@@ -8,6 +8,9 @@
     csm move 3 --to work --stop-source     # ...and stop the old process once the new one is up
     csm move "refactor" --to personal --dry-run
     csm move https://claude.ai/code/session_01Ab... --to work
+    csm stop 3                             # end a session csm moved, and free its window
+    csm matrix                             # what your accounts share, and what they cannot
+    csm matrix --check                     # ...as a check: exit 1 when a shared layer drifted
     csm --ssh otherhost list               # the same command on another machine
 
 WHY: one Claude account runs out of quota while your others have plenty. Starting the work
@@ -19,27 +22,54 @@ AN ACCOUNT is a Claude Code config home, the directory CLAUDE_CONFIG_DIR points 
 directory is the account "<name>". Sign one in once with `CLAUDE_CONFIG_DIR=~/.claude-<name>
 claude`, then `/login`. An accounts file replaces discovery (see `csm accounts --help`).
 
+🛑 A MOVE IS BETWEEN TWO CONFIG HOMES ON ONE MACHINE, never between machines: a transcript
+lives under `<home>/projects/`, which is per machine, and `--resume` looks only inside the
+home it is running under. `--ssh HOST` runs this same command ON that machine, where it
+again moves between two homes there.
+
 A MOVE IS A COPY AND A RESUME:
   1. the transcript `<home>/projects/<folder>/<id>.jsonl` and its sibling `<id>/` directory
-     are copied into the target home, under the source's own folder name;
-  2. the target home's two first-run dialogs (workspace trust for that directory, and
-     onboarding) are pre-answered in its state file, additively, atomically, backed up;
+     are copied into the target home, under the source's own folder name, together with the
+     session's own side data outside `projects/` (file-history, task list) when it has any;
+  2. the target home's first-run gates (workspace trust for that directory, and onboarding)
+     are pre-answered in its state file, additively, atomically, backed up;
   3. `claude --resume <id> --remote-control=<title>` starts in a detached tmux window
      `moved-<id8>` of the tmux session `csm-<account>`, under the target's CLAUDE_CONFIG_DIR,
-     in the session's recorded working directory;
+     in the session's recorded working directory, with a scrubbed environment;
   4. the tool waits for the window to print its claude.ai link, and only then (with
      --stop-source) stops the old process.
 The CLI connects as the target login and registers a NEW claude.ai session owned by it.
 The source transcript is never edited or deleted.
 
+WHAT A MOVE COSTS, because the account is the payment layer and little else:
+  * preserved thinking is bound to the organization that wrote it, so across organizations
+    the CLI drops it and the first turn RE-READS the session — on the new account's quota.
+    Move early, while there is quota to spare, not at the limit;
+  * the moved session gets a NEW claude.ai link owned by the target account; the old link
+    still opens the source account's copy;
+  * claude.ai connectors belong to the ACCOUNT and MCP sign-ins to the config home, so the
+    moved session gets the target's, not the source's;
+  * plugins are installed per home, even when one shared settings file enables them for all;
+  * the prompt cache starts cold, and the copied transcript still names the source account
+    inside itself until the conversation's context is rebuilt.
+`csm move` prints the ones that apply to the move in front of you.
+
+SAFETY, in one place: nothing is written before every refusal has been checked; the source
+transcript is never edited or deleted; the session running the tool is recognised and never
+stopped; a process is signalled only after its identity is PROVED (pid plus start time);
+`csm stop` ends only a window csm itself opened; tmux targets are exact-matched; every
+credential is probed for existence only, never read, printed or logged; and the child's
+environment is scrubbed of the whole CLAUDE*/ANTHROPIC* families.
+
 Everything this tool reads is Claude Code's own undocumented on-disk state (measured on CLI
-2.1.296). docs/design.md has the design, the formats and the measurements; the tests in
-tests/ pin every shape the tool depends on.
+2.1.296-2.1.300 on macOS). docs/design.md has the design, the formats and the measurements;
+the tests in tests/ pin every shape the tool depends on.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -54,7 +84,12 @@ import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "0.1.0"
+try:                                      # POSIX only; the tool is macOS/Linux anyway
+    import pwd
+except ImportError:                       # pragma: no cover
+    pwd = None
+
+__version__ = "0.2.0"
 PROG = "claude-session-mover"
 
 HOME = Path(os.path.expanduser("~"))
@@ -71,6 +106,14 @@ STATE_DIR = _env_path("CSM_STATE_DIR", _XDG_STATE / PROG)
 LOG = _env_path("CSM_LOG", STATE_DIR / "log")
 #: Where `list` leaves its numbering, so `move 3` means the row you just read. Per machine.
 PICKS = _env_path("CSM_PICKS", STATE_DIR / "picks.json")
+#: Where a pane's scrollback is parked before anything is signalled. A pane holds the one
+#: thing no file does: what the agent had typed and not yet sent. Measured: killing a tmux
+#: session to clear the way for a move ended six sessions at once, and the two unsent drafts
+#: in them survived only because somebody had captured the panes by hand first.
+#: 🛑 These files hold conversation text. They are written 0600 in a 0700 dated directory
+#: under the state dir, and they belong on the machine that wrote them — never in a synced
+#: folder and never anywhere a web server serves.
+CAPTURES = _env_path("CSM_CAPTURES", STATE_DIR / "captures")
 ACCOUNTS_FILE = _env_path("CSM_ACCOUNTS", _XDG_CONFIG / PROG / "accounts")
 
 #: How much of a transcript is read: a head and a tail, never a full parse. A multi-MB
@@ -87,10 +130,24 @@ SETTLE_S = float(os.environ.get("CSM_SETTLE") or 8)
 TITLE_MAX = 60
 ROW_TITLE = 44
 TMUX_PREFIX = "csm-"
+#: TEST ONLY. `tmux -L <socket>` on every call, so a test suite drives a private tmux
+#: server: the fixtures' session names are the real ones, and on the default socket a
+#: `stop` test would kill your own windows.
+TMUX_SOCKET = os.environ.get("CSM_TMUX_SOCKET") or ""
+#: TEST ONLY. Forces the answer of the credential-existence probe (`true` / `false` /
+#: `unknown` / `off`). It announces itself on stderr and in the log on EVERY run while it
+#: is set: a stale export must never switch a safety check off in silence.
+LOGIN_PROBE = (os.environ.get("CSM_LOGIN_PROBE") or "").strip().lower()
+LOGIN_PROBE_VALUES = {"true": True, "false": False, "unknown": None, "off": None}
 
-#: The apiError an assistant line carries when the account hit its usage limit. Its
-#: `apiErrorParams.rate_limit_info` has `rateLimitType` and `resetsAt`.
-QUOTA_ERRORS = ("usage_limit_reached",)
+#: The apiError an assistant line carries when the account hit a limit. Its
+#: `apiErrorParams.rate_limit_info` has `rateLimitType` and `resetsAt`; when that is
+#: missing the line (or its message) may carry `quotaLimits.resetsAt` instead. All three
+#: names have been seen in the wild, so a tool that knows only one under-reports.
+QUOTA_ERRORS = ("usage_limit_reached", "rate_limit_error", "rate_limit_exceeded")
+#: A `system` line carrying this marker means the session was ended or archived from the
+#: app. Such a row is shown as "closed", not "ended": resuming it is rarely what you want.
+ENDED_REMOTELY = "code 4090"
 #: 🛑 What may be passed to `--model`. An assistant line that carries an apiError names its
 #: model `<synthetic>`, and the out-of-quota line, the LAST line of exactly the session you
 #: want to move, is one. `claude --model '<synthetic>'` refuses to start, so a model is
@@ -100,23 +157,68 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 URL_RE = re.compile(r"(?:cse_|session_)([A-Za-z0-9]{10,})")
 LINK_RE = re.compile(r"https://claude\.ai/code/session_[A-Za-z0-9]+")
 PERM_RE = re.compile(rb'"permissionMode"\s*:\s*"([A-Za-z]+)"')
-MODES = ("default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto")
+#: Tool names of the form `mcp__<server>__<tool>`; a server named `claude_ai_<Connector>`
+#: is a claude.ai connector, which belongs to the ACCOUNT and not to any config home.
+MCP_TOOL_RE = re.compile(rb'"mcp__([A-Za-z0-9_.-]+?)__')
+CONNECTOR_PREFIX = "claude_ai_"
 
-#: 🛑 Removed from the environment of the moved session. Two kinds:
-#:  * variables that describe the session RUNNING this tool (it is usually an agent inside
-#:    Claude Code). Inherited, they make the new process believe it is nested in, or bridged
-#:    through, the old one;
-#:  * credentials that OUTRANK the target home's own login. With CLAUDE_CODE_OAUTH_TOKEN or
-#:    ANTHROPIC_API_KEY left in, the session moves but the quota does not: every turn would
-#:    still be spent on whatever the variable names.
-SCRUB_EXACT = frozenset({
-    "CLAUDECODE", "CLAUDE_PID", "CLAUDE_CONFIG_DIR",
-    "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_PARENT_PID", "CLAUDE_CODE_CHILD_SESSION",
-    "CLAUDE_CODE_WORKER_EPOCH", "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_ENVIRONMENT_KIND",
-    "CLAUDE_CODE_SSE_PORT",
-    "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
-})
-SCRUB_PREFIXES = ("CLAUDE_CODE_SESSION_", "CLAUDE_CODE_BRIDGE_", "CLAUDE_CODE_MESSAGING_")
+#: 🛑 Permission modes WEAKEST → STRONGEST. This is a strength order, not the CLI's own
+#: list order, and `resolve_mode` never moves a session down it. `manual` is the settings
+#: schema's own alias for `default` (and the label the claude.ai picker shows).
+MODE_ORDER = ("plan", "default", "acceptEdits", "auto", "dontAsk", "bypassPermissions")
+MODE_ALIASES = {"manual": "default"}
+MODES = MODE_ORDER
+#: The only recorded modes a stronger configured default may replace. `plan` and
+#: `acceptEdits` are chosen deliberately (shift+tab, or a flag) and are left alone; `auto`
+#: and `default` are what a session records by accident — a worker started by a Remote
+#: Control server records the mode the claude.ai session record holds, not the one its
+#: server was started with.
+RAISE_FROM = ("", "default", "auto")
+
+#: 🛑 Removed from the environment of the moved session: the WHOLE `CLAUDE*` and
+#: `ANTHROPIC*` families, by prefix, plus the two provider variables that carry neither
+#: prefix. A list of NAMES cannot be closed under names that do not exist yet — the CLI
+#: reads hundreds of distinct CLAUDE* and dozens of ANTHROPIC* variables — and each name a
+#: list misses is a real outcome:
+#:  * a credential (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
+#:    and others) OUTRANKS the target home's own login: the session moves, the quota does
+#:    not, and the move reports success;
+#:  * a provider switch (`ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK`,
+#:    `CLAUDE_CODE_USE_VERTEX`, …) sends the moved window somewhere else entirely, so it
+#:    spends neither account's subscription;
+#:  * identity variables (`CLAUDECODE`, `CLAUDE_PID`, `CLAUDE_CODE_SESSION_*`, the bridge
+#:    ones) make the child believe it is the process that launched it, which breaks
+#:    self-detection and `--stop-source`;
+#:  * preference variables (`ANTHROPIC_MODEL`, `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, …) leak the
+#:    mover's own settings into someone else's session.
+#: Re-verify the families against a CLI build with:
+#:   strings <the CLI binary> | grep -oE '\b(CLAUDE|ANTHROPIC)[A-Z0-9_]*' | sort -u | wc -l
+SCRUB_PREFIXES = ("CLAUDE", "ANTHROPIC")
+SCRUB_EXACT = frozenset({"CLOUD_ML_REGION", "AWS_BEARER_TOKEN_BEDROCK"})
+#: Put back by name, deliberately and visibly. Empty by default: `CSM_*` is outside both
+#: families, and `CLAUDE_CONFIG_DIR` is set afterwards from the plan, never inherited.
+#: ⚠️ The scrub is two families plus two names, NOT a general cleanout: AWS_PROFILE,
+#: GOOGLE_APPLICATION_CREDENTIALS and the rest of your own auth survive, because that is
+#: how your own work inside the moved session keeps working.
+KEEP_EXACT = frozenset()
+
+#: Claude Code's versioned binary lives under this path segment. A Remote-Control-spawned
+#: worker runs as that binary, a terminal session as `claude`; both are the CLI, and
+#: nothing else counts (see `is_claude_exe`).
+CLAUDE_VERSIONS_DIR = "/.local/share/claude/versions/"
+#: Per-session data the CLI keeps OUTSIDE `projects/`, keyed by the session id. Copied
+#: additively, never overwriting.
+#: `<home>/file-history/<id>/` is the file-edit history `/rewind` restores from — verified
+#: on 2.1.300, where every config home had it. `<home>/tasks/<id>/` is read from the config
+#: home by the CLI's own read-allowlist, but on 2.1.300 a session's task OUTPUT is written
+#: outside the config home (under a cache root keyed on the cwd), so it is carried
+#: opportunistically and is usually not there. Neither claim is a measurement of what the
+#: resume reads back.
+#: 🛑 Nothing else from the home travels: `sessions/`, `session-env/`, `shell-snapshots/`,
+#: `jobs/`, `bridge-pointer.json`, `.claude.json` and every credential stay where they are.
+SIDE_DATA_DIRS = ("file-history", "tasks")
+#: An older CLI filed the same lists as `<home>/todos/<id>-*.json`.
+SIDE_DATA_GLOBS = (("todos", "{id}*.json"),)
 
 
 # --------------------------------------------------------------------------- plumbing
@@ -253,6 +355,200 @@ class Account:
         o = self.oauth().get("organizationUuid")
         return o if isinstance(o, str) else ""
 
+    @property
+    def credential_service(self) -> str:
+        """The macOS Keychain service name holding this home's login.
+
+        🛑 `Claude Code-credentials` when CLAUDE_CONFIG_DIR is unset, and
+        `Claude Code-credentials-<8 hex>` otherwise, where the hex is the start of
+        sha256 over the NFC form of the LITERAL string the variable is set to — no
+        realpath, no trailing-slash trimming, no `~` expansion. So `~/.claude-work` and
+        `~/.claude-work/` are two different logins, and renaming a home orphans its login
+        until that Keychain item is copied across (copy, verify the new name serves, only
+        then delete the old one). The item's account is `$USER`.
+        """
+        if self.default:
+            return "Claude Code-credentials"
+        return keychain_service_for(str(self.home))
+
+
+def keychain_user() -> str:
+    """The Keychain item's ACCOUNT field, spelled the way the CLI spells it.
+
+    🛑 `$USER`, and when that is not exported the OS user name — NOT the sentinel. The CLI
+    falls back to the password database before it gives up, and `claude-code-user` is only
+    what it uses when even that fails or the name holds an odd character. Reaching for the
+    sentinel too early asks the Keychain about an account that does not exist, which comes
+    back `errSecItemNotFound` and reads as "signed out" for every home at once — exactly
+    the wrong answer in the unattended contexts (a container, `env -i`, some CI runners)
+    where USER tends to be missing.
+    """
+    u = os.environ.get("USER") or ""
+    if not u:
+        try:
+            u = pwd.getpwuid(os.getuid()).pw_name or ""
+        except (OSError, KeyError, AttributeError):
+            u = ""
+    return u if re.match(r"^[A-Za-z0-9._-]+$", u) else "claude-code-user"
+
+
+def credential_file(acct: Account) -> Path:
+    """Where the login lives when there is no OS keychain (Linux, containers)."""
+    return acct.home / ".credentials.json"
+
+
+def keychain_service_for(literal: str) -> str:
+    return "Claude Code-credentials-" + hashlib.sha256(
+        unicodedata.normalize("NFC", literal).encode("utf-8")).hexdigest()[:8]
+
+
+def credential_services(acct: Account) -> list:
+    """`[(the literal spelling, the Keychain service name)]` to probe, in order.
+
+    🛑 The service name is built from the LITERAL string `CLAUDE_CONFIG_DIR` held when the
+    login was made, so `~/.claude-work` and `~/.claude-work/` are two different items.
+    Every path csm holds has been through `expanduser`, which drops a trailing slash, so a
+    home signed in WITH one would read as signed out and the move would refuse a target
+    that is perfectly usable. One extra probe covers that one spelling.
+
+    🛑 One extra, and no more. Realpath and other speculative spellings are not tried:
+    each `security` call is another chance to block on a locked keychain over ssh, and an
+    unattended run has nobody to unlock it.
+    """
+    if acct.default:
+        return [("", "Claude Code-credentials")]
+    base = str(acct.home)
+    out = [("", keychain_service_for(base))]
+    if not base.endswith(os.sep):
+        out.append((base + os.sep, keychain_service_for(base + os.sep)))
+    return out
+
+
+def credential_present(acct: Account):
+    """`True` signed in, `False` the credential is gone, `None` could not look.
+
+    🛑 Existence only. The value is never read, printed, logged or cached: on macOS that
+    means the exit code of `security find-generic-password -a <user> -s <service>` with no
+    `-w` and no `-g` (both print the secret), under a hard timeout — an item whose ACL does
+    not cover /usr/bin/security raises a dialog that would block an unattended run, and
+    over ssh the login keychain often cannot be read at all. Exit 44 (errSecItemNotFound)
+    is a real "signed out"; every other non-zero answer is UNKNOWN.
+
+    🛑 Unreadable is never promoted to signed out. Reading "I could not look" as "you are
+    logged out" is how a check tells people to sign in to accounts that are perfectly fine.
+    """
+    if LOGIN_PROBE:
+        if LOGIN_PROBE not in LOGIN_PROBE_VALUES:
+            die("CSM_LOGIN_PROBE=%s is not one of %s" % (
+                LOGIN_PROBE, ", ".join(sorted(LOGIN_PROBE_VALUES))))
+        msg = ("CSM_LOGIN_PROBE=%s: the credential store was NOT asked about %s"
+               % (LOGIN_PROBE, acct.name))
+        print("csm: " + msg, file=sys.stderr)
+        log(msg)
+        return LOGIN_PROBE_VALUES[LOGIN_PROBE]
+    if sys.platform == "darwin":
+        gone = None
+        for literal, service in credential_services(acct):
+            try:
+                r = subprocess.run(["security", "find-generic-password",
+                                    "-a", keychain_user(), "-s", service],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   timeout=10)
+            except (OSError, subprocess.SubprocessError):
+                return None
+            if r.returncode == 0:
+                if literal:
+                    msg = ("%s is signed in under the Keychain item for %r, not %r: the "
+                           "literal CLAUDE_CONFIG_DIR it was signed in with differs from "
+                           "the path csm uses, which is fine here but will orphan the "
+                           "login the day that home is renamed"
+                           % (acct.name, literal, str(acct.home)))
+                    print("csm: " + msg, file=sys.stderr)
+                    log(msg)
+                return True
+            if r.returncode == 44:      # errSecItemNotFound: a real "signed out"
+                gone = False
+                continue
+            return None                 # 36 = keychain locked, 51 = no access, …
+        return gone
+    try:
+        return credential_file(acct).is_file()
+    except OSError:
+        return None
+
+
+def signin_gesture(acct: Account) -> str:
+    return "claude" if acct.default else "CLAUDE_CONFIG_DIR=%s claude" % tilde(acct.home)
+
+
+def login_usable(acct: Account):
+    """`(ok, sentence)` — the tri-state login check both `accounts` and `move` use.
+
+    The state file is NOT the login: `oauthAccount.emailAddress` is the last login the CLI
+    saw there, so a home whose credential was removed or expired still names someone. It
+    would pass every file check, have its dialogs pre-answered and its transcript written,
+    and then fail at the first API call — which is the one outcome a preflight exists to
+    prevent. Hence three answers, from one primitive, so the view and the refusal can never
+    disagree: signed in / the credential is gone (refuse) / could not look (proceed, warn).
+    """
+    if not acct.home.is_dir():
+        return False, "%s: %s does not exist" % (acct.name, tilde(acct.home))
+    if not acct.email:
+        return False, ("%s (%s) holds no login. Sign it in once: %s, then /login"
+                       % (acct.name, tilde(acct.home), signin_gesture(acct)))
+    cred = credential_present(acct)
+    if cred is False:
+        where = ("the Keychain item %s" % acct.credential_service if sys.platform == "darwin"
+                 else tilde(credential_file(acct)))
+        return False, ("%s still names %s in its state file, but its credential is GONE "
+                       "(%s): the move would copy the session into a home that cannot talk "
+                       "to Claude. Sign it in again: %s, then /login"
+                       % (acct.name, acct.email, where, signin_gesture(acct)))
+    if cred is None:
+        return True, ("⚠ UNVERIFIED: %s names %s, but the credential store could not be "
+                      "asked, so whether that login still works is unknown" % (acct.name,
+                                                                               acct.email))
+    return True, ""
+
+
+#: The settings files one config home reads, in the order they are layered: each later
+#: file wins over the earlier one, PER KEY PATH.
+SETTINGS_FILES = ("settings.json", "settings.local.json")
+
+
+def merge_settings(base: dict, over: dict) -> dict:
+    """`over` layered onto `base` per KEY PATH: nested objects merge, leaves replace.
+
+    🛑 Not `dict.update`. The CLI resolves each setting by its own key path across the
+    sources (`permissions.defaultMode`, `permissions.disableAutoMode`, `env.<name>` …), so
+    a later file that defines only `permissions.allow` leaves `permissions.defaultMode`
+    standing. A top-level update instead replaces the whole `permissions` object, which is
+    how an accumulated `settings.local.json` allow-list — the common shape — silently
+    erases the permission mode and the memory store the home actually reads.
+    """
+    out = dict(base)
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = merge_settings(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def effective_settings(home: Path) -> dict:
+    """`settings.json` with `settings.local.json` layered over it, per key path.
+
+    A plain read, so a home whose `settings.json` is a SYMLINK to one shared file is
+    followed — that is the usual way several homes are made to share one settings file, and
+    a value must never be inferred from which home this is.
+    """
+    out = {}
+    for name in SETTINGS_FILES:
+        d = read_json(home / name)
+        if isinstance(d, dict):
+            out = merge_settings(out, d)
+    return out
+
 
 def looks_like_home(p: Path) -> bool:
     return any((p / x).exists() for x in ("projects", ".claude.json", "sessions", "settings.json"))
@@ -260,7 +556,11 @@ def looks_like_home(p: Path) -> bool:
 
 def parse_accounts_file(path: Path) -> list:
     out, names = [], set()
-    for n, raw in enumerate(path.read_text().splitlines(), 1):
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        raise Refusal(f"{tilde(path)} is not UTF-8 text, so it cannot be an accounts file")
+    for n, raw in enumerate(text.splitlines(), 1):
         line = raw.split("#", 1)[0].strip()
         if not line:
             continue
@@ -407,11 +707,14 @@ class Session:
     perm: str = ""
     model: str = ""
     pid: int = 0
+    proc_start: str = ""         # the registry's `procStart`: the pid's identity, not a date
     tmux: str = ""
     status: str = ""
     entrypoint: str = ""
     rc_name: str = ""
     quota: dict = field(default_factory=dict)
+    ended_remotely: bool = False
+    mcp_servers: list = field(default_factory=list)
     pos: int = 0
 
     @property
@@ -451,6 +754,7 @@ class Session:
             "last_activity": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(self.mtime)),
             "age": human_age(self.mtime), "out_of_quota": bool(self.quota),
             "quota": self.quota or None, "is_self": self.is_self,
+            "ended_remotely": self.ended_remotely, "mcp_servers": self.mcp_servers,
         }
 
 
@@ -497,7 +801,7 @@ def scan_transcript(path: Path) -> dict:
     the file, i.e. the session stopped there and is waiting.
     """
     info = {"title": "", "cwd": "", "bridge_id": "", "perm": "", "model": "", "quota": {},
-            "sidechain_only": True}
+            "sidechain_only": True, "ended_remotely": False, "mcp_servers": []}
     try:
         size = path.stat().st_size
         with path.open("rb") as f:
@@ -549,6 +853,10 @@ def scan_transcript(path: Path) -> dict:
         if not info["cwd"] and isinstance(d.get("cwd"), str):
             info["cwd"] = d["cwd"]
         m = d.get("message")
+        # A session ended or archived from the app says so on a `system` line. Resuming
+        # such a session is rarely what anyone wants, so the row says "closed", not "ended".
+        if t == "system" and ENDED_REMOTELY in (_text_of(m) or str(d.get("content") or "")):
+            info["ended_remotely"] = True
         if t == "assistant" and isinstance(m, dict) and not d.get("isSidechain"):
             err = d.get("apiError") or m.get("apiError")
             if err in QUOTA_ERRORS:
@@ -556,9 +864,17 @@ def scan_transcript(path: Path) -> dict:
                 p = d.get("apiErrorParams") or m.get("apiErrorParams") or {}
                 rl = p.get("rate_limit_info") if isinstance(p, dict) else None
                 rl = rl if isinstance(rl, dict) else {}
+                resets = epoch_s(rl.get("resetsAt"))
+                if not resets:
+                    # Some builds carry the reset under `quotaLimits` instead, on the line
+                    # or inside the message.
+                    for holder in (p, d, m):
+                        q = holder.get("quotaLimits") if isinstance(holder, dict) else None
+                        if isinstance(q, dict) and epoch_s(q.get("resetsAt")):
+                            resets = epoch_s(q.get("resetsAt"))
+                            break
                 quota = {"error": err, "kind": rl.get("rateLimitType") or "",
-                         "resets_at": epoch_s(rl.get("resetsAt")),
-                         "message": tidy(_text_of(m), 80)}
+                         "resets_at": resets, "message": tidy(_text_of(m), 80)}
             elif not err:
                 # Only a CLEAN line counts: an error line names its model `<synthetic>`,
                 # and an error that is not a limit is not the session answering again.
@@ -576,6 +892,14 @@ def scan_transcript(path: Path) -> dict:
     if not perm and size > len(tail):
         perm = last_mode(path, size)
     info["perm"] = perm or head_perm
+    # Which MCP servers this conversation has actually used, from the tool names it called.
+    # A server named `claude_ai_<Connector>` is a claude.ai CONNECTOR: it belongs to the
+    # account, not to the config home, so a move changes which ones the session can reach.
+    names = set()
+    for blob in (head, tail):
+        for mm in MCP_TOOL_RE.finditer(blob):
+            names.add(mm.group(1).decode("utf-8", "ignore"))
+    info["mcp_servers"] = sorted(n for n in names if n)
     info["bridge_id"] = re.sub(r"^(cse_|session_)", "", bridge or head_bridge)
     info["title"] = tidy(titles["custom-title"] or titles["ai-title"]
                          or titles["last-prompt"] or first_prompt)
@@ -644,8 +968,14 @@ def live_rows(acct: Account) -> dict:
     return out
 
 
-def sessions_for(acct: Account, limit: int) -> list:
-    """This account's `limit` most recently touched sessions, plus every live one."""
+def sessions_for(acct: Account, limit: int, only=None) -> list:
+    """This account's `limit` most recently touched sessions, plus every live one.
+
+    `only` is a set of 8-character id prefixes: a caller that already knows which handful
+    of sessions it can possibly mean (`csm stop`, from the windows csm opened) skips
+    reading every other transcript in the home. It narrows WHICH rows are built, never
+    how one is built, so a row from a narrowed call is identical to one from a full scan.
+    """
     live = live_rows(acct)
     try:
         cands = [(p.stat().st_mtime, p) for p in acct.projects.glob("*/*.jsonl") if p.is_file()]
@@ -653,6 +983,8 @@ def sessions_for(acct: Account, limit: int) -> list:
         cands = []
     by_id = {}
     for m, p in cands:
+        if only is not None and p.stem[:8] not in only:
+            continue
         if p.stem not in by_id or m > by_id[p.stem][0]:
             by_id[p.stem] = (m, p)
     chosen = [by_id[s] for s in live if s in by_id]
@@ -673,18 +1005,20 @@ def sessions_for(acct: Account, limit: int) -> list:
             bridge_id=info["bridge_id"]
             or re.sub(r"^(cse_|session_)", "", str(r.get("bridgeSessionId") or "")),
             perm=info["perm"], model=info["model"], pid=int(r.get("pid") or 0),
+            proc_start=str(r.get("procStart") or ""),
             tmux=str(r.get("tmux") or ""), status=str(r.get("status") or ""),
             entrypoint=str(r.get("entrypoint") or ""), rc_name=str(r.get("name") or ""),
-            quota=info["quota"]))
+            quota=info["quota"], ended_remotely=info["ended_remotely"],
+            mcp_servers=info["mcp_servers"]))
     return out
 
 
-def all_sessions(accts: list, limit: int) -> list:
+def all_sessions(accts: list, limit: int, only=None) -> list:
     """Newest first across every account; a LIVE session is never cut off the list."""
     out = []
     for a in accts:
         if a.home.is_dir():
-            out.extend(sessions_for(a, limit))
+            out.extend(sessions_for(a, limit, only))
     out.sort(key=lambda s: -s.mtime)
     keep = [s for s in out if s.live]
     for s in out:
@@ -728,7 +1062,7 @@ def render_list(rows: list, accts: list) -> str:
         if s.quota:
             k = {"five_hour": "5h", "seven_day": "week"}.get(s.quota.get("kind"), "quota")
             bits.append(f"⚠ OUT OF QUOTA ({k}, resets {clock(s.quota.get('resets_at') or 0)})")
-        state = "● live" if s.live else "  ended"
+        state = "● live" if s.live else ("  closed" if s.ended_remotely else "  ended")
         out.append(f"{s.pos:>3}  {tidy(s.account.name, aw):<{aw}} {tidy(s.label, w):<{w}} "
                    f"{human_age(s.mtime):>4}  {state:<8} {'  '.join(bits)}")
     out.append("")
@@ -739,19 +1073,25 @@ def render_list(rows: list, accts: list) -> str:
 
 # --------------------------------------------------------------------- picking a session
 
-def one_of(hits: list, what: str):
+def one_of(hits: list, what: str, soft: bool = False):
     """One row out of several matches, or a refusal naming every one.
 
     🛑 A MOVE IS A COPY, so after the first move the same id sits in two account homes, with
     the same title. The LIVE copy is the one you mean; two live copies, or none, is refused
     with the row numbers to choose from. Taking the first match would move a stale snapshot,
     and with --stop-source stop a session nobody named.
+
+    `soft=True` returns None wherever this would refuse, changing nothing about what is
+    matched: a caller can then try a NARROWED list first (the copy `csm stop` has a window
+    for, say) and still produce the full refusal from the complete list afterwards.
     """
     if len(hits) == 1:
         return hits[0]
     live = [h for h in hits if h.live]
     if len(live) == 1:
         return live[0]
+    if soft:
+        return None
     die(f"{what} matches {len(hits)} sessions (a move is a copy, so one id can sit in more "
         "than one account): "
         + "; ".join(f"{h.pos}. {h.account.name} {h.short} {'live' if h.live else 'ended'} "
@@ -760,7 +1100,7 @@ def one_of(hits: list, what: str):
     raise AssertionError("unreachable")
 
 
-def pick(spec: str, rows: list):
+def pick(spec: str, rows: list, soft: bool = False):
     """THE LADDER, first unique win; more than one match is listed, never guessed.
 
       1. a row number from the last `csm list` on this machine
@@ -768,15 +1108,23 @@ def pick(spec: str, rows: list):
       3. a unique prefix of one (4 characters or more)
       4. a claude.ai/code/session_... link, or a bare cse_.../session_... id
       5. a unique, case-insensitive piece of the title
+
+    `soft=True` returns None instead of refusing, so a caller can run the same ladder over
+    a preferred subset first. Only the hard path ever produces user-facing refusal text, so
+    the two cannot drift apart.
     """
     s = (spec or "").strip()
     if not s:
+        if soft:
+            return None
         die("name a session: a row number from `csm list`, a session id, a claude.ai link, "
             "or part of its title")
     if s.isdigit():
         picks = load_picks()
         hit = [p for p in picks if int(p.get("pos") or 0) == int(s)]
         if not hit:
+            if soft:
+                return None
             die(f"row {s} is not in the last `csm list` "
                 f"({'no list has been run' if not picks else f'it had {len(picks)} rows'}): "
                 "run `csm list` and use a number it prints")
@@ -784,33 +1132,387 @@ def pick(spec: str, rows: list):
         for r in rows:
             if r.local_id == want.get("local_id") and r.account.name == want.get("account"):
                 return r
+        if soft:
+            return None
         die(f"row {s} was session {str(want.get('local_id'))[:8]} in {want.get('account')}, "
             "which is no longer there: run `csm list` again")
     low = s.lower()
     exact = [r for r in rows if r.local_id.lower() == low]
     if exact:
-        return one_of(exact, f"session id {s}")
+        return one_of(exact, f"session id {s}", soft)
     if len(s) >= 4:
         hits = [r for r in rows if r.local_id.lower().startswith(low)]
         if hits:
-            return one_of(hits, f"'{s}' as the start of a session id")
+            return one_of(hits, f"'{s}' as the start of a session id", soft)
     m = URL_RE.search(s)
     if m:
         hits = [r for r in rows if r.bridge_id == m.group(1)]
         if hits:
-            return one_of(hits, f"claude.ai id {m.group(1)}")
+            return one_of(hits, f"claude.ai id {m.group(1)}", soft)
+        if soft:
+            return None
         die(f"no session here has the claude.ai id '{m.group(1)}'. It may live on another "
             "machine (`csm --ssh HOST list`), or be older than this listing (`--all`)")
     hits = [r for r in rows if low in (r.label or "").lower()]
     if hits:
-        return one_of(hits, f"'{s}'")
+        return one_of(hits, f"'{s}'", soft)
+    if soft:
+        return None
     die(f"'{s}' matches no session in this listing. `csm list --all` widens it")
     raise AssertionError("unreachable")
 
 
+# --------------------------------------------------------------------- permission mode
+
+def canon_mode(m: str) -> str:
+    m = (m or "").strip()
+    return MODE_ALIASES.get(m, m)
+
+
+def mode_rank(m: str) -> int:
+    """Position in MODE_ORDER, or −1 for a mode this tool has never heard of.
+
+    🛑 −1 is NOT "weakest". A CLI that gains a mode must not be silently downgraded by a
+    tool one release behind, so an unknown recorded mode is carried through untouched.
+    """
+    m = canon_mode(m)
+    return MODE_ORDER.index(m) if m in MODE_ORDER else -1
+
+
+def settings_mode(tgt: Account):
+    """`(permissions.defaultMode, which file said so)` for the TARGET home, or `("", "")`."""
+    for name in ("settings.local.json", "settings.json"):
+        d = read_json(tgt.home / name)
+        perms = d.get("permissions") if isinstance(d, dict) else None
+        v = perms.get("defaultMode") if isinstance(perms, dict) else None
+        if isinstance(v, str) and v.strip():
+            return canon_mode(v), tilde(tgt.home / name)
+    return "", ""
+
+
+def resolve_mode(s: Session, tgt: Account, asked: str):
+    """`(mode, why)` — the permission mode is CHOSEN for the move, not copied.
+
+    🛑 Never weaker than the session was running, and never a mode this tool does not know.
+    The order:
+      1. `--permission-mode` wins, after validation (`manual` is an alias of `default`);
+      2. else, when the TARGET's settings name a `permissions.defaultMode` that is stronger
+         AND the transcript recorded nothing, `default` or `auto` — the modes a session
+         records by accident — the settings win. A worker spawned by a Remote Control
+         server records the mode the claude.ai session record holds, which is `auto` even
+         when its server was started in bypassPermissions, and a Remote Control session
+         cannot be put back into bypassPermissions from the picker: pass the recorded mode
+         through and the move hands back a weaker session than the one that was running;
+      3. else the recorded mode, even when the settings are stronger: `plan` and
+         `acceptEdits` are deliberate, and a quota move must not hand back a session that
+         may now write and run anything unasked;
+      4. else the settings' mode, else `default`.
+    """
+    if asked:
+        m = canon_mode(asked)
+        if mode_rank(m) < 0:
+            die("'%s' is not a permission mode. The modes are: %s (and `manual`, the "
+                "settings schema's own alias for `default`)" % (asked, ", ".join(MODE_ORDER)))
+        return m, "from --permission-mode"
+    rec, (cfg, where) = canon_mode(s.perm), settings_mode(tgt)
+    rec_rank = mode_rank(rec) if rec else -1
+    if cfg and rec in RAISE_FROM and mode_rank(cfg) > rec_rank:
+        return cfg, ("%s says permissions.defaultMode %s, and the session recorded %s, "
+                     "which is weaker (a session started by a Remote Control server records "
+                     "`auto` even when its server was started in bypassPermissions). %s"
+                     % (where, cfg, rec or "no mode",
+                        ("`--permission-mode %s` keeps the recorded one" % rec) if rec
+                        else "`--permission-mode default` overrides this"))
+    if rec:
+        if cfg and mode_rank(cfg) > rec_rank >= 0:
+            return rec, ("the session was running in %s, which is deliberate, so it is kept "
+                         "even though %s says %s. `--permission-mode %s` raises it"
+                         % (rec, where, cfg, cfg))
+        return rec, "the mode the session was running in"
+    if cfg:
+        return cfg, "%s says permissions.defaultMode %s; the transcript recorded none" % (
+            where, cfg)
+    return "default", "nothing recorded the mode and no settings name a default"
+
+
+#: The CLI's own footer literals, lower-cased, measured on 2.1.300-2.1.301. `default`
+#: draws `⏸ manual mode on` — the footer's name for it, not the flag's — so the mode a
+#: move asked for and did not get is visible in the pane. There is no footer for
+#: `dontAsk`, so a pane showing none of these still says nothing about the mode.
+PANE_MODES = (("bypass permissions on", "bypassPermissions"),
+              ("accept edits on", "acceptEdits"),
+              ("plan mode on", "plan"),
+              ("auto mode on", "auto"),
+              ("manual mode on", "default"))
+
+
+def pane_mode(pane: str) -> str:
+    """The mode the window's footer shows; the LAST one on the screen wins."""
+    low = (pane or "").lower()
+    best, at = "", -1
+    for lit, mode in PANE_MODES:
+        i = low.rfind(lit)
+        if i > at:
+            best, at = mode, i
+    return best
+
+
+def appended_mode(dest: Path, after: int) -> str:
+    """The last `permissionMode` the RESUMED session wrote, reading only past `after`.
+
+    🛑 The copy already contains every mode the source ever recorded, so only the bytes
+    appended after the copy ended say what the moved session came up in. The resumed CLI
+    writes that line with the FIRST prompt, so right after a move there is usually nothing
+    yet: the answer is then `""`, never a guess.
+    """
+    try:
+        size = dest.stat().st_size
+        if size <= after:
+            return ""
+        with dest.open("rb") as f:
+            f.seek(after)
+            found = PERM_RE.findall(f.read())
+    except OSError:
+        return ""
+    return found[-1].decode() if found else ""
+
+
+def came_up_as(pane: str, dest: Path, after: int):
+    """`(mode, how)` — what the moved session ACTUALLY came up in, or `("", "")`.
+
+    The transcript line outranks the footer: the footer is a render, the line is the CLI's
+    own record.
+    """
+    m = appended_mode(dest, after)
+    if m:
+        return m, "from the transcript"
+    m = pane_mode(pane)
+    return (m, "from the window footer") if m else ("", "")
+
+
+# --------------------------------------------------- what the target home can and cannot do
+
+def has_plugins(acct: Account) -> bool:
+    """Does this home have plugins INSTALLED? (enabled is not installed.)"""
+    p = acct.home / "plugins"
+    if (p / "installed_plugins.json").exists():
+        return True
+    try:
+        return any((p / "marketplaces").iterdir())
+    except OSError:
+        return False
+
+
+MEMORY_DIR_ENV = "CLAUDE_CODE_REMOTE_MEMORY_DIR"
+MEMORY_OVERRIDE_ENV = "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE"
+
+
+def memory_store(acct: Account):
+    """`(base directory, where it was configured, is a project key appended)`.
+
+    `("", "", True)` means no store: memory stays in the config home, at
+    `<home>/projects/<folder>/memory/`.
+
+    🛑 The order and the SHAPE are the CLI's, measured on 2.1.300, and the two differ
+    between the rungs — getting either wrong points a reader at an empty directory:
+      1. `env.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE` — the memory directory itself, used
+         VERBATIM, with nothing appended;
+      2. `autoMemoryDirectory` — also VERBATIM, with a leading `~/` expanded (the only
+         one of the three that expands anything);
+      3. `env.CLAUDE_CODE_REMOTE_MEMORY_DIR`, else the config home — a BASE, under which
+         memory lives at `<base>/projects/<key>/memory/`.
+    So the documented setting wins over the undocumented variable, and only the variable
+    is project-keyed. Settings are read from the home itself (through a symlinked
+    settings.json, when that is how homes share one file).
+
+    🛑 A store that is configured but does not exist yet is still the store. Requiring the
+    directory to exist reads a fresh store as "no store", and whatever is then said about
+    memory is about a path the CLI will never open.
+
+    🛑 The CLI uses the env values LITERALLY: a value starting with `~` or `$HOME`, or a
+    relative one, is a mistake rather than a store, so it is ignored here too.
+    """
+    s = effective_settings(acct.home)
+    env = s.get("env") if isinstance(s.get("env"), dict) else {}
+    v = env.get(MEMORY_OVERRIDE_ENV)
+    if isinstance(v, str) and v.startswith("/"):
+        return v, "settings env.%s" % MEMORY_OVERRIDE_ENV, False
+    v = s.get("autoMemoryDirectory")
+    if isinstance(v, str) and v.strip():
+        p = os.path.expanduser(v.strip())   # this key DOES expand a leading ~
+        if os.path.isabs(p):
+            return p, "settings autoMemoryDirectory", False
+    v = env.get(MEMORY_DIR_ENV)
+    if isinstance(v, str) and v.startswith("/"):
+        return v, "settings env.%s" % MEMORY_DIR_ENV, True
+    return "", "", True
+
+
+def memory_slug(cwd: str) -> str:
+    """The directory name a shared memory store is keyed on: the git worktree root.
+
+    With `CLAUDE_CODE_REMOTE_MEMORY_DIR` set, the CLI keys memory on the REALPATH of the
+    project's git worktree root with every non-alphanumeric character turned into `-`,
+    which is NOT the transcript's project-folder name: a session launched through a symlink
+    has its transcript filed under the symlink's spelling and its memory under the resolved
+    one. Returns `""` rather than a wrong name, so the step line can name the store
+    directory without a slug instead of sending anyone to notes that are elsewhere.
+    """
+    try:
+        r = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    top = (r.stdout or "").strip()
+    if r.returncode != 0 or not top:
+        return ""
+    return re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(top))
+
+
+def memory_dir(acct: Account, folder: str, cwd: str):
+    """`(the directory this home reads project memory from, how it got there)`.
+
+    A store reached by rung 1 or 2 of `memory_store` IS the directory — nothing is
+    appended. Only `CLAUDE_CODE_REMOTE_MEMORY_DIR` and the config-home default are
+    project-keyed, and they key on different things: the variable on the realpath of the
+    worktree, the home on the transcript's own folder name.
+    """
+    base, how, keyed = memory_store(acct)
+    if base and not keyed:
+        return base, how
+    if base:
+        return os.path.join(base, "projects", memory_slug(cwd) or "<project>",
+                            "memory"), how
+    return str(acct.home / "projects" / folder / "memory"), "this home"
+
+
+def transcript_mcp(s: Session):
+    """`(claude.ai connectors used, other MCP servers used)` — names only, from the scan."""
+    conn = [x[len(CONNECTOR_PREFIX):] for x in s.mcp_servers if x.startswith(CONNECTOR_PREFIX)]
+    other = [x for x in s.mcp_servers if not x.startswith(CONNECTOR_PREFIX)]
+    return conn, other
+
+
+def target_notes(s: Session, tgt: Account, mode: str) -> list:
+    """What the target home cannot do that the source could. WARNINGS, never refusals.
+
+    🛑 Computed at every move and keyed on the mode the move will actually pass: keyed on
+    the transcript's mode instead, the bypass note would go missing on exactly the moves
+    that need it. Nothing here is remembered between runs — one shared settings file can
+    enable a plugin for every home while the installed tree stays genuinely per home, so
+    the answer changes under you.
+    """
+    out = []
+
+    def note(fn):
+        try:
+            v = fn()
+            if v:
+                out.append(v)
+        except Exception:                 # a warning must never break a move
+            pass
+
+    def bypass():
+        if mode != "bypassPermissions":
+            return ""
+        if effective_settings(tgt.home).get("skipDangerousModePermissionPrompt") is True:
+            return ""
+        return ("⚠ %s has not accepted bypass mode: its settings.json does not set "
+                "skipDangerousModePermissionPrompt, so the moved window may stop on the "
+                "Bypass Permissions warning, which this tool can only answer by keystroke. "
+                "Accept it once by hand there, or move with --permission-mode default"
+                % tgt.name)
+
+    def remote_dialog():
+        d = read_json(tgt.state_file)
+        if isinstance(d, dict) and d.get("remoteDialogSeen") is True:
+            return ""
+        return ("⚠ %s has never answered “Enable Remote Control?”, so the moved window may "
+                "stop on that question" % tgt.name)
+
+    def plugins():
+        if not has_plugins(s.account) or has_plugins(tgt):
+            return ""
+        return ("⚠ %s has no INSTALLED plugins while %s has: the conversation arrives "
+                "intact, its plugin-provided skills and tools do not (enabled in a shared "
+                "settings file is not installed — the tree is per home)"
+                % (tgt.name, s.account.name))
+
+    def shared_dirs():
+        # skills, agents and commands are per home too, unless the homes are linked to one
+        # directory — comparing realpaths says which, without reading a single file
+        missing = []
+        for name in ("skills", "agents", "commands", "output-styles"):
+            src_d, tgt_d = s.account.home / name, tgt.home / name
+            try:
+                if not src_d.is_dir() or not any(src_d.iterdir()):
+                    continue
+                if tgt_d.exists() and os.path.realpath(str(src_d)) == os.path.realpath(str(tgt_d)):
+                    continue              # one shared directory: nothing is lost
+                if not tgt_d.is_dir() or not any(tgt_d.iterdir()):
+                    missing.append(name)
+            except OSError:
+                continue
+        if not missing:
+            return ""
+        return ("⚠ %s has no %s of its own while %s has: those are per config home. Link "
+                "each home's to one shared directory to stop this happening"
+                % (tgt.name, "/".join(missing), s.account.name))
+
+    def connectors():
+        conn, servers = transcript_mcp(s)
+        bits = ["the moved session gets %s's claude.ai connectors, not %s's: connectors "
+                "belong to the ACCOUNT, server-side, and no terminal can attach one — "
+                "enable the same set on both at claude.ai/customize/connectors"
+                % (tgt.name, s.account.name)]
+        if conn:
+            bits.append("this conversation has used: " + ", ".join(sorted(set(conn))))
+        if servers:
+            bits.append("it has also used the MCP server(s) %s, whose sign-ins are per "
+                        "config home (`claude mcp login <server>` once in %s)"
+                        % (", ".join(sorted(set(servers))), tgt.name))
+        return "⚠ " + "; ".join(bits)
+
+    def memory():
+        folder = s.transcript.parent.name
+        src_dir, _ = memory_dir(s.account, folder, s.cwd)
+        tgt_dir, tgt_how = memory_dir(tgt, folder, s.cwd)
+        if os.path.normpath(src_dir) == os.path.normpath(tgt_dir):
+            return ""                     # one store: there is nothing to say
+        src_mem = s.transcript.parent / "memory"
+        notes = len([p for p in src_mem.iterdir()]) if src_mem.is_dir() else 0
+        if not notes:
+            return ""                     # nothing to lose
+        tgt_own = (Path(tgt_dir).is_dir() and any(Path(tgt_dir).iterdir()))
+        return ("⚠ auto-memory is per account here: %s reads %s (%s), while this project "
+                "has %d note file(s) in %s. %s Point every home's settings `env.%s` at one "
+                "directory to share one store"
+                % (tgt.name, tilde(tgt_dir), tgt_how, notes, s.account.name,
+                   "The target has its own notes for this project, and the moved session "
+                   "reads those." if tgt_own else
+                   "The steps below say what happens to them; a copy becomes a second set "
+                   "that then drifts.", MEMORY_DIR_ENV))
+
+    def shell_memory():
+        if not os.environ.get(MEMORY_DIR_ENV):
+            return ""
+        if memory_store(tgt)[0]:
+            return ""
+        return ("⚠ %s is set in THIS shell but not in %s's settings: the moved session does "
+                "not inherit it (every CLAUDE* variable is scrubbed), so it will read memory "
+                "from the config home instead. Put it in the home's settings `env` block"
+                % (MEMORY_DIR_ENV, tgt.name))
+
+    for fn in (bypass, remote_dialog, plugins, shared_dirs, connectors, memory,
+               shell_memory):
+        note(fn)
+    return out
+
+
 # ------------------------------------------------------------------------------ the move
 
-def check_target(s: Session, tgt: Account, accts: list) -> None:
+def check_target(s: Session, tgt: Account, accts: list) -> str:
+    """Every reason this target is the wrong one. Returns a warning to print, or `""`."""
     others = ", ".join(a.name for a in accts if a.name != s.account.name) or "none"
     if os.path.realpath(str(tgt.home)) == os.path.realpath(str(s.account.home)) \
             and tgt.default == s.account.default:
@@ -819,7 +1521,7 @@ def check_target(s: Session, tgt: Account, accts: list) -> None:
     if not tgt.home.is_dir():
         die(f"{tgt.name}'s home {tilde(tgt.home)} does not exist")
     held = tgt.email
-    signin = ("claude" if tgt.default else f"CLAUDE_CONFIG_DIR={tilde(tgt.home)} claude")
+    signin = signin_gesture(tgt)
     if not held:
         die(f"{tgt.name} ({tilde(tgt.home)}) holds no login, so a session moved there could "
             f"not talk to Claude. Sign it in once: {signin}, then /login")
@@ -832,6 +1534,11 @@ def check_target(s: Session, tgt: Account, accts: list) -> None:
             not tgt.org or not src.org or tgt.org == src.org):
         die(f"{tgt.name} is signed in as the same login as {src.name} ({held}): the move "
             "would spend the same quota. Pick a home signed in to another account")
+    # 🛑 LAST, and before anything is written: the state file is not the credential.
+    ok, sentence = login_usable(tgt)
+    if not ok:
+        die(sentence)
+    return sentence
 
 
 def window_name(s: Session) -> str:
@@ -850,16 +1557,24 @@ def tmux_bin() -> str:
 
 
 def tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    """🛑 EVERY tmux call goes through here — send-keys and capture-pane included.
+
+    This is the only place the scrubbed environment, the private test socket and the
+    "tmux is not installed" refusal are applied, and a call that goes around it quietly
+    opts out of all three.
+    """
     exe = tmux_bin()
     if not exe:
         if check:
             die("tmux is not installed: install it, or move with --foreground")
         return subprocess.CompletedProcess(list(args), 127, "", "tmux not found")
+    argv = [exe] + (["-L", TMUX_SOCKET] if TMUX_SOCKET else []) + list(args)
     try:
         # A tmux SERVER started here inherits this environment and hands it to every window
-        # it ever opens, so it gets the scrubbed one: run from inside an agent, it would
-        # otherwise carry that session's identity into unrelated windows.
-        r = subprocess.run([exe, *args], capture_output=True, text=True,
+        # it ever opens, for the life of the server, so it gets the scrubbed one: run from
+        # inside an agent, it would otherwise carry that session's identity into unrelated
+        # windows that anyone opens later.
+        r = subprocess.run(argv, capture_output=True, text=True,
                            env=scrubbed_env(dict(os.environ)))
     except OSError as e:
         if check:
@@ -874,10 +1589,25 @@ def tmux_windows(sess: str) -> list:
     """Window names of one tmux session. ⚠️ Exact match (`=`): tmux matches prefixes, so
     `-t csm-work` would also find `csm-work2`. ⚠️ splitlines, never split(): a window
     name may contain spaces."""
+    return list(tmux_window_ids(sess))
+
+
+def tmux_window_ids(sess: str) -> dict:
+    """`{window name: window id}` for one tmux session; `{}` when there is no such session.
+
+    The id (`@7`) is what the live registry's `tmux` field names, so `stop` can insist that
+    the process it is about to signal is really the one sitting in the window csm opened.
+    """
     if tmux("has-session", "-t", f"={sess}", check=False).returncode != 0:
-        return []
-    r = tmux("list-windows", "-t", f"={sess}", "-F", "#{window_name}", check=False)
-    return [x.strip() for x in r.stdout.splitlines()]
+        return {}
+    r = tmux("list-windows", "-t", f"={sess}", "-F", "#{window_id} #{window_name}",
+             check=False)
+    out = {}
+    for line in r.stdout.splitlines():
+        wid, _, name = line.strip().partition(" ")     # a window name may contain spaces
+        if wid.startswith("@") and name:
+            out[name] = wid
+    return out
 
 
 def claude_bin() -> str:
@@ -917,14 +1647,30 @@ def preflight(s: Session, tgt: Account, mode: str, dry: bool) -> list:
             stop.append(f"{tgt.name} is ALREADY running session {s.short} (pid {twin.get('pid')}): "
                         f"{tilde(dest)} is that process's own transcript. Stop it there "
                         "first, or move this session to a third account")
+    # 🛑 The same id in two project folders of one home makes `--resume <id>` ambiguous.
+    # The CLI looks in the cwd's own folder, then sibling worktrees, then scans every
+    # folder for `<id>.jsonl` and takes the hit ONLY when exactly one file matches. A copy
+    # left in another folder by an earlier move out of a third account would make the hit
+    # ambiguous, and the window would die after the state file had already been written.
+    try:
+        twins = sorted(q for q in tgt.projects.glob("*/" + s.transcript.name)
+                       if os.path.normpath(str(q)) != os.path.normpath(str(dest)))
+    except OSError:
+        twins = []
+    if twins:
+        stop.append("%s already holds session %s in another project folder (%s), and this "
+                    "move would put a second copy in %s: `--resume %s` finds an id only "
+                    "when exactly ONE file in the home matches. Delete or rename the other "
+                    "copy, or move this session to a third account"
+                    % (tgt.name, s.short, tilde(twins[0]), tilde(dest.parent), s.short))
     if mode != "foreground":
         if not tmux_bin():
             stop.append("tmux is not installed: install it, or move with --foreground")
         elif window_name(s) in tmux_windows(tgt.tmux_session):
             stop.append(f"a window {window_name(s)} already exists in tmux session "
-                        f"{tgt.tmux_session}: this session was moved there before. Close it "
-                        f"(tmux kill-window -t '={tgt.tmux_session}:={window_name(s)}') "
-                        "or pick another account")
+                        f"{tgt.tmux_session}: this session was moved there before. End that "
+                        f"one first (`csm stop {s.short}`, which also frees the window) or "
+                        "pick another account")
     if stop and not dry:
         die("; and ".join(stop))
     return stop
@@ -937,7 +1683,9 @@ def dest_of(s: Session, tgt: Account) -> Path:
     path the session was LAUNCHED from (every non-alphanumeric character becomes `-`) but
     records the RESOLVED path as `cwd`, so a session started through a symlink is filed
     under the symlink's spelling. Reusing the source's folder name keeps the copy exactly
-    where the same CLI put the original; `--resume <id>` finds it in any folder anyway.
+    where the same CLI put the original. `--resume <id>` also finds it in another folder,
+    but only when exactly one file in the home matches — which is why `preflight` refuses
+    a move into a home that already holds this id somewhere else.
     """
     return tgt.projects / s.transcript.parent.name / s.transcript.name
 
@@ -948,9 +1696,14 @@ def clear_first_run(tgt: Account, cwd: str, apply: bool) -> list:
     Measured on the first real move: the workspace-trust dialog for the directory, then
     onboarding (theme picker and security notice). A home that has never run Claude Code
     interactively in that directory has answered neither, and in a detached window nobody
-    is there to. Nothing else in the file is read or rewritten; it is replaced through a
-    temp file in the same directory, keeping its mode, and the old one is kept as
-    `.claude.json.csm-bak`.
+    is there to. Both are built cancel-first and focused on the cancelling answer, so a
+    stray Enter declines — pre-answering them is far safer than keying them.
+
+    Nothing else in the file is read or rewritten: the CLI's own `.claude.json.lock` is
+    taken, the file is re-read inside it, only the two keys csm owns are merged in, and it
+    is replaced through a temp file in the same directory, keeping its own mode, with the
+    old one kept as `.claude.json.csm-bak-<epoch>`. A lock that cannot be taken is a
+    warning, never a refusal.
     """
     p = tgt.state_file
     d = read_json(p) if p.exists() else {}
@@ -959,36 +1712,123 @@ def clear_first_run(tgt: Account, cwd: str, apply: bool) -> list:
     projects = d.get("projects") if isinstance(d.get("projects"), dict) else {}
     entry = projects.get(cwd) if isinstance(projects.get(cwd), dict) else {}
     todo = []
+    cold = d.get("hasCompletedOnboarding") is not True
     if entry.get("hasTrustDialogAccepted") is not True:
         todo.append(f"trust {cwd}")
-    if d.get("hasCompletedOnboarding") is not True:
+    if cold:
         todo.append("mark onboarding done")
-    if not d.get("theme"):
-        todo.append("set a theme (dark)")
+        if not d.get("theme"):
+            todo.append("set a theme (dark)")
+    # 🛑 A home that has already answered both gates for this directory produces an EMPTY
+    # todo and its state file is not opened for writing at all. Writing a theme into a home
+    # that simply never set one would rewrite someone else's config file on every move, and
+    # hand it a preference the CLI never put there.
     if not todo or not apply:
         return todo
-    entry["hasTrustDialogAccepted"] = True
-    projects[cwd] = entry
-    d["projects"] = projects
-    d["hasCompletedOnboarding"] = True
-    d.setdefault("theme", "dark")
     tmp = p.with_name(p.name + ".csm-tmp")
     mode = 0o600
-    try:
-        if p.exists():
-            mode = p.stat().st_mode & 0o777       # keep the file's own mode, never widen it
-            shutil.copy2(str(p), str(p.with_name(p.name + ".csm-bak")))
-        tmp.write_text(json.dumps(d, indent=2))
-        os.chmod(str(tmp), mode)
-        os.replace(str(tmp), str(p))
-    except OSError as e:
-        die(f"cannot pre-answer the first-run dialogs in {tilde(p)}: {e}")
+    with state_lock(p) as lk:
+        if not lk.held:
+            msg = ("could not take %s within %gs, so another session may be writing that "
+                   "file; pre-answering anyway" % (tilde(lk.path), STATE_LOCK_WAIT_S))
+            print("csm: ⚠ " + msg, file=sys.stderr)
+            log(msg)
+        # 🛑 Re-read INSIDE the lock and merge only the keys csm owns. Whatever the CLI
+        # wrote since the plan was built (lastSessionId, per-turn metrics) stays; the read
+        # above was for the plan, and a plan is not a snapshot to write back.
+        fresh = read_json(p) if p.exists() else {}
+        if p.exists() and not isinstance(fresh, dict):
+            die(f"{tilde(p)} is not a JSON object: refusing to touch it")
+        if not isinstance(fresh, dict):
+            fresh = {}
+        projects = fresh.get("projects") if isinstance(fresh.get("projects"), dict) else {}
+        entry = projects.get(cwd) if isinstance(projects.get(cwd), dict) else {}
+        entry["hasTrustDialogAccepted"] = True
+        projects[cwd] = entry
+        fresh["projects"] = projects
+        if cold:
+            fresh["hasCompletedOnboarding"] = True
+            fresh.setdefault("theme", "dark")
+        try:
+            if p.exists():
+                mode = p.stat().st_mode & 0o777   # keep the file's own mode, never widen it
+                # The backup carries an epoch, so a second move cannot discard the first one.
+                shutil.copy2(str(p), str(p.with_name("%s.csm-bak-%d" % (p.name,
+                                                                        int(time.time())))))
+            tmp.write_text(json.dumps(fresh, indent=2))
+            os.chmod(str(tmp), mode)
+            os.replace(str(tmp), str(p))
+        except OSError as e:
+            die(f"cannot pre-answer the first-run dialogs in {tilde(p)}: {e}")
     log(f"pre-answered in {p}: {'; '.join(todo)}")
     return todo
 
 
-def copy_tree(src: Path, dst: Path) -> None:
-    """Merge-copy a directory, symlinks as symlinks (no `dirs_exist_ok` before Python 3.8)."""
+#: How long to wait for the CLI's `.claude.json.lock`, and when to call one abandoned.
+STATE_LOCK_WAIT_S = float(os.environ.get("CSM_LOCK_WAIT", "2"))
+STATE_LOCK_STALE_S = 120.0
+
+
+class state_lock(object):
+    """The CLI's own `<file>.lock` directory, held for the shortest possible window.
+
+    🛑 The target home is not idle just because this session is not in it. The CLI writes
+    `.claude.json` at startup and at the end of every turn, and it guards those writes
+    with a lock DIRECTORY beside the file. A read-modify-replace that ignores the lock
+    loses whichever write lands second — either the CLI's update, or the trust key csm
+    just wrote, in which case the moved window stops on the very dialog the move
+    pre-answered.
+
+    ⚠️ It can never fail the move. A lock that cannot be taken within a couple of seconds
+    is reported and stepped over: an unattended move must not die because another session
+    was mid-write, and the merge below re-reads the file inside the attempt either way.
+    `held` says which of the two happened.
+    """
+
+    def __init__(self, p):
+        self.path = Path(str(p) + ".lock")
+        self.held = False
+
+    def __enter__(self):
+        deadline = time.time() + max(0.0, STATE_LOCK_WAIT_S)
+        while True:
+            try:
+                os.mkdir(str(self.path))
+                self.held = True
+                return self
+            except FileExistsError:
+                try:
+                    age = time.time() - os.stat(str(self.path)).st_mtime
+                except OSError:
+                    age = 0.0
+                if age > STATE_LOCK_STALE_S:
+                    try:
+                        os.rmdir(str(self.path))        # abandoned by a dead writer
+                        continue
+                    except OSError:
+                        pass
+            except OSError:
+                return self                             # unwritable dir: say so, carry on
+            if time.time() >= deadline:
+                return self
+            time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        if self.held:
+            try:
+                os.rmdir(str(self.path))
+            except OSError:
+                pass
+        self.held = False
+        return False
+
+
+def copy_tree(src: Path, dst: Path, overwrite: bool = True) -> None:
+    """Merge-copy a directory, symlinks as symlinks (no `dirs_exist_ok` before Python 3.8).
+
+    With `overwrite=False` a file already in the destination is left exactly as it is: that
+    is how the session's side data is carried into a home that may have some of its own.
+    """
     for root, dirs, files in os.walk(str(src)):
         rel = os.path.relpath(root, str(src))
         here = dst if rel == "." else dst / rel
@@ -999,12 +1839,42 @@ def copy_tree(src: Path, dst: Path) -> None:
                 if dp.is_symlink() or dp.exists():
                     continue
                 os.symlink(os.readlink(sp), str(dp))
-            else:
+            elif overwrite or not dp.exists():
                 shutil.copy2(sp, str(dp))
 
 
+def side_data(s: Session, tgt: Account) -> list:
+    """`[(source, destination)]` for the session's own data OUTSIDE `projects/`.
+
+    The CLI files some per-session state under the config home itself, keyed by the session
+    id: `file-history/<id>/` (what `/rewind` restores from) and `tasks/<id>/` (the session's
+    task list), with older builds using `todos/<id>-*.json`. A resume in the target home
+    looks for them under that home, so without them the conversation arrives whole and its
+    rewind history does not.
+
+    🛑 Nothing else travels. `sessions/`, `session-env/`, `shell-snapshots/` and `jobs/`
+    describe a PROCESS or are code-execution surfaces, `bridge-pointer.json` points at a
+    live pid, `.claude.json` is the home's own state, and a credential is never touched.
+    """
+    out = []
+    for name in SIDE_DATA_DIRS:
+        src = s.account.home / name / s.local_id
+        if src.is_dir():
+            out.append((src, tgt.home / name / s.local_id))
+    for name, pattern in SIDE_DATA_GLOBS:
+        try:
+            found = sorted((s.account.home / name).glob(pattern.format(id=s.local_id)))
+        except OSError:
+            found = []
+        for src in found:
+            if src.is_file():
+                out.append((src, tgt.home / name / src.name))
+    return out
+
+
 def copy_in(s: Session, tgt: Account, apply: bool):
-    """Copy the transcript, its sibling directory, and the project memory if the target has none."""
+    """Copy the transcript, its sibling directory and the session's side data — and never
+    the project's auto-memory."""
     dest = dest_of(s, tgt)
     folder = dest.parent
     steps = [f"copy {s.transcript.name} to {tilde(folder)}/"]
@@ -1012,10 +1882,29 @@ def copy_in(s: Session, tgt: Account, apply: bool):
         steps.append(f"back up the target's existing copy of {dest.name} first (it is not running)")
     if s.sibling.is_dir():
         steps.append(f"copy {s.sibling.name}/ (subagents, tool results)")
+    extra = side_data(s, tgt)
+    if extra:
+        steps.append("copy this session's %s (additively, never overwriting)"
+                     % ", ".join(sorted({p.parent.name for p, _ in extra})))
+    # 🛑 Auto-memory is NEVER copied, in any configuration. A copy is exactly how one
+    # store becomes two that drift apart, with nothing afterwards reporting the fork, and
+    # the one case where it looks harmless (neither home has a store, the target has no
+    # notes yet) is the case that creates the second store. The plan says where the moved
+    # session will read instead, so the choice is the user's and it is an explicit one.
     src_mem, tgt_mem = s.transcript.parent / "memory", folder / "memory"
-    take_mem = src_mem.is_dir() and any(src_mem.iterdir()) and not tgt_mem.exists()
-    if take_mem:
-        steps.append("copy the project's memory/ (the target has none)")
+    store_tgt, how_tgt, _keyed_tgt = memory_store(tgt)
+    has_notes = src_mem.is_dir() and any(src_mem.iterdir())
+    if store_tgt:
+        steps.append("copy NO memory/: %s reads auto-memory from %s (%s), so a copy would "
+                     "only fork the notes"
+                     % (tgt.name, tilde(memory_dir(tgt, folder.name, s.cwd)[0]), how_tgt))
+    elif has_notes and tgt_mem.exists():
+        steps.append("copy NO memory/: %s already has its own notes for this project, and "
+                     "the moved session will read those" % tgt.name)
+    elif has_notes:
+        steps.append("copy NO memory/: %s starts this project with no notes — a copy is "
+                     "how one store becomes two. Point both homes' settings at one store "
+                     "to share them" % tgt.name)
     if not apply:
         return dest, steps
     folder.mkdir(parents=True, exist_ok=True)
@@ -1027,8 +1916,15 @@ def copy_in(s: Session, tgt: Account, apply: bool):
     os.chmod(str(dest), 0o600)
     if s.sibling.is_dir():
         copy_tree(s.sibling, folder / s.sibling.name)
-    if take_mem:
-        copy_tree(src_mem, tgt_mem)
+    for src, dst in extra:
+        try:
+            if src.is_dir():
+                copy_tree(src, dst, overwrite=False)
+            elif not dst.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src), str(dst))
+        except OSError as e:                      # side data is a nicety, never the move
+            log(f"could not copy {src} to {dst}: {e}")
     return dest, steps
 
 
@@ -1048,8 +1944,10 @@ def rc_label(text: str, tail: str = "") -> str:
 
 
 def scrubbed_env(base: dict) -> dict:
+    """The environment with both families removed — by PREFIX, so it is closed under names
+    that do not exist yet. `KEEP_EXACT` is the one allowlist, and it is empty by default."""
     return {k: v for k, v in base.items()
-            if k not in SCRUB_EXACT and not k.startswith(SCRUB_PREFIXES)}
+            if k in KEEP_EXACT or (k not in SCRUB_EXACT and not k.startswith(SCRUB_PREFIXES))}
 
 
 def make_plan(s: Session, tgt: Account, rc_name, perm: str) -> dict:
@@ -1107,46 +2005,119 @@ def start_window(s: Session, tgt: Account, plan: dict) -> Path:
     return plan_path
 
 
-#: Prompts a resumed session can stop on in a cold home, and how each is answered. The
-#: state-file pre-answers make the trust and onboarding prompts unreachable in the normal case,
-#: so this is the belt and braces. 🛑 Answer by the option's NUMBER, never with arrow keys: in CLI 2.1.296
-#: "Yes, I trust this folder" is option 1, so Down+Enter would choose "No".
+#: 🛑 The focus marker the CLI draws beside the option Enter would choose. It is also the
+#: ordinary input line's glyph, which is why the search starts at the prompt's own line.
+FOCUS_MARK = "❯"
+#: At most this many keys per prompt: a dialog that never clears is left on the screen for
+#: a person instead of being keyed at forever.
+MAX_PROMPT_KEYS = 6
+
+#: The blocking dialogs a resumed session can stop on in a cold home, as rows
+#: `(name, the prompt, the option wanted, the cancelling option, bypass only)`. The
+#: state-file pre-answers make trust and onboarding unreachable in the normal case, so this
+#: is the belt and braces.
+#:
+#: 🛑 ANSWERED BY THE MARKER, never by an option number and never by a canned keystroke.
+#: Measured on CLI 2.1.300: these dialogs are built `hideIndexes: true, cancelFirst: true,
+#: focus: "cancel"`, so the cancelling answer is drawn FIRST, holds the focus, and NO option
+#: numbers appear on the screen at all. A tool that types "1" sends a stray character, and
+#: one that then presses Enter confirms "No, exit" — killing the window it was asked to
+#: rescue. Re-verify on a new CLI by starting it in a throwaway config home in an untrusted
+#: directory and reading `tmux capture-pane -p -J`.
+#:
+#: ⚠️ Not every dialog is cancel-first. The auto-mode offer below draws "Yes, set auto
+#: mode …" FIRST and focused, so a tool that assumed the shape rather than reading the
+#: marker would accept it — and accepting it WEAKENS that home's default mode for good.
+#: Reading the marker is what makes one rule safe for both shapes.
 PROMPTS = (
-    (re.compile(r"trust this folder|Is this a project you created"), r"(\d)\.\s*Yes"),
-    (re.compile(r"Bypass Permissions mode"), r"(\d)\.\s*Yes, I accept"),
-    (re.compile(r"Enable Remote Control\?"), None),      # "Choose [1/2] (default: 1)": Enter
-    (re.compile(r"Press Enter to continue|Choose the text style"), None),
+    ("trust", re.compile(r"Is this a project you created|trust this folder"),
+     re.compile(r"Yes, I trust this folder"),
+     re.compile(r"No, exit|No, continue without these permissions"), False),
+    # A home governed by managed settings asks the same question with other words.
+    ("trust-settings", re.compile(r"Do you trust these settings\?"),
+     re.compile(r"Yes, I trust these settings"),
+     re.compile(r"No, exit"), False),
+    ("bypass", re.compile(r"WARNING: Claude Code running in Bypass Permissions mode"),
+     re.compile(r"Yes, I accept"), re.compile(r"No, exit"), True),
+    # Offered once per home, to a home whose settings set a defaultMode and leave
+    # disableAutoMode unset. Declining is the only safe answer: accepting it rewrites the
+    # home's default for every later session, not just this one.
+    ("auto-mode-default",
+     re.compile(r"Make auto mode your default permission mode\?"),
+     re.compile(r"No, keep"), re.compile(r"Yes, set auto mode"), False),
+    ("remote-control", re.compile(r"Enable Remote Control\?"),
+     re.compile(r"Enable Remote Control(?!\?)"), re.compile(r"Never mind"), False),
+    ("theme", re.compile(r"Choose the text style"), None, None, False),
+    ("continue", re.compile(r"Press Enter to continue"), None, None, False),
 )
 
 
-def answer_prompt(target: str, pane: str, perm: str, tries: dict) -> bool:
-    """Answer one blocking prompt if the pane shows one; True when keys were sent.
+def prompt_answer(pane: str, mode: str, tries: dict):
+    """`(prompt name, the ONE key to send)` for the pane as it is now; `("", "")` for none.
 
-    First sighting: the option's number (or Enter where the default is the right answer).
-    A later sighting of the same prompt, one poll on: Enter, in case the number only moved
-    the cursor. After two tries, nothing: the wait runs out and the window is left for a
-    person to look at. The bypass-mode warning is accepted only for a session that already
-    ran in that mode, i.e. whose owner already accepted it once.
+    Pure, so the rule can be tested without a terminal. The rule:
+      * the first matching prompt wins and RETURNS — never falls through to a later
+        pattern, or an old "Press Enter to continue" still in the scrollback would send an
+        Enter onto a live dialog's focused cancel;
+      * the bypass warning is answered only when the move is deliberately starting the
+        session in bypassPermissions;
+      * a screen that is not a choice (theme, "Press Enter to continue") gets one Enter;
+      * otherwise the pane is read from the TOP OF THE DIALOG downwards — the earliest of
+        the prompt line and the two option lines, because a short window scrolls the
+        prompt off and leaves the focused option above the first line that matched, while
+        the marker glyph is also the input line's, so a marker above the whole dialog must
+        still not be read as its focus — and the decision is taken from the MARKER'S OWN
+        LINE: the wanted label on it → Enter; both labels on it (`capture-pane -J` joins
+        wrapped lines, so one row can hold both) → nothing at all, which is the one safe
+        way to be wrong; otherwise → Down.
+    🛑 `Down` WRAPS in a two-option list, so "press Down until the marker is where I want
+    it" terminates for a list of any length and a repeat can never confirm the cancel.
     """
-    for rx, opt in PROMPTS:
-        if not rx.search(pane):
+    for name, rx, want, cancel, bypass_only in PROMPTS:
+        m = rx.search(pane or "")
+        if not m:
             continue
-        if "Bypass" in rx.pattern and perm != "bypassPermissions":
-            return False
-        n = tries.get(rx.pattern, 0)
-        if n >= 2:
-            return False
-        key = "Enter"
-        if opt and n == 0:
-            m = re.search(opt, pane)
-            if not m:
-                return False
-            key = m.group(1)
-        tries[rx.pattern] = n + 1
-        subprocess.run([tmux_bin(), "send-keys", "-t", target, key], capture_output=True)
-        log(f"answered '{rx.pattern}' in {target} with {key}")
-        return True
-    return False
+        if bypass_only and mode != "bypassPermissions":
+            return name, ""
+        if tries.get(name, 0) >= MAX_PROMPT_KEYS:
+            return name, ""
+        if want is None:
+            return name, "Enter"
+        lines = pane.splitlines()
+        starts = [pane[:m.start()].count("\n")]
+        for rx in (want, cancel):
+            if rx is None:
+                continue
+            for i, ln in enumerate(lines):
+                if rx.search(ln):
+                    starts.append(i)
+                    break
+        block = lines[min(starts):]
+        if not any(want.search(ln) for ln in block):
+            return name, ""                        # the option is not on screen (yet)
+        marker = next((ln for ln in block if FOCUS_MARK in ln), "")
+        if not marker:
+            return name, ""                        # no focus drawn: leave it readable
+        on_want = bool(want.search(marker))
+        on_cancel = bool(cancel.search(marker)) if cancel else False
+        if on_want and on_cancel:
+            return name, ""
+        return name, ("Enter" if on_want else "Down")
+    return "", ""
+
+
+def answer_prompt(target: str, pane: str, mode: str, tries: dict) -> bool:
+    """Send at most ONE key for whatever the pane is showing; True when a key was sent."""
+    name, key = prompt_answer(pane, mode, tries)
+    if not key:
+        if name and tries.get(name, 0) >= MAX_PROMPT_KEYS and not tries.get(name + "!"):
+            tries[name + "!"] = 1
+            log(f"gave up on the '{name}' prompt in {target} after {MAX_PROMPT_KEYS} keys")
+        return False
+    tries[name] = tries.get(name, 0) + 1
+    tmux("send-keys", "-t", target, key, check=False)
+    log(f"answered the '{name}' prompt in {target} with {key}")
+    return True
 
 
 def wait_window(sess: str, win: str, seconds: float, want_link: bool, perm: str):
@@ -1162,8 +2133,8 @@ def wait_window(sess: str, win: str, seconds: float, want_link: bool, perm: str)
     pane = ""
     tries = {}
     while time.time() < start + seconds:
-        r = subprocess.run([tmux_bin(), "capture-pane", "-p", "-J", "-t", target],
-                           capture_output=True, text=True)
+        # ⚠️ -J joins wrapped lines, or a wrapped claude.ai link reads as a short, wrong id.
+        r = tmux("capture-pane", "-p", "-J", "-t", target, check=False)
         if r.returncode != 0:
             return "", pane, False                 # the window is gone
         pane = r.stdout or pane
@@ -1181,34 +2152,153 @@ def wait_window(sess: str, win: str, seconds: float, want_link: bool, perm: str)
     return "", pane, not want_link
 
 
-def proc_command(pid: int) -> str:
+def _ps(pid: int, fmt: str, utc: bool = False):
+    """`ps -o <fmt> -p <pid>`: `None` when ps could not be ASKED, `""` when it answered
+    nothing, else the text.
+
+    🛑 The two are deliberately different answers. Conflating them makes a blinded prover
+    look like agreement, and every guard built on it quietly stops guarding.
+
+    🛑 `LC_ALL=C` ALWAYS, and `TZ=UTC` for `lstart=`, because that is exactly how the CLI
+    spells the call that WRITES the start time into the registry. `ps -o lstart=` is
+    locale-sensitive (`Thu Oct 15 23:03:03 2026` under C, `jeu. 15 oct. 23:03:03 2026`
+    under a French locale), so a prover that inherits the user's locale compares a
+    localised string against a C-locale one, finds them different, and reports a pid reuse
+    that did not happen — a false refusal that leaves two copies of a session answering.
+    """
+    env = scrubbed_env(dict(os.environ))
+    env["LC_ALL"] = "C"                   # month and weekday names are locale-dependent
+    env.pop("LC_TIME", None)              # LC_ALL wins, but leave nothing to argue with
+    env.pop("LANG", None)
+    if utc:
+        env["TZ"] = "UTC"                 # ps prints LOCAL time; the registry records UTC
     try:
-        return subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True,
-                              text=True, timeout=5).stdout.strip()
+        r = subprocess.run(["ps", "-o", fmt, "-p", str(pid)], capture_output=True,
+                           text=True, timeout=10, env=env)
     except (OSError, subprocess.SubprocessError):
+        return None
+    return (r.stdout or "").strip() if r.returncode == 0 else ""
+
+
+def is_claude_exe(cmd: str) -> bool:
+    """Is this command line's argv[0] the Claude Code CLI?
+
+    🛑 argv[0] ONLY, never a substring of the whole line: `"claude" in command` passes for
+    `vim ~/.claude/settings.json`, `tail -f claude.log`, or anything running under a
+    directory whose name contains the word. A terminal session runs as `claude`; a worker
+    spawned by a Remote Control server runs as the versioned binary.
+    """
+    argv0 = (cmd or "").strip().split(" ")[0]
+    if not argv0:
+        return False
+    return os.path.basename(argv0) == "claude" or CLAUDE_VERSIONS_DIR in argv0
+
+
+def still_the_same_process(s: Session):
+    """`(ok, why)` — is pid <n> still the process the registry wrote down?
+
+    🛑 Registry files outlive their processes and pids are reused, so "the file says pid
+    4242" is not evidence. The proof is the pid PLUS its start time, compared byte for byte
+    against `LC_ALL=C TZ=UTC ps -o lstart= -p <pid>` (whitespace-normalised, because ps
+    pads single-digit days). An unprovable identity is a REFUSAL, not a fallback: "never
+    signal what cannot be proved" has to hold precisely when the prover is the thing that
+    broke.
+
+    🛑 There is NO name-based fallback. A registry row with no recorded start time cannot
+    be proved, and "argv[0] is the Claude Code CLI" is not proof of WHICH session: on a
+    machine running several of them, pid reuse by a different Claude Code process passes
+    that test and the signal lands on someone else's work. `is_claude_exe` stays as an
+    EXTRA condition on top of the start time, never as a substitute for it.
+    """
+    if not s.pid:
+        return False, "no pid is recorded for that session"
+    if not pid_alive(s.pid):
+        return False, f"pid {s.pid} had already exited"
+    if not s.proc_start:
+        return False, (f"the registry row for pid {s.pid} recorded no start time, so the "
+                       "process cannot be identified: nothing was stopped and nothing was "
+                       "proved")
+    got = _ps(s.pid, "lstart=", utc=True)
+    if got is None:
+        return False, (f"ps could not be asked about pid {s.pid}, so the process could "
+                       "not be identified: nothing was stopped and nothing was proved")
+    if not got:
+        return False, f"ps named no start time for pid {s.pid}"
+    norm = lambda t: " ".join(t.split())
+    if norm(got) != norm(s.proc_start):
+        return False, (f"pid {s.pid} has been reused: it started at {norm(got)}, the "
+                       f"session's registry row says {norm(s.proc_start)}")
+    cmd = _ps(s.pid, "command=")
+    if cmd is None:
+        return False, (f"ps could not be asked what pid {s.pid} is running: nothing was "
+                       "stopped and nothing was proved")
+    if not cmd:
+        return False, f"ps named no command for pid {s.pid}"
+    if not is_claude_exe(cmd):
+        return False, (f"pid {s.pid} has the start time the registry recorded but is not "
+                       "running the Claude Code CLI: nothing was stopped and nothing was "
+                       "proved")
+    return True, f"pid {s.pid} still has the start time the registry recorded"
+
+
+def capture_pane(s: Session, pane: str, why: str) -> str:
+    """Park a pane's whole scrollback in a dated 0600 file BEFORE anything is signalled.
+
+    🛑 CAPTURE FIRST, PROVE, THEN SIGNAL. Everything else a session owns is on disk and
+    survives a SIGTERM; the pane does not. A prompt the agent had composed and not yet sent,
+    the tail of a long tool output, the reason it was stuck — all of it lives only in the
+    terminal's scrollback, and `tmux kill-window` destroys the pane along with the process.
+
+    ⚠️ It can NEVER fail the stop. Every error is swallowed and answered with `""`: a session
+    the user asked to stop must stop whether or not its scrollback could be read. The caller
+    prints the path only when there is one.
+    """
+    if not pane:
+        return ""
+    try:
+        d = CAPTURES / time.strftime("%Y-%m-%d")
+        d.mkdir(parents=True, exist_ok=True)
+        os.chmod(d, 0o700)
+        r = tmux("capture-pane", "-p", "-S", "-", "-t", pane, check=False)
+        if r.returncode != 0 or not (r.stdout or "").strip():
+            return ""
+        out = d / f"{time.strftime('%H%M%S')}-{s.account.name}-{s.short}.txt"
+        fd = os.open(str(out), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(f"# csm {why}: {s.account.name} {s.local_id} pane {pane} on {host()} "
+                    f"at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(r.stdout)
+        log(f"captured {pane} -> {out} before {why}")
+        return str(out)
+    except (OSError, ValueError) as e:
+        log(f"could not capture {pane} before {why}: {e}")
         return ""
 
 
 def stop_source(s: Session) -> str:
-    """SIGTERM the source process: the one pid the registry gave, never a pattern."""
+    """SIGTERM the source process: the one pid the registry gave, never a pattern, and only
+    once `still_the_same_process` has proved it is still that process."""
     if not s.pid:
         return "the source was not running, so there was nothing to stop"
     if s.is_self:
         return ("left the source RUNNING on purpose: it is the session running this command, "
                 "and stopping it would kill the turn that reports the move. Close it in the "
                 "app, so only the moved copy gets your next message")
-    if not pid_alive(s.pid):
-        return f"the source (pid {s.pid}) had already exited"
-    if "claude" not in proc_command(s.pid).lower():
-        return (f"left pid {s.pid} alone: it is no longer a claude process (the registry "
-                "file outlived its process and the pid was reused)")
+    ok, why = still_the_same_process(s)
+    if not ok:
+        log(f"did not signal pid {s.pid} ({s.local_id}, {s.account.name}): {why}")
+        return f"left pid {s.pid} alone: {why}"
+    # The proof above is still what authorises the signal; the capture goes between the two,
+    # so an unsent draft outlives the process it was being written in.
+    kept = capture_pane(s, s.tmux or "", "--stop-source")
     try:
         os.kill(s.pid, signal.SIGTERM)
     except OSError as e:
         return f"could not stop the source (pid {s.pid}): {e}"
-    log(f"stopped source pid {s.pid} ({s.local_id}, {s.account.name})")
+    log(f"stopped source pid {s.pid} ({s.local_id}, {s.account.name}): {why}")
     return (f"stopped the source process (pid {s.pid}), so only one copy answers. The session "
-            f"is still in {s.account.name}'s list; archive it in the app if you want it gone")
+            f"is still in {s.account.name}'s list; archive it in the app if you want it gone"
+            + (f". Its pane's scrollback is kept at {tilde(Path(kept))}" if kept else ""))
 
 
 def target_quota_note(tgt: Account) -> str:
@@ -1235,7 +2325,7 @@ def do_move(args, accts: list) -> int:
     rows = all_sessions(accts, ALL_LIMIT if args.all else max(DEFAULT_LIMIT, 60))
     s = pick(args.session, rows)
     tgt = resolve(args.to, accts)
-    check_target(s, tgt, accts)
+    unverified = check_target(s, tgt, accts)
     mode = "foreground" if args.foreground else ("tmux" if args.no_remote_control else "remote")
     if args.foreground and os.environ.get("CLAUDECODE"):
         die("--foreground runs the session in THIS terminal, and this command is running "
@@ -1244,12 +2334,13 @@ def do_move(args, accts: list) -> int:
         die("--stop-source needs the default Remote Control mode: the claude.ai link the new "
             "window prints is the proof it connected, and without that proof the source "
             "must keep running")
-    perm = args.permission_mode or s.perm or "default"
+    perm, why_perm = resolve_mode(s, tgt, args.permission_mode)
     blockers = preflight(s, tgt, mode, args.dry_run)
     rc_name = None
     if mode == "remote":
         rc_name = rc_label(args.name or s.label, "" if args.name else f"moved from {s.account.name}")
     warn = target_quota_note(tgt)
+    notes = target_notes(s, tgt, perm)
 
     plan = [f"MOVE  {s.label}",
             f"      {s.account.name} ({s.account.email or 'no login'})  ->  {tgt.name} ({tgt.email})",
@@ -1265,8 +2356,13 @@ def do_move(args, accts: list) -> int:
     elif s.status == "busy":
         plan.append("      ⚠ the source is mid-turn: its current answer is not on disk yet, so "
                     "the copy ends just before it")
+    plan.append(f"      mode {perm} ({why_perm})")
     if warn:
         plan.append(f"      {warn}")
+    for n in notes:
+        plan.append(f"      {n}")
+    if unverified:
+        plan.append(f"      {unverified}")
     first = clear_first_run(tgt, s.cwd, apply=False)
     dest, steps = copy_in(s, tgt, apply=False)
     plan += ["", "steps:"] + [f"  - {t}" for t in steps]
@@ -1279,8 +2375,9 @@ def do_move(args, accts: list) -> int:
              else f"in tmux {tgt.tmux_session}:{window_name(s)}")
     plan.append(f"  - start {where}, {env_word}: {shown}")
     if perm == "bypassPermissions" and mode != "foreground":
-        plan.append("  - the session runs in bypassPermissions: if the target shows that mode's "
-                    "warning, accept it, as the source account already did")
+        plan.append("  - the window resumes in bypassPermissions: if it stops on that mode's "
+                    "warning, the\n    answer is walked to “Yes, I accept” by reading the "
+                    "focus marker, one key at a time")
     if args.stop_source:
         plan.append("  - once the new window prints its link, stop the source process"
                     + (f" (pid {s.pid})" if s.pid else " (not running)"))
@@ -1288,6 +2385,8 @@ def do_move(args, accts: list) -> int:
 
     if args.dry_run:
         print("\n".join(plan))
+        print("")
+        print("\n".join(cost_lines(s, tgt)))
         for b in blockers:
             print(f"\n🛑 a real move would be REFUSED: {b}")
         print("\n(dry run: nothing was copied, written or started)")
@@ -1297,11 +2396,19 @@ def do_move(args, accts: list) -> int:
     print("\n".join(plan))
     clear_first_run(tgt, s.cwd, apply=True)
     copy_in(s, tgt, apply=True)
+    # 🛑 The size of the copy, taken BEFORE the window starts: everything past this offset
+    # was written by the moved session, which is the only honest way to report the mode it
+    # actually came up in (the copy already holds every mode the source ever recorded).
+    try:
+        copied_bytes = dest.stat().st_size
+    except OSError:
+        copied_bytes = 0
     log(f"copied {s.local_id} {s.account.name} -> {tgt.name}")
 
     if mode == "foreground":
         print(f"\nresuming here as {tgt.name}. The source is untouched.\n", flush=True)
-        log(f"MOVED (foreground) {s.local_id} {s.account.name} -> {tgt.name}")
+        log(f"MOVED (foreground) {s.local_id} {s.account.name} -> {tgt.name} "
+            f"(asked {perm}; this process is replaced, so nothing is measured after)")
         os.chdir(s.cwd)
         os.execve(run["claude"], claude_argv(run), run_env(run))
 
@@ -1312,10 +2419,13 @@ def do_move(args, accts: list) -> int:
         if not alive:
             print(f"\n⚠ the window exited straight away. Its last lines:\n"
                   + "\n".join("    " + x for x in pane.strip().splitlines()[-8:]))
+            for n in notes:
+                print(f"\n  {n}")
             return 1
-        log(f"MOVED (tmux) {s.local_id} {s.account.name} -> {tgt.name}")
+        log(f"MOVED (tmux) {s.local_id} {s.account.name} -> {tgt.name} (asked {perm})")
         print(f"\n✅ moved. It runs as {tgt.name} ({tgt.email}) in tmux:\n"
               f"    tmux attach -t '={sess}'    (window {win})")
+        print_cost(s, tgt, dest, copied_bytes, pane, perm)
         if warn:
             print(f"\n  {warn}")
         return 0
@@ -1330,23 +2440,190 @@ def do_move(args, accts: list) -> int:
               f"The window is kept, with its scrollback:\n    tmux attach -t '={sess}'    "
               f"(window {win})\nlast lines:\n"
               + "\n".join("    " + x for x in pane.strip().splitlines()[-8:]))
+        # The target notes are the likeliest reason a window stopped before connecting, so
+        # they are repeated here rather than left scrolled off the top of the plan.
+        for n in notes:
+            print(f"\n  {n}")
         if args.stop_source:
             print("\n  source LEFT RUNNING: the move did not connect, so --stop-source was "
                   "not carried out")
         return 1
     note = stop_source(s) if args.stop_source else ""
-    log(f"MOVED {s.local_id} {s.account.name} -> {tgt.name}: {link}")
+    came, how = came_up_as(pane, dest, copied_bytes)
+    log(f"MOVED {s.local_id} {s.account.name} -> {tgt.name}: {link} (asked {perm}, came up "
+        f"{came or 'not measured'})")
     print(f"\n✅ moved. It runs as {tgt.name} ({tgt.email}).")
     print(f"\nOpen the Claude app signed in as {tgt.email} and pick “{s.label}”, or open:\n"
           f"    {link}")
-    print(f"\n  tmux window   {sess}:{win} on {host()}")
+    print(f"\n  tmux window   {sess}:{win} on {host()} (a move stays on one machine: the "
+          "transcript\n                lives in a config home, and homes are per machine)")
     print(f"  source kept   {tilde(s.transcript)}")
     if note:
         print(f"  source        {note}")
-    print("\n  The claude.ai thread starts at the move: the agent remembers the whole "
-          "conversation,\n  but the app does not re-render the earlier turns.")
+    print(f"  link          a NEW claude.ai session, owned by {tgt.email}. The old link "
+          f"still opens\n                {s.account.name}'s copy; the moved agent has the "
+          "whole conversation, and the app\n                may show the thread starting at "
+          "the move.")
+    print_cost(s, tgt, dest, copied_bytes, pane, perm)
     if warn:
         print(f"\n  {warn}")
+    return 0
+
+
+def cost_lines(s: Session, tgt: Account) -> list:
+    """What a move costs, known BEFORE anything starts — so the plan can say it too.
+
+    🛑 A dry run is exactly where "move early, not at the limit" can still be acted on:
+    reading it only in the success block, after the move, is reading it too late.
+    """
+    same_org = bool(s.account.org) and bool(tgt.org) and s.account.org == tgt.org
+    out = ["  what this move costs:"]
+    if same_org:
+        out.append("    * same organization: the session's preserved thinking is KEPT.")
+    else:
+        out.append("    * preserved thinking is bound to the organization that wrote it, "
+                   "so the CLI drops it\n      and the first turn RE-READS the whole "
+                   f"session — on {tgt.name}'s quota. Move early, while\n      there is "
+                   "quota to spare: a long session moved at the limit spends a slice of "
+                   "the\n      quota it was moved to find.")
+    out.append("    * the copied transcript still names the source account inside itself "
+               "(paths and the\n      recorded email from earlier turns), so the moved "
+               "session describes itself as\n      " + s.account.name + " until its "
+               "context is rebuilt. Harmless, but it surprises people.")
+    out.append("    * the prompt cache starts cold, so the first turn is slower.")
+    return out
+
+
+def print_cost(s: Session, tgt: Account, dest: Path, after: int, pane: str, perm: str) -> None:
+    """What the move cost, and which mode it actually came up in."""
+    print("\n" + "\n".join(cost_lines(s, tgt)))
+    came, how = came_up_as(pane, dest, after)
+    if came and came != perm:
+        print(f"\n  🛑 it came up in {came}, not the {perm} that was asked for ({how})."
+              "\n     claude.ai keeps a permission mode on the session's own record and "
+              "restores it over\n     the flag, and a Remote Control session cannot be put "
+              "back into bypassPermissions\n     from the picker. To fix: `csm stop` it and "
+              "move it again, leaving the picker alone.")
+    elif came:
+        print(f"\n  mode {came}, confirmed {how}.")
+    else:
+        print(f"\n  mode {perm} is the mode REQUESTED, not a measurement (the resumed "
+              "session writes its\n  mode with the first prompt). Check it with:  tmux "
+              f"capture-pane -p -J -t '={tgt.tmux_session}:={window_name(s)}' | tail -3")
+
+
+# ------------------------------------------------------------------------------ the stop
+
+def moved_windows(accts: list) -> dict:
+    """`{account name: {window name: window id}}` for the windows csm opens.
+
+    One `list-windows` per account, read ONCE per command: a row-by-row lookup would ask
+    tmux the same question a dozen times and still race with itself.
+    """
+    out = {}
+    for a in accts:
+        wins = tmux_window_ids(a.tmux_session)
+        if wins:
+            out[a.name] = {n: i for n, i in wins.items() if n.startswith("moved-")}
+    return out
+
+
+def registry_window(s: Session) -> str:
+    """The window id the live registry row names (`<session>:@7.%12` → `@7`), or `""`."""
+    m = re.search(r"(@\d+)", s.tmux or "")
+    return m.group(1) if m else ""
+
+
+def do_stop(args, accts: list) -> int:
+    """End a session CSM MOVED, and free the window that blocks a second move.
+
+    🛑 The only authorisation is csm's own fingerprint: a window named `moved-<id8>` in the
+    tmux session `csm-<account>` of the account the row belongs to — and, for a live row,
+    a registry `tmux` field naming that same window id, so that a moved window plus an
+    unrelated reused pid cannot add up to a signal for someone else's process. A window you
+    opened, a server's window, anything else: refused, with the list of what csm did start.
+    Never self, never a transcript.
+    """
+    wins = moved_windows(accts)
+    # 🛑 The windows csm opened are the whole candidate set, and their names carry the
+    # 8-character id prefixes — so the common case reads a handful of transcripts instead
+    # of every transcript in every home. The full scan still runs, but only to produce the
+    # refusal, which keeps ONE producer of that text.
+    prefixes = set(n[len("moved-"):] for w in wins.values() for n in w)
+    rows = all_sessions(accts, ALL_LIMIT, only=prefixes) if prefixes else []
+    mine = [r for r in rows if window_name(r) in wins.get(r.account.name, {})]
+    # The narrowed list first: after a move the same id sits in two homes, and only one of
+    # them has a window csm opened.
+    s = pick(args.session, mine, soft=True)
+    if s is None:
+        rows = all_sessions(accts, ALL_LIMIT)
+        s = pick(args.session, rows)
+    sess, win = s.account.tmux_session, window_name(s)
+    have = wins.get(s.account.name, {})
+    if win not in have:
+        started = "; ".join(f"{a}: {', '.join(sorted(w))}" for a, w in sorted(wins.items()) if w)
+        die(f"{s.short} in {s.account.name} is not a session csm moved: there is no window "
+            f"{win} in tmux session {sess}, and stopping anything csm did not start is not "
+            "this tool's job. Close it in the app, or in its own terminal."
+            + (f" csm has moved: {started}" if started else " csm has moved nothing here."))
+    if s.is_self:
+        die("that is the session running this command: stopping it would kill the turn "
+            f"reporting the result. Run `csm stop {s.short}` from another session, or close "
+            "it in the app")
+    wid = have[win]
+    if s.live and registry_window(s) and registry_window(s) != wid:
+        die(f"{s.short} is running as pid {s.pid}, but its registry row names window "
+            f"{registry_window(s)} while {sess}:{win} is {wid}: that process is not the one "
+            "in the window csm opened, so nothing was stopped")
+    if not s.live:
+        ok, why = False, "it is not running"
+    elif not registry_window(s):
+        # A `moved-` window plus a pid is not the same as a pid IN that window.
+        ok, why = False, ("its registry row does not say which window it runs in, so the "
+                          "pid cannot be tied to the window csm opened")
+    else:
+        ok, why = still_the_same_process(s)
+    kill = f"tmux kill-window -t '={sess}:={win}'"
+    plan = [f"STOP  {s.label}",
+            f"      {s.account.name} session {s.local_id}",
+            f"      window {sess}:{win} ({wid})",
+            "      source: " + (f"live, pid {s.pid}" if s.live else "not running"),
+            "",
+            "steps:",
+            f"  - {'SIGTERM pid %d (%s)' % (s.pid, why) if ok else 'signal no process: ' + why}",
+            f"  - capture the pane's scrollback to {tilde(CAPTURES)}/<date>/ first "
+            f"(0600)",
+            f"  - {kill}",
+            "  - the transcript is NEVER deleted: " + tilde(s.transcript)]
+    if s.live and not ok:
+        plan.append("  - ⚠ killing the window destroys its pane and SIGHUPs the process "
+                    "tree in it, so\n    that process ends with the window even though it "
+                    "was not signalled by pid")
+    print("\n".join(plan))
+    if args.dry_run:
+        print("\n(dry run: nothing was stopped and no window was removed)")
+        return 0
+    # 🛑 Last moment the scrollback exists: the kill-window below destroys the pane, and it
+    # does so whether or not the pid was signalled.
+    kept = capture_pane(s, s.tmux or f"={sess}:={win}", "stop")
+    if ok:
+        try:
+            os.kill(s.pid, signal.SIGTERM)
+        except OSError as e:
+            print(f"\n⚠ could not signal pid {s.pid}: {e}")
+            ok = False
+    gone = tmux("kill-window", "-t", f"={sess}:={win}", check=False).returncode == 0
+    log(f"STOPPED {s.local_id} ({s.account.name}): window {sess}:{win} "
+        f"{'removed' if gone else 'NOT removed'}, pid "
+        f"{s.pid if s.live else 0} {'signalled' if ok else 'not signalled: ' + why}")
+    if not gone:
+        print(f"\n⚠ the window {sess}:{win} could not be removed. Try it by hand: {kill}")
+        return 1
+    print(f"\n✅ stopped. The window is gone, so the session can be moved to "
+          f"{s.account.name} again.\n   Its transcript is untouched: archive it in the app "
+          "if you want it gone.")
+    if kept:
+        print(f"   The pane is gone; its text is not: {tilde(Path(kept))} (0600)")
     return 0
 
 
@@ -1387,6 +2664,815 @@ def run_window(plan_path: str) -> int:
         return rc
 
 
+# --------------------------------------------------------------------------- the matrix
+
+#: 🛑 The verdicts of the fungibility matrix (README.md, docs/fungibility-matrix.md). A
+#: verdict belongs to the LAYER and never moves with what is measured: it says what kind
+#: of thing the layer is, while the cells say what this machine happens to hold.
+V_SHARED = "✅"     # fungible: shared already, or csm carries it across a move
+V_SETUP = "🔧"      # fungible after a one-time setup (one shared file, one key)
+V_PER = "🛑"        # per account, per config home or per machine by design
+
+#: Width-preserving stand-ins, used when stdout cannot encode the glyphs (a C-locale CI,
+#: a pipe through a non-UTF-8 terminal). The table has to print on every machine it can
+#: describe, and each replacement takes exactly the columns of the thing it replaces.
+ASCII_FALLBACK = ((V_SHARED, "ok"), (V_SETUP, "fx"), (V_PER, "no"), ("⚠", "!"),
+                  ("…", "."), ("→", ">"), ("–", "-"), ("·", "-"), ("≠", "!"))
+
+#: The table is laid out for this width. Values that do not fit are truncated; with many
+#: homes it grows past it rather than squeezing a column into uselessness.
+MATRIX_WIDTH = 100
+MATRIX_LAYER_W = 20
+MATRIX_MIN_CELL = 10
+MATRIX_MAX_CELL = 26
+
+#: The entries a home can share with its siblings by pointing at one file or directory.
+#: The flag is whether `--check` fails on a divergence. It is off for two of them:
+#: `settings.local.json` is merged OVER settings.json, so having one is a policy choice;
+#: `scheduled-tasks/` runs on whichever home holds it, so its absence elsewhere is usually
+#: the design and not drift. Both still get a row — an asymmetric settings.local.json is
+#: the commonest reason two homes sharing one settings.json still behave differently.
+SHARED_ENTRIES = (("settings.json", True), ("settings.local.json", False),
+                  ("CLAUDE.md", True), ("skills", True), ("agents", True),
+                  ("commands", True), ("output-styles", True), ("plugins", True),
+                  ("scheduled-tasks", False))
+
+#: A shared file is hashed so two unlinked copies can be reported as identical-but-
+#: separate rather than as divergent. Anything larger is reported without that comparison.
+DIGEST_MAX = 4 * 1024 * 1024
+
+
+def dwidth(s: str) -> int:
+    """Printed columns of a string: 2 for a wide glyph, 0 for a combining mark or VS16."""
+    n = 0
+    for ch in s:
+        if ch == "️" or unicodedata.combining(ch):
+            continue
+        n += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return n
+
+
+def dpad(s: str, w: int) -> str:
+    return s + " " * max(0, w - dwidth(s))
+
+
+def dcut(s: str, w: int) -> str:
+    if dwidth(s) <= w:
+        return s
+    out = ""
+    for ch in s:
+        if dwidth(out + ch) > w - 1:
+            break
+        out += ch
+    return out + "…"
+
+
+def dwrap(text: str, width: int, first: str = "", rest: str = "") -> list:
+    """`text` as lines no wider than `width`, with a hanging indent.
+
+    Not `textwrap`: this has to count PRINTED columns, and textwrap counts code points.
+    A single word wider than `width` — an absolute path, usually — is left whole on its
+    own line: a path is better long than broken in half, where it cannot be copied.
+    """
+    lines, line = [], ""
+    for word in text.split():
+        if not line:
+            line = (first if not lines else rest) + word
+        elif dwidth(line) + 1 + dwidth(word) > width:
+            lines.append(line)
+            line = rest + word
+        else:
+            line += " " + word
+    if line:
+        lines.append(line)
+    return lines
+
+
+def printable(s: str) -> str:
+    """The same text, in whatever stdout can actually encode.
+
+    A matrix that dies of UnicodeEncodeError on a C-locale runner is no use to the check
+    it was written for, so the glyphs degrade to stand-ins of the same width instead.
+    """
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        s.encode(enc)
+        return s
+    except (LookupError, UnicodeEncodeError):
+        pass
+    for a, b in ASCII_FALLBACK:
+        s = s.replace(a, b)
+    try:
+        s.encode(enc)
+    except (LookupError, UnicodeEncodeError):
+        s = s.encode(enc, "replace").decode(enc, "replace")
+    return s
+
+
+def read_json3(p: Path):
+    """`(data, state)` with state `ok` / `absent` / `unreadable` / `unparseable`.
+
+    🛑 Three outcomes, never two. `read_json` folds them into one, which is right for a
+    move (a missing key and a broken file both mean "no value") and wrong here: an ABSENT
+    plugin registry means nothing is installed — a measurement a row must fire on — while
+    an unparseable one means the matrix could not look. A reader that cannot tell them
+    apart prints a green table over a machine it never read.
+
+    🛑 A file whose BYTES are not UTF-8 is `unreadable`, not a traceback. `Path.read_text`
+    raises `UnicodeDecodeError`, which is a `ValueError` and not an `OSError`, so a
+    truncated or byte-corrupted state file would otherwise kill the whole matrix — in the
+    command advertised as safe to run from a hook.
+    """
+    try:
+        text = p.read_bytes().decode("utf-8")
+    except FileNotFoundError:
+        return None, "absent"
+    except OSError:
+        return None, "unreadable"
+    except UnicodeDecodeError:
+        return None, "unreadable"
+    try:
+        return json.loads(text), "ok"
+    except ValueError:
+        return None, "unparseable"
+
+
+def settings3(home: Path):
+    """`(effective settings, state, which file was bad)`.
+
+    `settings.json` with `settings.local.json` layered over it PER KEY PATH — the CLI's own
+    resolution, see `merge_settings` — and an honest state, so a home whose settings do not
+    parse reads as unknown instead of as a home with no plugins, no hooks and no modes.
+    """
+    out, state, bad = {}, "absent", ""
+    for name in SETTINGS_FILES:
+        d, st = read_json3(home / name)
+        if st == "ok":
+            if isinstance(d, dict):
+                out = merge_settings(out, d)
+            state = "ok"
+        elif st in ("unreadable", "unparseable"):
+            return out, st, name
+    return out, state, bad
+
+
+@dataclass
+class Entry:
+    """What a home holds at one shareable path."""
+    kind: str = "absent"            # absent | file | dir | dangling | error
+    real: str = ""
+    link: bool = False
+    digest: str = ""
+    err: str = ""
+
+
+def entry_at(path: Path) -> Entry:
+    """Look at one entry, without following the question.
+
+    🛑 The RESOLVED path is the only honest test of "do these homes share this": two
+    copies with the same bytes today are two files tomorrow. And a symlink whose target is
+    gone — what renaming a home leaves behind — is its own state, never "absent": the CLI
+    simply loads nothing, and says nothing.
+    """
+    try:
+        link = path.is_symlink()
+        here = path.exists()
+        if not link and not here:
+            return Entry("absent")
+        real = os.path.realpath(str(path))
+        if not here:
+            return Entry("dangling", real=real, link=True)
+        if path.is_dir():
+            return Entry("dir", real=real, link=link)
+        dig = ""
+        if path.stat().st_size <= DIGEST_MAX:
+            dig = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+        return Entry("file", real=real, link=link, digest=dig)
+    except OSError as e:
+        return Entry("error", err=(e.strerror or "could not read").lower())
+
+
+@dataclass
+class Cell:
+    """One measurement. `ok` · `diff` (divergent) · `cold` (a per-home gate or a layer
+    nobody has shared yet — needs your hands, not a fault) · `unknown` (could not look,
+    and never counted as a match) · `info` (nothing here is measurable)."""
+    text: str
+    state: str = "ok"
+    why: str = ""
+
+
+@dataclass
+class Row:
+    layer: str
+    verdict: str
+    cells: list = field(default_factory=list)
+    note: str = ""
+    span: bool = False
+    counts: bool = False            # does `--check` fail on this row?
+
+    @property
+    def state(self) -> str:
+        for want in ("diff", "unknown", "cold"):
+            if any(c.state == want for c in self.cells):
+                return want
+        return self.cells[0].state if self.cells else "info"
+
+
+def project_folder(cwd: str) -> str:
+    """The `projects/` directory name the CLI derives from a working directory.
+
+    Every character outside `[A-Za-z0-9]` becomes `-`. Past 200 characters the CLI
+    truncates and appends a hash of its own, which is not reproduced here: such a path
+    gets `""` back, and the caller says `<project>` rather than name a directory that
+    would send someone to the wrong notes.
+    """
+    name = re.sub(r"[^A-Za-z0-9]", "-", cwd or "")
+    return name if 0 < len(name) <= 200 else ""
+
+
+def cli_version():
+    """`(version, where it was read)` — the CLI this machine resolves, WITHOUT running it.
+
+    🛑 No exec. `claude --version` on a cold home can print a first-run banner and start
+    an update check, and the point of this command is that it is safe to run from a hook
+    or a scheduled check. The launcher is a symlink into `…/versions/<version>`, so the
+    answer is one readlink away.
+    """
+    p = claude_bin()
+    if not p:
+        return "", "no `claude` on PATH (and CSM_CLAUDE is not set)"
+    real = os.path.realpath(p)
+    parts = real.split(os.sep)
+    if "versions" in parts:
+        i = len(parts) - 1 - parts[::-1].index("versions")
+        if i + 1 < len(parts):
+            return parts[i + 1], tilde(real)
+    base = os.path.basename(real)
+    if re.match(r"^\d+\.\d+\.\d+", base):
+        return base, tilde(real)
+    return "", ("%s does not resolve into a versions/ directory, and nothing is run to ask"
+                % tilde(p))
+
+
+# ---------------------------------------------------------------------- the matrix rows
+
+def row_account(accts: list) -> Row:
+    """Which account each home last signed in as — the state file's claim, not proof."""
+    cells, bits = [], []
+    for a in accts:
+        d, st = read_json3(a.state_file)
+        if st in ("unreadable", "unparseable"):
+            cells.append(Cell("?", "unknown",
+                              "%s: %s is %s" % (a.name, tilde(a.state_file), st)))
+        elif not a.email:
+            cells.append(Cell("–", "cold", "%s names no account" % a.name))
+        elif a.expect and a.email.lower() != a.expect.lower():
+            cells.append(Cell("≠ " + a.email, "diff"))
+            bits.append("%s is signed in as %s, not the %s its accounts file expects — a "
+                        "move into it would spend the wrong quota"
+                        % (a.name, a.email, a.expect))
+        else:
+            cells.append(Cell(a.email))
+    if any(c.state == "unknown" for c in cells) and not bits:
+        bits = [c.why for c in cells if c.why]
+    return Row("account", V_PER, cells, "; ".join(bits))
+
+
+def row_login(accts: list) -> Row:
+    """The tri-state login check — the same primitive a move refuses on, so the table and
+    the refusal can never disagree. Existence only: no credential value is ever read."""
+    cells, bits = [], []
+    for a in accts:
+        if not a.home.is_dir():
+            cells.append(Cell("no home", "diff"))
+            bits.append("%s: %s does not exist" % (a.name, tilde(a.home)))
+        elif not a.email:
+            cells.append(Cell("signed out", "cold",
+                              "%s holds no login (%s, then /login)"
+                              % (a.name, signin_gesture(a))))
+        else:
+            cred = credential_present(a)
+            if cred is True:
+                cells.append(Cell("ok"))
+            elif cred is False:
+                cells.append(Cell("GONE", "diff"))
+                bits.append("%s still names %s in its state file, but its credential is "
+                            "gone: %s, then /login" % (a.name, a.email, signin_gesture(a)))
+            else:
+                cells.append(Cell("? unverified", "unknown",
+                                  "%s: the credential store could not be asked — over ssh "
+                                  "a macOS login keychain cannot be read at all, which is "
+                                  "not the same as signed out" % a.name))
+    if not bits:
+        bits = [c.why for c in cells if c.why]
+    return Row("login", V_PER, cells, "; ".join(bits), counts=True)
+
+
+def row_entry(accts: list, name: str, counted: bool) -> Row:
+    """One shareable file or directory, across every home."""
+    entries = [entry_at(a.home / name) for a in accts]
+    reals, digests = {}, {}
+    for a, e in zip(accts, entries):
+        if e.kind in ("file", "dir"):
+            reals.setdefault(e.real, []).append(a.name)
+        if e.kind == "file" and e.digest:
+            digests.setdefault(e.digest, []).append(a.name)
+    roots = [(a.name, os.path.realpath(str(a.home))) for a in accts]
+
+    def into_other(me: str, e: Entry) -> str:
+        for nm, root in roots:
+            if nm != me and (e.real == root or e.real.startswith(root + os.sep)):
+                return nm
+        return ""
+
+    unknown = [a.name for a, e in zip(accts, entries) if e.kind == "error"]
+    dangling = [a.name for a, e in zip(accts, entries) if e.kind == "dangling"]
+    crossed = [(a.name, into_other(a.name, e)) for a, e in zip(accts, entries)
+               if e.kind in ("file", "dir") and into_other(a.name, e)]
+    present = [e for e in entries if e.kind in ("file", "dir")]
+    readable = len(accts) - len(unknown)
+    # 🛑 ONE realpath for every home IS shared, wherever that path happens to be. The
+    # commonest working layout puts the shared copy in the default home and links the
+    # others at it; calling that a divergence contradicts the legend, makes `--check`
+    # impossible to get green, and flips the verdict with the column selection. Where the
+    # copy lives is a fragility worth a NOTE (rename that home and every link dangles),
+    # not a fault. A dangling link, two realpaths, or a home missing the entry altogether
+    # are the real divergences.
+    diverged = bool(dangling) or (
+        len(accts) > 1 and bool(present) and (len(reals) > 1 or len(present) != readable))
+    state = "diff" if diverged else ("unknown" if unknown else "ok")
+
+    cells = []
+    for a, e in zip(accts, entries):
+        if e.kind == "error":
+            cells.append(Cell("?", "unknown", "%s: %s" % (a.name, e.err)))
+        elif e.kind == "dangling":
+            cells.append(Cell("DANGLING", "diff"))
+        elif e.kind == "absent":
+            cells.append(Cell("–", "diff" if state == "diff" else "ok"))
+        elif state == "ok" and len(accts) > 1:
+            cells.append(Cell("shared"))
+        else:
+            other, group = into_other(a.name, e), reals.get(e.real, [])
+            if other:
+                t = "→" + other
+            elif len(group) > 1:
+                t = "shared(%d)" % len(group)     # with some of the homes, not with all
+            else:
+                t = "link" if e.link else "own"
+                if e.kind == "file" and e.digest and len(digests.get(e.digest, [])) > 1:
+                    t += "(=)"                   # same bytes, separate files: it drifts
+            cells.append(Cell(t, "diff" if state == "diff" else "ok"))
+
+    note = ""
+    if state == "diff":
+        bits = []
+        for real, names in sorted(reals.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+            bits.append("%s → %s" % ("+".join(names), tilde(real)))
+        for me, other in crossed:
+            bits.append("%s links into %s's own home — fine in itself, but it dangles the "
+                        "day that home is renamed" % (me, other))
+        if dangling:
+            bits.append("a symlink to nowhere in " + "+".join(dangling)
+                        + " (what renaming a home leaves behind; the CLI loads nothing "
+                          "and says nothing)")
+        gone = [a.name for a, e in zip(accts, entries) if e.kind == "absent"]
+        if gone:
+            bits.append("absent in " + "+".join(gone))
+        bits.append("point every home's %s at one copy" % name)
+        note = "; ".join(bits)
+    elif crossed:
+        # Shared, and worth one sentence: the copy lives inside a config home.
+        hosts = sorted(set(other for _me, other in crossed))
+        note = ("one copy, inside %s's own home — fine, but renaming or deleting that "
+                "home dangles every link into it" % "+".join(hosts))
+    elif unknown:
+        note = "; ".join(c.why for c in cells if c.why)
+    return Row(name, V_SETUP, cells, note, counts=counted)
+
+
+def row_plugins_enabled(accts: list) -> Row:
+    """Enabled is not installed. One shared settings.json enables a plugin for every home
+    while the tree it loads from stays per home, so the accounts that are supposed to be
+    interchangeable silently lack its skills, its commands and its MCP servers."""
+    cells, bits = [], []
+    for a in accts:
+        s, st, which = settings3(a.home)
+        if st in ("unreadable", "unparseable"):
+            cells.append(Cell("?", "unknown", "%s: %s is %s" % (a.name, which, st)))
+            continue
+        d = s.get("enabledPlugins")
+        enabled = set(k for k, v in d.items() if v) if isinstance(d, dict) else set()
+        reg, rst = read_json3(a.home / "plugins" / "installed_plugins.json")
+        if rst in ("unreadable", "unparseable"):
+            cells.append(Cell("?", "unknown",
+                              "%s: plugins/installed_plugins.json is %s" % (a.name, rst)))
+            continue
+        inst = set()
+        if isinstance(reg, dict) and isinstance(reg.get("plugins"), dict):
+            inst = set(reg["plugins"])
+        if not enabled:
+            cells.append(Cell("–"))
+            continue
+        missing = sorted(enabled - inst)
+        if missing:
+            cells.append(Cell("%d missing" % len(missing), "diff"))
+            bits.append("%s enables but has not installed %s"
+                        % (a.name, ", ".join(missing[:4])
+                           + ("…" if len(missing) > 4 else "")))
+        else:
+            cells.append(Cell("%d ok" % len(enabled)))
+    if bits:
+        bits.append("install them once in that home, or link every home's plugins/ to one "
+                    "directory so one install serves them all")
+    elif any(c.state == "unknown" for c in cells):
+        bits = [c.why for c in cells if c.why]
+    return Row("plugins enabled", V_SETUP, cells, "; ".join(bits), counts=True)
+
+
+def row_mcp_servers(accts: list) -> Row:
+    """User-scope MCP server NAMES.
+
+    🛑 Names only. An MCP entry's url, headers and env routinely carry a token, and none
+    of them is needed to answer "is it the same set in every home?".
+    """
+    cells, sets = [], []
+    for a in accts:
+        d, st = read_json3(a.state_file)
+        if st in ("unreadable", "unparseable"):
+            cells.append(Cell("?", "unknown",
+                              "%s: %s is %s" % (a.name, tilde(a.state_file), st)))
+            sets.append(None)
+            continue
+        m = d.get("mcpServers") if isinstance(d, dict) else None
+        names = sorted(m) if isinstance(m, dict) else []
+        sets.append(tuple(names))
+        cells.append(Cell(", ".join(names) if names else "–"))
+    note = ""
+    if len(set(x for x in sets if x is not None)) > 1:
+        for c in cells:
+            if c.state != "unknown":
+                c.state = "diff"
+        note = ("; ".join("%s: %s" % (a.name, ", ".join(s) or "none")
+                          for a, s in zip(accts, sets) if s is not None)
+                + "; user-scope servers live in each home's own state file — put them in "
+                  "the project's .mcp.json, or in a plugin, to share them")
+    elif any(c.state == "unknown" for c in cells):
+        note = "; ".join(c.why for c in cells if c.why)
+    return Row("MCP servers", V_SETUP, cells, note, counts=True)
+
+
+def row_memory(accts: list, cwd: str) -> Row:
+    """Where each home reads this project's auto-memory from.
+
+    Three states, not two: one store for every home (shared), no store anywhere (per
+    home — the normal starting point, one key away from shared) and MIXED, where some
+    homes point at the store and some do not. MIXED is the one worth shouting about: it
+    reads as "mostly shared" while the notes keep forking.
+    """
+    folder = project_folder(cwd) or "<project>"
+    cells, dirs, stores = [], [], []
+    for a in accts:
+        try:
+            base = memory_store(a)[0]
+            where = memory_dir(a, folder, cwd)[0]
+        except Exception as e:          # this row asks git where the worktree is: one
+            cells.append(Cell("?", "unknown",                 # cell may fail, not the
+                              "%s: the memory directory could not be resolved (%s)"
+                              % (a.name, e)))                 # whole table
+            dirs.append("")
+            stores.append("")
+            continue
+        stores.append(base)
+        dirs.append(os.path.normpath(where))
+        cells.append(Cell("store" if base else "own home"))
+    unknown = any(c.state == "unknown" for c in cells)
+    known = [d for d in dirs if d]
+    # judged on the homes that could be read, and never on the ones that could not
+    read = [(s, d) for s, d in zip(stores, dirs) if d]
+    with_store = [s for s, _d in read if s]
+    if len(read) < 2:
+        state = "unknown" if unknown else "ok"       # nothing to compare it with
+    elif not with_store:
+        state = "unknown" if unknown else "cold"     # per home: one key away from shared
+    elif len(with_store) < len(read) or len(set(d for _s, d in read)) > 1:
+        state = "diff"                               # MIXED, or two different stores
+    else:
+        state = "unknown" if unknown else "ok"
+    for c in cells:
+        if c.state != "unknown":
+            c.state = state
+    note = ""
+    if state in ("diff", "cold"):
+        bits = []
+        for a, d in zip(accts, dirs):
+            if not d:
+                continue
+            try:
+                n = len([p for p in Path(d).glob("*.md")])
+            except OSError:
+                n = 0
+            bits.append("%s → %s%s" % (a.name, tilde(d),
+                                       (" (%d note file(s))" % n) if n else ""))
+        bits.append("set env.%s to one absolute directory in the settings every home "
+                    "reads; csm never copies memory, because a copy forks" % MEMORY_DIR_ENV)
+        note = "; ".join(bits)
+        if state == "diff":
+            note = "MIXED — " + note
+    elif known and state == "ok" and len(accts) > 1:
+        note = "every home reads %s" % tilde(known[0])
+    elif unknown:
+        note = "; ".join(c.why for c in cells if c.why)
+    return Row("auto-memory", V_SETUP, cells, note, counts=True)
+
+
+def project_state(d, key):
+    """`.claude.json` → `projects[<absolute cwd>]`, or `{}`."""
+    p = d.get("projects") if isinstance(d, dict) else None
+    v = p.get(key) if isinstance(p, dict) else None
+    return v if isinstance(v, dict) else {}
+
+
+def row_onboarding(accts: list) -> Row:
+    cells = []
+    for a in accts:
+        d, st = read_json3(a.state_file)
+        if st in ("unreadable", "unparseable"):
+            cells.append(Cell("?", "unknown",
+                              "%s: %s is %s" % (a.name, tilde(a.state_file), st)))
+        elif isinstance(d, dict) and d.get("hasCompletedOnboarding") is True:
+            cells.append(Cell("done"))
+        else:
+            cells.append(Cell("will ask", "cold"))
+    cold = [a.name for a, c in zip(accts, cells) if c.state == "cold"]
+    note = ""
+    if cold:
+        note = ("%s would open the theme picker and the security notice. Those dialogs put "
+                "the cancelling answer first and focused, so an unattended start there "
+                "just sits; `csm move` pre-answers this gate in the target home"
+                % "+".join(cold))
+    return Row("onboarding", V_PER, cells, note)
+
+
+def row_trust(accts: list, cwd: str) -> Row:
+    """The folder-trust gate, for the directory this matrix was asked about.
+
+    🛑 Trust is recorded per (config home × directory) under the cwd string exactly as the
+    CLI spells it, so a directory reached through a symlink and the same directory reached
+    directly are two different keys.
+    """
+    real = os.path.realpath(cwd)
+    cells = []
+    for a in accts:
+        d, st = read_json3(a.state_file)
+        if st in ("unreadable", "unparseable"):
+            cells.append(Cell("?", "unknown",
+                              "%s: %s is %s" % (a.name, tilde(a.state_file), st)))
+            continue
+        if project_state(d, cwd).get("hasTrustDialogAccepted") is True:
+            cells.append(Cell("trusted"))
+        elif real != cwd and project_state(d, real).get("hasTrustDialogAccepted") is True:
+            cells.append(Cell("trusted(real)", "cold",
+                              "%s trusts %s but not the spelling %s, and the CLI keys them "
+                              "separately" % (a.name, tilde(real), tilde(cwd))))
+        else:
+            cells.append(Cell("will ask", "cold"))
+    cold = [a.name for a, c in zip(accts, cells) if c.state == "cold"]
+    note = ""
+    if cold:
+        note = ("%s has not trusted %s; `csm move` writes that one key into the target "
+                "home before it starts anything" % ("+".join(cold), tilde(cwd)))
+    return Row("folder trust", V_PER, cells, note)
+
+
+def row_modes(accts: list) -> list:
+    """`permissions.defaultMode`, `permissions.disableAutoMode` and the bypass consent,
+    reported VERBATIM — a spelling nobody has seen yet must read as itself, not as false.
+    """
+    out = []
+    for key, layer, verdict, why in (
+            ("defaultMode", "permissions mode", V_SHARED,
+             "csm chooses the moved session's mode and never weakens it: the recorded "
+             "mode, raised to a stronger defaultMode only when the session recorded "
+             "nothing, `default` or `auto`"),
+            ("disableAutoMode", "disableAutoMode", V_SETUP,
+             "`disable` is its only legal value; it is read once at launch and it takes "
+             "`auto` away from the picker and from --permission-mode")):
+        cells, vals = [], []
+        for a in accts:
+            s, st, which = settings3(a.home)
+            if st in ("unreadable", "unparseable"):
+                cells.append(Cell("?", "unknown", "%s: %s is %s" % (a.name, which, st)))
+                vals.append(None)
+                continue
+            perms = s.get("permissions")
+            v = perms.get(key) if isinstance(perms, dict) else None
+            v = v.strip() if isinstance(v, str) else ""
+            # an absent defaultMode IS `default`, so the two must not read as a divergence
+            vals.append((canon_mode(v) or "default") if key == "defaultMode" else v)
+            cells.append(Cell(v or "–"))
+        note = ""
+        if len(set(x for x in vals if x is not None)) > 1:
+            for c in cells:
+                if c.state != "unknown":
+                    c.state = "diff"
+            note = why
+        out.append(Row(layer, verdict, cells, note))
+
+    cells = []
+    for a in accts:
+        s, st, which = settings3(a.home)
+        perms = s.get("permissions") if isinstance(s, dict) else None
+        if st in ("unreadable", "unparseable"):
+            cells.append(Cell("?", "unknown", "%s: %s is %s" % (a.name, which, st)))
+        elif isinstance(perms, dict) and perms.get("disableBypassPermissionsMode"):
+            cells.append(Cell("bypass OFF"))
+        elif s.get("skipDangerousModePermissionPrompt") is True:
+            cells.append(Cell("accepted"))
+        else:
+            d, dst = read_json3(a.state_file)
+            if isinstance(d, dict) and d.get("bypassPermissionsModeAccepted") is True:
+                cells.append(Cell("accepted(old)"))
+            elif dst in ("unreadable", "unparseable"):
+                cells.append(Cell("?", "unknown",
+                                  "%s: %s is %s" % (a.name, tilde(a.state_file), dst)))
+            else:
+                cells.append(Cell("will warn", "cold"))
+    cold = [a.name for a, c in zip(accts, cells) if c.state == "cold"]
+    note = ""
+    if cold:
+        note = ("%s would stop on the bypass warning, whose first and focused answer is "
+                "\"No, exit\" — accept it once by hand there, or set "
+                "skipDangerousModePermissionPrompt in the settings those homes read"
+                % "+".join(cold))
+    out.append(Row("bypass consent", V_SETUP, cells, note))
+    return out
+
+
+def row_version() -> Row:
+    v, how = cli_version()
+    if v:
+        return Row("CLI version", V_PER, [Cell("%s  (%s)" % (v, how))], span=True)
+    return Row("CLI version", V_PER, [Cell("? " + how, "unknown")], span=True,
+               note="read off the launcher symlink; nothing is executed to ask")
+
+
+def row_connectors() -> Row:
+    return Row("connectors", V_PER, span=True,
+               cells=[Cell("per account — granted at claude.ai/customize/connectors, not "
+                           "readable offline", "info")],
+               note="No file in any config home records them, and no terminal command on "
+                    "any machine can attach one, so a moved session gets the TARGET "
+                    "account's connectors. Enable the same set on every account, in a "
+                    "browser signed in as that account.")
+
+
+def row_mcp_signins() -> Row:
+    return Row("MCP sign-ins", V_PER, span=True,
+               cells=[Cell("per home — stored inside the login credential, not read",
+                           "info")],
+               note="They live under an `mcpOAuth` key inside the same blob as the login, "
+                    "so there is no file to copy: `claude mcp login <server>` once per "
+                    "config home.")
+
+
+def with_whys(row: Row) -> Row:
+    """Make sure every unknown's REASON reaches the table, even on a row that also
+    diverges. A `?` whose reason was dropped is halfway back to being read as "fine"."""
+    extra = [c.why for c in row.cells
+             if c.state == "unknown" and c.why and c.why not in row.note]
+    if extra:
+        row.note = "; ".join(([row.note] if row.note else []) + extra)
+    return row
+
+
+def matrix_rows(accts: list, cwd: str) -> list:
+    rows = [row_account(accts), row_login(accts)]
+    for name, counted in SHARED_ENTRIES:
+        rows.append(row_entry(accts, name, counted))
+    rows.append(row_plugins_enabled(accts))
+    rows.append(row_mcp_servers(accts))
+    rows.append(row_memory(accts, cwd))
+    rows.append(row_onboarding(accts))
+    rows.append(row_trust(accts, cwd))
+    rows.extend(row_modes(accts))
+    rows.append(row_version())
+    rows.append(row_connectors())
+    rows.append(row_mcp_signins())
+    return [with_whys(r) for r in rows]
+
+
+def matrix_summary(rows: list, accts: list) -> dict:
+    """🛑 `unknown` is never folded into a match. A summary that says "all N match" over a
+    machine it could not read is the one answer worse than no answer."""
+    share = [r for r in rows if r.counts and r.layer != "login"]
+    return {"homes": len(accts),
+            "shareable": len(share),
+            "agree": len([r for r in share if r.state == "ok"]),
+            "divergent": len([r for r in rows if r.state == "diff"]),
+            "unknown": len([r for r in rows if r.state == "unknown"]),
+            "cold": len([r for r in rows if r.state == "cold"]),
+            "failed": sorted(r.layer for r in rows if r.counts and r.state == "diff")}
+
+
+def render_matrix(rows: list, accts: list, cwd: str, sumy: dict) -> str:
+    n = len(accts)
+    w = max(MATRIX_MIN_CELL, min(MATRIX_MAX_CELL, (MATRIX_WIDTH - 24 - 2 * n) // n))
+    span_w = n * (w + 2) - 2
+    out = ["fungibility matrix on %s" % host(),
+           dcut("  %d config home%s · project %s"
+                % (n, "" if n == 1 else "s", tilde(cwd)), MATRIX_WIDTH), ""]
+    head = dpad("layer", MATRIX_LAYER_W) + "  " + dpad("v", 2)
+    rule = "-" * MATRIX_LAYER_W + "  " + "--"
+    for a in accts:
+        head += "  " + dpad(dcut(a.name, w), w)
+        rule += "  " + "-" * w
+    out += [head.rstrip(), rule]
+    for r in rows:
+        line = dpad(dcut(r.layer, MATRIX_LAYER_W), MATRIX_LAYER_W) + "  " + dpad(r.verdict, 2)
+        if r.span:
+            # a machine-level row: one value, over the whole table rather than per home,
+            # and wrapped instead of truncated — these are the rows people quote
+            pre = " " * (MATRIX_LAYER_W + 6)
+            wrapped = dwrap(r.cells[0].text, max(span_w, MATRIX_WIDTH - dwidth(pre)))
+            out.append((line + "  " + wrapped[0]).rstrip())
+            out += [pre + x for x in wrapped[1:]]
+            continue
+        for c in r.cells:
+            line += "  " + dpad(dcut(c.text, w), w)
+        out.append(line.rstrip())
+    notes = [(r.layer, r.note) for r in rows if r.note]
+    if notes:
+        out.append("")
+        for layer, note in notes:
+            out += dwrap(note, MATRIX_WIDTH, first="  %s: " % layer, rest="    ")
+    out += ["",
+            "  %s shared already, or csm carries it across a move    %s one shared file "
+            "or key away" % (V_SHARED, V_SETUP),
+            "  %s per account / per config home / per machine by design    ? could not "
+            "look" % V_PER,
+            "  cells: shared = one realpath in every home · shared(N) = one realpath "
+            "shared by N of the",
+            "  homes, not all · own = its own copy · (=) = the same bytes in separate "
+            "files · link, →home =",
+            "  a symlink · DANGLING = a symlink to nowhere · – = absent · ? = could not "
+            "look",
+            "  sharing skills/ or plugins/ also pools their synced/ subdirectory, which is "
+            "per account",
+            "  --check fails on a divergent shareable layer, or on a login that is gone. "
+            "Never on an",
+            "  unknown (\"I could not look\" is not a fault, and is never counted as a "
+            "match either),",
+            "  and never on settings.local.json or scheduled-tasks, where having one and "
+            "not the", "  other is usually the design.", ""]
+    bits = ["%d of %d shareable layer(s) agree across %d home(s)"
+            % (sumy["agree"], sumy["shareable"], sumy["homes"])]
+    for key, word in (("divergent", "divergent"), ("unknown", "could not be read"),
+                      ("cold", "needing your hands")):
+        if sumy[key]:
+            bits.append("%d %s" % (sumy[key], word))
+    if n == 1:
+        bits.append("one home: there is nothing to compare it with")
+    out += dwrap(" · ".join(bits), MATRIX_WIDTH, first="  ", rest="  ")
+    return "\n".join(out)
+
+
+def matrix_json(rows: list, accts: list, cwd: str, sumy: dict, check: bool) -> dict:
+    v, how = cli_version()
+    return {
+        "tool": PROG, "version": __version__, "host": host(), "cwd": cwd,
+        "cli_version": v, "cli_version_from": how,
+        "homes": [{"name": a.name, "home": str(a.home), "default": a.default,
+                   "email": a.email} for a in accts],
+        "rows": [{"layer": r.layer, "verdict": r.verdict, "state": r.state,
+                  "checked": r.counts, "note": r.note, "span": r.span,
+                  "cells": [{"home": ("*" if r.span else accts[i].name), "text": c.text,
+                             "state": c.state, "why": c.why}
+                            for i, c in enumerate(r.cells)]} for r in rows],
+        "summary": sumy,
+        "exit": 1 if (check and sumy["failed"]) else 0,
+    }
+
+
+def cmd_matrix(accts: list, cwd: str, as_json: bool, check: bool) -> int:
+    """Your own fungibility matrix: which layers these config homes share, which are per
+    account by design, and which could not be read. Read-only, offline and prompt-free."""
+    if not accts:
+        print("no config homes found.\n\n" + ACCOUNTS_HELP)
+        return 0
+    cwd = os.path.abspath(os.path.expanduser(cwd or os.getcwd()))
+    rows = matrix_rows(accts, cwd)
+    sumy = matrix_summary(rows, accts)
+    log("matrix: %d home(s), %d divergent, %d unknown (%s)"
+        % (len(accts), sumy["divergent"], sumy["unknown"], tilde(cwd)))
+    if as_json:
+        print(json.dumps(matrix_json(rows, accts, cwd, sumy, check), indent=1))
+    else:
+        print(printable(render_matrix(rows, accts, cwd, sumy)))
+    return 1 if (check and sumy["failed"]) else 0
+
+
 # ------------------------------------------------------------------------------- cli
 
 def over_ssh(dest: str, argv: list) -> int:
@@ -1419,6 +3505,7 @@ def cmd_accounts(accts: list, as_json: bool) -> int:
     rows = []
     for a in accts:
         live = len(live_rows(a)) if a.home.is_dir() else 0
+        cred = None
         if not a.home.is_dir():
             state = "no such directory"
         elif not a.email:
@@ -1426,10 +3513,15 @@ def cmd_accounts(accts: list, as_json: bool) -> int:
         elif a.expect and a.email.lower() != a.expect.lower():
             state = f"WRONG LOGIN (expected {a.expect})"
         else:
-            state = "ok"
+            # 🛑 The same primitive the move gate uses, so the view and the refusal can
+            # never disagree about whether a home can actually talk to Claude.
+            cred = credential_present(a)
+            state = ("ok" if cred is True
+                     else "CREDENTIAL GONE" if cred is False else "ok (UNVERIFIED)")
         rows.append({"name": a.name, "home": str(a.home), "default": a.default,
                      "email": a.email, "expected": a.expect, "state": state,
-                     "live_sessions": live, "tmux_session": a.tmux_session})
+                     "credential": cred, "live_sessions": live,
+                     "tmux_session": a.tmux_session})
     if as_json:
         print(json.dumps(rows, indent=1))
         return 0
@@ -1443,8 +3535,18 @@ def cmd_accounts(accts: list, as_json: bool) -> int:
     ew = max([len(r["email"] or "-") for r in rows] + [5])
     for r in rows:
         home = tilde(r["home"]) + ("  (CLAUDE_CONFIG_DIR unset)" if r["default"] else "")
-        print(f"  {r['name']:<{nw}}  {r['email'] or '-':<{ew}}  {r['state']:<10}  "
+        print(f"  {r['name']:<{nw}}  {r['email'] or '-':<{ew}}  {r['state']:<16}  "
               f"live {r['live_sessions']:<3} {home}")
+    print("\n  state: `ok` = the home names a login AND its credential is there; "
+          "`CREDENTIAL GONE` =\n  the home still names someone but the credential is not "
+          "there any more (sign it in again);\n  `ok (UNVERIFIED)` = the credential store "
+          "could not be asked, which is not the same as\n  signed out. The credential "
+          "itself is never read, printed or copied.\n\n  `live N` counts the home's "
+          "RUNNING Claude Code processes. `csm list` can show fewer: a\n  session whose "
+          "transcript holds only a subagent's own turns is not a session you can move.\n"
+          "\n  `csm matrix` says what these "
+          "homes SHARE — settings, CLAUDE.md, skills, plugins, memory —\n  and what stays "
+          "per account whatever you do.")
     return 0
 
 
@@ -1457,10 +3559,17 @@ def main(argv: list) -> int:
 
     ap = argparse.ArgumentParser(
         prog="csm", description="Move a Claude Code session to another of your own Claude "
-        "accounts, keeping the whole conversation.",
-        epilog="Design notes: docs/design.md in the repository.")
+        "accounts, keeping the whole conversation. A move is between two config homes on "
+        "ONE machine: it copies the transcript into the target home and resumes it there, "
+        "so every turn from then on is spent on that account's quota.",
+        epilog="What a move costs, and what it cannot carry (connectors, MCP sign-ins, "
+               "plugins, preserved thinking across organizations): README.md. Design notes "
+               "and the measured on-disk formats: docs/design.md.")
     ap.add_argument("--version", action="version", version=f"{PROG} {__version__}")
-    ap.add_argument("--ssh", metavar="HOST", help="run this command on another machine")
+    ap.add_argument("--ssh", metavar="HOST",
+                    help="run this same command ON that machine, where csm is installed "
+                         "too. A move is always between two config homes of ONE machine, "
+                         "so this moves sessions over there, never from here to there")
     sub = ap.add_subparsers(dest="cmd")
 
     pa = sub.add_parser("accounts", help="the config homes here, and who is signed in",
@@ -1471,24 +3580,80 @@ def main(argv: list) -> int:
     pl = sub.add_parser("list", help="recent sessions in every account, newest first")
     pl.add_argument("--account", metavar="NAME", help="only this account")
     pl.add_argument("--all", action="store_true", help=f"up to {ALL_LIMIT} sessions")
-    pl.add_argument("--json", action="store_true", dest="as_json")
-    pl.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+    pl.add_argument("--json", action="store_true", dest="as_json",
+                    help="the same rows as JSON, for a script")
+    pl.add_argument("--limit", type=int, default=DEFAULT_LIMIT, metavar="N",
+                    help=f"how many sessions to list (default {DEFAULT_LIMIT}). It caps "
+                         "the ENDED ones only: every live session is listed whatever the "
+                         "limit, so a small number can still print a long table")
 
-    pm = sub.add_parser("move", help="move one session to another account")
+    pm = sub.add_parser("move", help="move one session to another account",
+                        description="Copy a session into another account's config home and "
+                                    "resume it there, on that account's quota. Both homes "
+                                    "are on THIS machine.")
     pm.add_argument("session", help="row number from `csm list`, session id or prefix, "
                     "claude.ai link, or part of the title")
     pm.add_argument("--to", required=True, metavar="ACCOUNT", help="the account to move it to")
     pm.add_argument("--stop-source", action="store_true",
-                    help="stop the old process once the new one has connected")
+                    help="stop the old process once the new one has connected (only in the "
+                         "default Remote Control mode, where the link proves it connected). "
+                         "The source pane's scrollback is captured to <state dir>/captures/"
+                         "<date>/ first, and the path is printed")
     pm.add_argument("--dry-run", action="store_true", help="print the plan, change nothing")
     pm.add_argument("--no-remote-control", action="store_true",
                     help="start a plain interactive session in tmux, without Remote Control")
     pm.add_argument("--foreground", action="store_true",
                     help="resume in this terminal instead of tmux")
-    pm.add_argument("--permission-mode", choices=MODES,
-                    help="override the mode read from the transcript")
+    pm.add_argument("--permission-mode", metavar="MODE",
+                    help="the permission mode to resume in: " + ", ".join(MODE_ORDER)
+                         + " (`manual` is an alias of `default`). Without it the mode the "
+                           "session was running in is used, raised to the target home's "
+                           "permissions.defaultMode when that is stronger and the session "
+                           "recorded nothing, `default` or `auto` — an automatic choice "
+                           "never weakens a session. An explicit mode here is obeyed as "
+                           "given, including a weaker one")
     pm.add_argument("--name", help="the --remote-control name of the moved session")
     pm.add_argument("--all", action="store_true", help="search every session, not just the newest")
+
+    ps = sub.add_parser("stop", help="end a session csm moved, and free its window",
+                        description="End a session THIS TOOL moved and remove the tmux "
+                                    "window it opened — the cleanup, and the unblocker for "
+                                    "moving the same session to the same account again. It "
+                                    "stops nothing else: the authorisation is csm's own "
+                                    "window (`moved-<id8>` in `csm-<account>`) plus, for a "
+                                    "running session, a registry row naming that window. "
+                                    "The transcript is never deleted.")
+    ps.add_argument("session", help="row number from `csm list`, session id or prefix, "
+                    "claude.ai link, or part of the title")
+    ps.add_argument("--dry-run", action="store_true", help="print the plan, change nothing")
+
+    px = sub.add_parser("matrix", help="what your config homes share, and what is per "
+                                       "account",
+                        description="Your own fungibility matrix: rows are the layers "
+                                    "that decide whether your accounts are "
+                                    "interchangeable, columns are the config homes on "
+                                    "this machine. It is READ-ONLY, offline and "
+                                    "prompt-free: it writes nothing into any config home "
+                                    "(only a line in csm's own log), never runs `claude` "
+                                    "and makes no network call, so it is safe from a hook "
+                                    "or a scheduled check. It does ask `git` for the "
+                                    "project root, and on macOS asks the keychain whether "
+                                    "an item exists — never for its value.",
+                        epilog="A cell is a measurement, never a guess: `?` means the "
+                               "matrix could not look, which is not the same as `no`, and "
+                               "is never counted as a match. The layer-by-layer story, "
+                               "and how to make each one fungible: docs/"
+                               "fungibility-matrix.md and docs/setup.md.")
+    px.add_argument("--json", action="store_true", dest="as_json",
+                    help="the whole table as JSON: homes, rows, cells, summary, exit")
+    px.add_argument("--cwd", metavar="DIR",
+                    help="the project the first-run gates and the memory row are measured "
+                         "for (default: the current directory)")
+    px.add_argument("--account", metavar="NAME", action="append",
+                    help="only these columns; repeatable, or one comma-separated list")
+    px.add_argument("--check", action="store_true",
+                    help="exit 1 when a shareable layer diverges or a login is gone. An "
+                         "unknown never fails it: a cell nobody could read is not a fault")
 
     args = ap.parse_args(argv)
     if args.ssh:
@@ -1510,6 +3675,17 @@ def main(argv: list) -> int:
             return 0
         if args.cmd == "move":
             return do_move(args, accts)
+        if args.cmd == "stop":
+            return do_stop(args, accts)
+        if args.cmd == "matrix":
+            want = []
+            for spec in (args.account or []):
+                for part in spec.split(","):
+                    if part.strip():
+                        a = resolve(part.strip(), accts)
+                        if a not in want:
+                            want.append(a)
+            return cmd_matrix(want or accts, args.cwd, args.as_json, args.check)
     except Refusal as e:
         log(f"REFUSED: {e}")
         print(f"csm: {e}", file=sys.stderr)

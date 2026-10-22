@@ -2854,5 +2854,141 @@ class CaptureBeforeSignal(InProc):
         self.mod.capture_pane(self.s, "x:@1.%1", "stop")
         self.assertEqual(seen[0], ("capture-pane", "-p", "-S", "-", "-t", "x:@1.%1"))
 
+
+# --------------------------------------------------------------- one shared projects/ tree
+# Two or more homes whose projects/ (and file-history/) are symlinks into ONE directory. The
+# layout is a choice some people make to share history between accounts; LESSONS.md says
+# what it costs. These pin that csm sees ONE file there, copies nothing onto itself, and asks
+# every home, not just the target, who is running it.
+
+def link_into(central: Path, home: Path, name: str = "projects") -> None:
+    central.mkdir(parents=True, exist_ok=True)
+    d = home / name
+    if d.is_dir() and not d.is_symlink():
+        for p in d.iterdir():
+            shutil.move(str(p), str(central / p.name))
+        d.rmdir()
+    os.symlink(str(central), str(d))
+
+
+class SharedTree(Base):
+    def setUp(self):
+        super().setUp()
+        self.third = self.w.account("third", "me@third.example", org="org-3")
+        self.central = self.w.root / "central" / "projects"
+        for h in (self.work, self.personal, self.third):
+            link_into(self.central, h)
+        self.t = self.w.session(self.work, SID_A)
+        self.before = self.t.read_bytes()
+
+    def test_one_transcript_is_one_row_not_one_per_account(self):
+        rows = self.listing()
+        self.assertEqual([r["local_id"] for r in rows], [SID_A])
+        out = self.ok(self.w.run("list"))
+        self.assertIn("one shared tree", out)
+
+    # An idle shared row is filed under the first home in account order: here `personal`.
+
+    def test_moving_by_id_is_not_refused_as_several_copies(self):
+        out = self.ok(self.w.run("move", SID_A, "--to", "work", "--dry-run"))
+        self.assertIn("copy NOTHING", out)
+        self.assertIn("ONE TRANSCRIPT", out)
+        self.assertNotIn("REFUSED", out)
+
+    def test_a_real_move_copies_nothing_and_leaves_no_backup(self):
+        out = self.ok(self.w.run("move", SID_A, "--to", "work"))
+        self.assertIn(LINK, out)
+        self.assertEqual(self.t.read_bytes(), self.before)
+        self.assertEqual(list(self.central.rglob("*.csm-bak-*")), [])
+        self.assertEqual(len(list(self.central.rglob(SID_A + ".jsonl"))), 1)
+        call = self.w.claude_calls()[0]
+        self.assertEqual(call["argv"][-2:], ["--resume", SID_A])
+        self.assertEqual(call["env"]["CLAUDE_CONFIG_DIR"], str(self.work))
+
+    def test_the_row_names_the_account_that_is_running_it(self):
+        self.w.live(self.personal, SID_A, self.w.spawn().pid)
+        rows = self.listing()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["account"], "personal")
+        self.assertTrue(rows[0]["live"])
+
+    def test_a_running_source_is_warned_about_not_refused(self):
+        self.w.live(self.personal, SID_A, self.w.spawn().pid)
+        # The row is personal's (it runs there), so personal's process is the SOURCE, not a
+        # twin: moving a live session is the whole point. It is warned, with the flag.
+        out = self.ok(self.w.run("move", SID_A, "--to", "third", "--dry-run"))
+        self.assertIn("The source is RUNNING", out)
+        self.assertIn("--stop-source", out)
+
+    def test_the_default_home_is_asked_too(self):
+        default = self.w.account("default", "me@default.example", default=True)
+        link_into(self.central, default)
+        self.w.live(default, SID_A, self.w.spawn().pid)
+        cfg = self.w.root / "accounts"            # an accounts file that omits the default
+        cfg.write_text("work ~/.claude-work\npersonal ~/.claude-personal\n")
+        rows = json.loads(self.ok(self.w.run("list", "--json", CSM_ACCOUNTS=cfg)))
+        src = rows[0]["account"]
+        tgt = "personal" if src == "work" else "work"
+        self.refused(self.w.run("move", SID_A, "--to", tgt, CSM_ACCOUNTS=cfg),
+                     "default is ALREADY running")
+
+
+class SharedTreeUnits(InProc):
+    def test_same_path_sees_through_a_link_and_answers_for_a_missing_end(self):
+        real = self.root / "real" / "x"
+        real.mkdir(parents=True)
+        os.symlink(str(self.root / "real"), str(self.root / "alias"))
+        self.assertTrue(self.mod.same_path(real, self.root / "alias" / "x"))
+        self.assertTrue(self.mod.same_path(self.root / "real" / "nope",
+                                           self.root / "alias" / "nope"))
+        self.assertFalse(self.mod.same_path(real, self.root / "real" / "y"))
+
+    def test_unshared_homes_keep_two_rows_for_two_real_copies(self):
+        a, b = self.account("work"), self.account("personal", email="me@home.example")
+        s1, s2 = self.session(a), self.session(b)
+        self.assertEqual(len(self.mod.dedupe_shared([s1, s2])), 2)
+        self.assertEqual(self.mod.SHARED, [])
+
+    def test_a_shared_file_history_is_not_carried_but_tasks_are(self):
+        a, b = self.account("work"), self.account("personal", email="me@home.example")
+        central = self.root / "central-fh"
+        link_into(central, a.home, "file-history")
+        link_into(central, b.home, "file-history")
+        s = self.session(a)
+        (central / SID_A).mkdir()
+        (central / SID_A / "f@v1").write_text("one")
+        (a.home / "tasks" / SID_A).mkdir(parents=True)
+        (a.home / "tasks" / SID_A / "t.json").write_text("{}")
+        pairs = self.mod.side_data(s, b)
+        self.assertEqual([p.parent.name for p, _ in pairs], ["tasks"])
+        self.mod.copy_in(s, b, apply=True)
+        self.assertEqual((central / SID_A / "f@v1").read_text(), "one")
+        self.assertTrue((b.home / "tasks" / SID_A / "t.json").exists())
+
+    def test_copy_tree_onto_itself_is_a_no_op(self):
+        d = self.root / "d"
+        d.mkdir()
+        (d / "f").write_text("keep")
+        os.symlink(str(d), str(self.root / "e"))
+        self.mod.copy_tree(d, self.root / "e")          # must not raise SameFileError
+        self.assertEqual((d / "f").read_text(), "keep")
+
+    def test_copy_in_onto_one_tree_touches_nothing(self):
+        a, b = self.account("work"), self.account("personal", email="me@home.example")
+        central = self.root / "central"
+        link_into(central, a.home)
+        link_into(central, b.home)
+        s = self.session(a)
+        (s.sibling / "subagents").mkdir(parents=True)
+        os.chmod(str(s.transcript), 0o644)
+        before = s.transcript.read_bytes()
+        dest, steps = self.mod.copy_in(s, b, apply=True)
+        self.assertTrue(self.mod.same_path(dest, s.transcript))
+        self.assertIn("copy NOTHING", steps[0])
+        self.assertEqual(s.transcript.read_bytes(), before)
+        self.assertEqual(oct(s.transcript.stat().st_mode & 0o777), "0o644", "not even a chmod")
+        self.assertEqual(list(central.rglob("*.csm-bak-*")), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

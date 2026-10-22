@@ -41,6 +41,16 @@ A MOVE IS A COPY AND A RESUME:
 The CLI connects as the target login and registers a NEW claude.ai session owned by it.
 The source transcript is never edited or deleted.
 
+A SHARED `projects/` TREE (two homes whose `projects/` resolve to one directory, e.g. both
+symlinked into a central tree) is detected by resolved path, not by spelling. A move between
+two such homes copies NOTHING: the transcript the target resumes is already the file the
+source is using, so the copy, its backup and the sibling tree are all skipped (a copy onto
+itself is `shutil.SameFileError`). The listing shows one row per file, not one per home, and
+the live-twin check asks every home on the machine, because the process holding a shared
+transcript can belong to a third account. Leaving the source running then means two CLIs
+append to one file, so the plan says so and names `--stop-source`. See LESSONS.md before
+sharing `projects/`: it also holds per-account Remote Control state.
+
 WHAT A MOVE COSTS, because the account is the payment layer and little else:
   * preserved thinking is bound to the organization that wrote it, so across organizations
     the CLI drops it and the first turn RE-READS the session — on the new account's quota.
@@ -89,7 +99,7 @@ try:                                      # POSIX only; the tool is macOS/Linux 
 except ImportError:                       # pragma: no cover
     pwd = None
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 PROG = "claude-session-mover"
 
 HOME = Path(os.path.expanduser("~"))
@@ -1013,12 +1023,67 @@ def sessions_for(acct: Account, limit: int, only=None) -> list:
     return out
 
 
+#: One entry per transcript the last `dedupe_shared` collapsed: how many EXTRA homes saw it.
+#: A one-value cache in the same shape as `_SELF`; the listing prints a line from it.
+SHARED: list = []
+
+
+def _owns_side_data(acct: Account, sid: str) -> bool:
+    """Does this home hold the session's per-home side data (`tasks/<id>/`, `todos/<id>*`)?"""
+    try:
+        if (acct.home / "tasks" / sid).is_dir():
+            return True
+        return any((acct.home / "todos").glob(sid + "*.json"))
+    except OSError:
+        return False
+
+
+def dedupe_shared(rows: list) -> list:
+    """ONE ROW PER FILE: collapse rows that are the same transcript seen from several homes.
+
+    🛑 When two or more homes' `projects/` resolve to one directory, `sessions_for` returns
+    the same transcript once per home. Without this, `csm list` shows each session N times
+    (and a `--limit` spends its rows on one conversation), and `csm move <id>` refuses every
+    session that is not running, because several hits read as several copies.
+    Collapsed by the transcript's REALPATH, never by the id alone: after an ordinary move
+    between unshared homes there are two genuine copies of one id, and those stay two rows.
+    The row kept names the account whose `sessions/<pid>.json` says it is RUNNING the
+    session (the only on-disk fact about who owns a shared transcript), else the one holding
+    its per-home `tasks/`/`todos/`, else the first home in account order.
+    """
+    groups, order = {}, []
+    for s in rows:
+        try:
+            key = os.path.realpath(str(s.transcript))
+        except OSError:
+            key = str(s.transcript)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(s)
+    out = []
+    del SHARED[:]
+    for key in order:
+        g = groups[key]
+        if len(g) == 1:
+            out.append(g[0])
+            continue
+        best = (next((x for x in g if x.live), None)
+                or next((x for x in g if _owns_side_data(x.account, x.local_id)), None)
+                or g[0])
+        SHARED.append(len(g) - 1)
+        out.append(best)
+    return out
+
+
 def all_sessions(accts: list, limit: int, only=None) -> list:
     """Newest first across every account; a LIVE session is never cut off the list."""
     out = []
     for a in accts:
         if a.home.is_dir():
             out.extend(sessions_for(a, limit, only))
+    # BEFORE the cap: N rows that are one file must not spend N of its rows.
+    out = dedupe_shared(out)
     out.sort(key=lambda s: -s.mtime)
     keep = [s for s in out if s.live]
     for s in out:
@@ -1066,6 +1131,12 @@ def render_list(rows: list, accts: list) -> str:
         out.append(f"{s.pos:>3}  {tidy(s.account.name, aw):<{aw}} {tidy(s.label, w):<{w}} "
                    f"{human_age(s.mtime):>4}  {state:<8} {'  '.join(bits)}")
     out.append("")
+    if SHARED:
+        n = len(SHARED)
+        out.append(("(%d of these rows %s one transcript that several account homes can see "
+                    "— their projects/ is one shared tree — so `account` names the home "
+                    "running it, not the only one that reaches it)")
+                   % (n, "is" if n == 1 else "are each"))
     out.append("move one with:  csm move <#> --to <account>      (accounts: "
                + ", ".join(a.name for a in accts) + ")")
     return "\n".join(out)
@@ -1503,8 +1574,27 @@ def target_notes(s: Session, tgt: Account, mode: str) -> list:
                 "from the config home instead. Put it in the home's settings `env` block"
                 % (MEMORY_DIR_ENV, tgt.name))
 
+    def one_file():
+        # 🛑 Before a shared tree, a move made a second file and a source left running kept
+        # writing its own. With one file, its CLI and the moved one's both append to it, and
+        # their lines interleave. Moving a live session is the whole point, so this warns
+        # instead of refusing, and names the flag that avoids it.
+        if not one_tree(s, tgt):
+            return ""
+        head = ("⚠ ONE TRANSCRIPT: %s's and %s's projects/ are the same directory, so "
+                "nothing is copied and the moved session resumes the very file the source "
+                "uses" % (s.account.name, tgt.name))
+        if s.live and not s.is_self:
+            return head + (". The source is RUNNING (pid %d): two CLIs appending to one "
+                           "file interleave, so stop it with --stop-source, or `csm stop "
+                           "%s` after the move" % (s.pid, s.short))
+        if s.live:
+            return head + (". This IS the session running the move, so it keeps writing "
+                           "to that file until it ends: type to the moved window, not here")
+        return head
+
     for fn in (bypass, remote_dialog, plugins, shared_dirs, connectors, memory,
-               shell_memory):
+               shell_memory, one_file):
         note(fn)
     return out
 
@@ -1622,7 +1712,24 @@ def claude_bin() -> str:
     return ""
 
 
-def preflight(s: Session, tgt: Account, mode: str, dry: bool) -> list:
+def other_homes(s: Session, tgt: Account, accts) -> list:
+    """Every home on this machine except the source and the target, the default included.
+
+    The default home is added even when an accounts file leaves it out: a desktop app or a
+    plain `claude` registers its sessions there, and in a shared layout its `projects/` is
+    often the very tree the other homes link to.
+    """
+    out, seen = [], {os.path.realpath(str(s.account.home)), os.path.realpath(str(tgt.home))}
+    for a in list(accts or []) + [Account("default", HOME / ".claude", default=True)]:
+        real = os.path.realpath(str(a.home))
+        if real in seen or not a.home.is_dir():
+            continue
+        seen.add(real)
+        out.append(a)
+    return out
+
+
+def preflight(s: Session, tgt: Account, mode: str, dry: bool, accts=None) -> list:
     """Every refusal, BEFORE anything is copied or written.
 
     🛑 Order is the point: a move refused for a window name, a vanished directory or a live
@@ -1642,9 +1749,21 @@ def preflight(s: Session, tgt: Account, mode: str, dry: bool) -> list:
     if dest.exists():
         # 🛑 Move A to B and later B to A, and `dest` is the original file in A, possibly
         # open in a running process. Two writers on one transcript is unrecoverable.
-        twin = live_rows(tgt).get(s.local_id)
+        owner, twin = tgt.name, live_rows(tgt).get(s.local_id)
+        if not twin and one_tree(s, tgt):
+            # 🛑 WITH ONE SHARED `projects/` THE OWNER CAN BE A THIRD HOME. `dest` is then
+            # the only copy on the machine, so the process writing it need not be in the
+            # target's registry: move a→b, leave it running in b, then move it to c, and c's
+            # view of `dest` looks quiet while b's pid writes it. The registry is per home,
+            # so every home is asked. The source's own process is not a twin: moving it is
+            # what was asked for (`target_notes` says so).
+            for a in other_homes(s, tgt, accts):
+                r = live_rows(a).get(s.local_id)
+                if r:
+                    owner, twin = a.name, r
+                    break
         if twin:
-            stop.append(f"{tgt.name} is ALREADY running session {s.short} (pid {twin.get('pid')}): "
+            stop.append(f"{owner} is ALREADY running session {s.short} (pid {twin.get('pid')}): "
                         f"{tilde(dest)} is that process's own transcript. Stop it there "
                         "first, or move this session to a third account")
     # 🛑 The same id in two project folders of one home makes `--resume <id>` ambiguous.
@@ -1688,6 +1807,32 @@ def dest_of(s: Session, tgt: Account) -> Path:
     a move into a home that already holds this id somewhere else.
     """
     return tgt.projects / s.transcript.parent.name / s.transcript.name
+
+
+def same_path(a, b) -> bool:
+    """Do these two paths name THE SAME file or directory on disk?
+
+    🛑 Both halves are needed. `os.path.samefile` is the truth when both ends exist (it
+    stats through every symlink and compares device and inode), but a destination folder
+    need not exist yet, and for a missing path `realpath` still resolves the links it finds.
+    Never `==` on the two spellings: `~/.claude-a/projects/x` and `~/.claude-b/projects/x`
+    differ by construction while naming one directory, which is exactly the case guarded.
+    """
+    try:
+        return os.path.samefile(str(a), str(b))
+    except OSError:
+        return os.path.realpath(str(a)) == os.path.realpath(str(b))
+
+
+def one_tree(s: Session, tgt: Account) -> bool:
+    """🛑 Do the source and target homes file this session in ONE directory?
+
+    True when both homes' `projects/` resolve to the same tree. A move between them then has
+    nothing to copy, and a copy would be a copy onto itself: `shutil.copy2` raises
+    `SameFileError` for it (it compares before opening, so nothing is truncated, but the
+    move dies half-done and leaves a `.csm-bak-…` twin of a live transcript behind).
+    """
+    return same_path(s.transcript.parent, dest_of(s, tgt).parent)
 
 
 def clear_first_run(tgt: Account, cwd: str, apply: bool) -> list:
@@ -1828,7 +1973,10 @@ def copy_tree(src: Path, dst: Path, overwrite: bool = True) -> None:
 
     With `overwrite=False` a file already in the destination is left exactly as it is: that
     is how the session's side data is carried into a home that may have some of its own.
+    A copy onto itself (two homes linked into one tree) is never attempted.
     """
+    if same_path(src, dst):
+        return
     for root, dirs, files in os.walk(str(src)):
         rel = os.path.relpath(root, str(src))
         here = dst if rel == "." else dst / rel
@@ -1855,11 +2003,14 @@ def side_data(s: Session, tgt: Account) -> list:
     🛑 Nothing else travels. `sessions/`, `session-env/`, `shell-snapshots/` and `jobs/`
     describe a PROCESS or are code-execution surfaces, `bridge-pointer.json` points at a
     live pid, `.claude.json` is the home's own state, and a credential is never touched.
+
+    🛑 A pair that is one directory is not a pair: where both homes' `file-history/` (say)
+    resolve to one shared tree, there is nothing to carry, and it is dropped here.
     """
     out = []
     for name in SIDE_DATA_DIRS:
         src = s.account.home / name / s.local_id
-        if src.is_dir():
+        if src.is_dir() and not same_path(src, tgt.home / name / s.local_id):
             out.append((src, tgt.home / name / s.local_id))
     for name, pattern in SIDE_DATA_GLOBS:
         try:
@@ -1867,7 +2018,7 @@ def side_data(s: Session, tgt: Account) -> list:
         except OSError:
             found = []
         for src in found:
-            if src.is_file():
+            if src.is_file() and not same_path(src, tgt.home / name / src.name):
                 out.append((src, tgt.home / name / src.name))
     return out
 
@@ -1877,10 +2028,23 @@ def copy_in(s: Session, tgt: Account, apply: bool):
     the project's auto-memory."""
     dest = dest_of(s, tgt)
     folder = dest.parent
-    steps = [f"copy {s.transcript.name} to {tilde(folder)}/"]
-    if dest.exists():
+    # 🛑 ONE TREE, ONE TRANSCRIPT, NOTHING COPIED. Where both homes' `projects/` resolve to
+    # one directory, `dest` IS `s.transcript` by another spelling. The whole copy block is
+    # skipped, not merely made idempotent: `shutil.copy2` raises `SameFileError`, a merge of
+    # the sibling onto itself is pointless, and the backup step would leave a `.csm-bak-…`
+    # snapshot of a LIVE transcript in the shared tree. What the move still does: the
+    # first-run gates and the resume under the target's login.
+    shared = one_tree(s, tgt)
+    if shared:
+        steps = [f"copy NOTHING: {s.account.name}'s and {tgt.name}'s projects/ are ONE "
+                 f"directory ({tilde(os.path.realpath(str(folder)))}), so {s.transcript.name} "
+                 f"is already the file {tgt.name} resumes; it is not copied, backed up or "
+                 "rewritten"]
+    else:
+        steps = [f"copy {s.transcript.name} to {tilde(folder)}/"]
+    if dest.exists() and not shared:
         steps.append(f"back up the target's existing copy of {dest.name} first (it is not running)")
-    if s.sibling.is_dir():
+    if s.sibling.is_dir() and not shared:
         steps.append(f"copy {s.sibling.name}/ (subagents, tool results)")
     extra = side_data(s, tgt)
     if extra:
@@ -1894,7 +2058,9 @@ def copy_in(s: Session, tgt: Account, apply: bool):
     src_mem, tgt_mem = s.transcript.parent / "memory", folder / "memory"
     store_tgt, how_tgt, _keyed_tgt = memory_store(tgt)
     has_notes = src_mem.is_dir() and any(src_mem.iterdir())
-    if store_tgt:
+    if shared and not store_tgt:
+        steps.append("memory/ is in that same one directory: nothing to copy, nothing lost")
+    elif store_tgt:
         steps.append("copy NO memory/: %s reads auto-memory from %s (%s), so a copy would "
                      "only fork the notes"
                      % (tgt.name, tilde(memory_dir(tgt, folder.name, s.cwd)[0]), how_tgt))
@@ -1907,15 +2073,19 @@ def copy_in(s: Session, tgt: Account, apply: bool):
                      "to share them" % tgt.name)
     if not apply:
         return dest, steps
-    folder.mkdir(parents=True, exist_ok=True)
-    if dest.exists():
-        bak = dest.with_name(f"{dest.name}.csm-bak-{int(time.time())}")
-        shutil.copy2(str(dest), str(bak))
-        log(f"backed up {dest} to {bak.name}")
-    shutil.copy2(str(s.transcript), str(dest))
-    os.chmod(str(dest), 0o600)
-    if s.sibling.is_dir():
-        copy_tree(s.sibling, folder / s.sibling.name)
+    if shared:
+        # Not even a chmod: `dest` is the live transcript, reached by another spelling.
+        log(f"one tree: {dest} is already the file {tgt.name} resumes; nothing copied")
+    else:
+        folder.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            bak = dest.with_name(f"{dest.name}.csm-bak-{int(time.time())}")
+            shutil.copy2(str(dest), str(bak))
+            log(f"backed up {dest} to {bak.name}")
+        shutil.copy2(str(s.transcript), str(dest))
+        os.chmod(str(dest), 0o600)
+        if s.sibling.is_dir():
+            copy_tree(s.sibling, folder / s.sibling.name)
     for src, dst in extra:
         try:
             if src.is_dir():
@@ -2335,7 +2505,7 @@ def do_move(args, accts: list) -> int:
             "window prints is the proof it connected, and without that proof the source "
             "must keep running")
     perm, why_perm = resolve_mode(s, tgt, args.permission_mode)
-    blockers = preflight(s, tgt, mode, args.dry_run)
+    blockers = preflight(s, tgt, mode, args.dry_run, accts)
     rc_name = None
     if mode == "remote":
         rc_name = rc_label(args.name or s.label, "" if args.name else f"moved from {s.account.name}")
@@ -2381,7 +2551,9 @@ def do_move(args, accts: list) -> int:
     if args.stop_source:
         plan.append("  - once the new window prints its link, stop the source process"
                     + (f" (pid {s.pid})" if s.pid else " (not running)"))
-    plan.append("  - the source transcript is never edited or deleted")
+    plan.append("  - the source transcript is never deleted, and is edited only by the resumed "
+                "session itself (one shared file)" if one_tree(s, tgt) else
+                "  - the source transcript is never edited or deleted")
 
     if args.dry_run:
         print("\n".join(plan))

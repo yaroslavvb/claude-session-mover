@@ -9,6 +9,47 @@ Every fact below was measured against Claude Code 2.1.296–2.1.300 on macOS. Th
 state it reads is undocumented and can change in any CLI release; the tests pin every shape
 the tool depends on.
 
+## [0.3.0] — 2026-10-22
+
+Verified against Claude Code 2.1.308 on macOS.
+
+### Added
+
+- **`LESSONS.md`**, linked from the README: 36 rules for moving Claude Code sessions between
+  accounts and machines, each with a one-line rule, the incident behind it, a command to check
+  it and the version it was verified against, with fast-changing or undocumented facts marked
+  **Beta**. New in it: `projects/<slug>/bridge-pointer.json` is per-account Remote Control
+  state, so a `projects/` tree must not be shared between accounts on a machine that runs
+  Remote Control servers; writes reopen the transcript by path and hold no descriptor;
+  `cleanupPeriodDays` prunes, so pin it before linking anything; the Keychain slot formula and
+  the inputs tools disagree on; `CLAUDE_SECURESTORAGE_CONFIG_DIR` (present in the binary,
+  undocumented); an environment token outranks the config dir; `.claude.json` mixes identity
+  with per-project trust; and a linked shared file can silently become a real one.
+- A **Related tools** section in `LESSONS.md` (about 25 actively developed tools that move or
+  share sessions or accounts) and a short one in the README, replacing "Prior art".
+- `csm list` adds a line saying how many rows are one transcript several homes can see.
+
+### Fixed
+
+- **Safe on homes that share one `projects/` tree.** Where the source and target homes'
+  `projects/` resolve to one directory:
+  - a move copies nothing: no transcript copy, no `.csm-bak-…` backup, no sibling copy, not even
+    a chmod. Before, the copy onto itself raised `shutil.SameFileError` half-way through the
+    move;
+  - side data that is one directory in both homes (a shared `file-history/`) is skipped;
+    `tasks/` and `todos/` still travel when they are real per-home directories. The merge copy
+    also refuses a copy onto itself for any caller;
+  - `csm list` shows one row per transcript instead of one per home (collapsed by realpath, so
+    two genuine copies after an ordinary move stay two rows), attributed to the home running it,
+    else the home holding its `tasks/`/`todos/`. `csm move <id>` and `csm move "<title>"` no
+    longer refuse an idle shared session as "several copies";
+  - the live-twin refusal asks every home on the machine, the default home included even when an
+    accounts file leaves it out, because the process holding a shared transcript can belong to a
+    third account;
+  - the plan warns that the moved session resumes the very file the source uses, and, if the
+    source is running, that two CLIs would interleave in it, naming `--stop-source`.
+  Homes with their own `projects/` behave exactly as before. 11 new tests (232 in all).
+
 ## [0.2.0] — 2026-10-19
 
 ### Added
@@ -276,5 +317,6 @@ Initial public release.
 - Fixture-only tests (fake homes, fake `claude`, fake tmux; no network, no account) and CI on
   ubuntu and macOS × Python 3.9 and 3.12.
 
-[0.2.0]: https://github.com/yaroslavvb/claude-session-mover/compare/48dde4b...main
+[0.3.0]: https://github.com/yaroslavvb/claude-session-mover/compare/484f855...main
+[0.2.0]: https://github.com/yaroslavvb/claude-session-mover/compare/48dde4b...484f855
 [0.1.0]: https://github.com/yaroslavvb/claude-session-mover/commit/48dde4b

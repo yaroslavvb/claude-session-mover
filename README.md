@@ -308,6 +308,15 @@ time: Down only while the marker is not on the wanted option, Enter only when th
 option, and no key at all when the pane is ambiguous. Never a digit, never a canned sequence — a cold home's
 dialogs put the cancelling answer first and focused, so a blind Enter declines.
 
+**Homes that share one `projects/` tree.** If two homes' `projects/` resolve to the same directory (both symlinked
+into one tree, say), `csm` compares by resolved path, not by spelling. `csm list` shows one row per transcript, not
+one per home, and names the home running it. A move between two such homes copies nothing — the file the target
+resumes is already the file the source uses — so there is no copy, no backup and no sibling copy, and side data
+that is one directory in both homes is skipped too. The live-twin refusal asks every home on the machine (the
+default home included), because the process holding a shared transcript can belong to a third account. Leaving the
+source running then means two CLIs append to one file, so the plan says so and names `--stop-source`. Read
+[LESSONS.md § D](LESSONS.md#d) before choosing this layout.
+
 ## What a move costs, and what it cannot carry
 
 `csm move` prints the ones that apply before and after the move. In short:
@@ -379,8 +388,14 @@ machine; connectors are free, because they follow the account.
 
 ## Lessons
 
-Eight of the rules that cost the most to learn. The rest, grouped and with the reasoning, are in
-[docs/lessons.md](docs/lessons.md).
+Eight of the rules that cost the most to learn. **[LESSONS.md](LESSONS.md)** has 36, each with a one-line rule,
+the incident behind it, a command to check it, and the Claude Code version it was verified against, with the
+fast-changing (Beta) facts marked. The longer narrative is in [docs/lessons.md](docs/lessons.md).
+
+- **Do not share one `projects/` tree between accounts on a machine that runs Remote Control servers.**
+  `projects/<slug>/bridge-pointer.json` is each server's per-account reattach state, and pin `cleanupPeriodDays`
+  before linking anything, or one home's pruner deletes every account's history.
+  ([more](LESSONS.md#d))
 
 - **An account is a payment layer — a login and a quota. Everything that should follow you belongs outside the
   config home.** Anything you leave inside one will fork silently the day you add another account.
@@ -418,7 +433,7 @@ session, and answers with the account and the new link.
   macOS, `<home>/.credentials.json` elsewhere.
 - **tmux** for the default Remote Control mode. `--foreground` resumes in the current terminal and needs no tmux.
 - **Claude Code's on-disk state is undocumented** and can change in any release. Everything here was measured
-  against CLI 2.1.296–2.1.300; the tests pin every shape the tool depends on, so a format change fails loudly
+  against CLI 2.1.296–2.1.300 (the shared-tree handling and LESSONS.md against 2.1.308); the tests pin every shape the tool depends on, so a format change fails loudly
   rather than quietly. Re-check anything load-bearing against the version you actually run.
 - CI runs the suite on Ubuntu and macOS against Python 3.9 and 3.12, with no tmux and no account.
 
@@ -473,18 +488,29 @@ environment scrub, the dialog answerer's key-by-key walk, the process proof, `st
 exit codes. What a fixture cannot show — a real resume under another login — was measured instead, and written
 down in [docs/design.md](docs/design.md).
 
-## Prior art
+## Related tools
 
-Other people's tools for neighbouring jobs:
+Actively developed tools for neighbouring jobs (as of 22 Oct 2026; the full list of about 25, grouped, is in
+[LESSONS.md § Related tools](LESSONS.md#related)):
 
-- [realiti4/claude-swap](https://github.com/realiti4/claude-swap) — switch between several Claude Code accounts, with
-  rate-limit rotation and a usage dashboard.
-- [OpenGraphLabs/claude-rotate](https://github.com/OpenGraphLabs/claude-rotate) — run Claude Code across several
-  accounts and resume the session on the next one when a usage limit hits; the closest in purpose to `csm`.
-- [Sertelegger/claude-sesh-mover](https://github.com/Sertelegger/claude-sesh-mover) — a Claude Code plugin that
-  imports, exports and migrates sessions between profiles, containers and machines.
-- [tawanorg/claude-sync](https://github.com/tawanorg/claude-sync) — sync Claude Code sessions across devices,
-  end-to-end encrypted.
+- [claude-sesh-mover](https://github.com/Sertelegger/claude-sesh-mover) — a Claude Code plugin that exports, imports
+  and migrates sessions between profiles, containers and machines.
+- [hatswap](https://github.com/orvi2014/hatswap) — concurrent accounts, a live session move between them, folders
+  pinned to accounts, and handoff to Codex.
+- [claude-rotate](https://github.com/OpenGraphLabs/claude-rotate) — resumes the session on the next account when a
+  usage limit hits.
+- [AgEnD](https://github.com/songsid/agend) — a fleet daemon for several agent CLIs that can carry a conversation to
+  another credential profile.
+- [tokenmaxxing](https://github.com/anaclumos/tokenmaxxing) — one real `~/.claude`, only the credential store
+  switching, via `CLAUDE_SECURESTORAGE_CONFIG_DIR`.
+- [Orca](https://github.com/stablyai/orca) — a config dir per account with a shared layer of settings, skills and
+  plugins.
+- [agent-shim](https://github.com/exadev/agent-shim), [claude-profile-manager](https://github.com/jakubkontra/claude-profile-manager),
+  [clausona](https://github.com/larcane97/clausona), [clauth](https://github.com/uwuclxdy/clauth) — per-account
+  homes linked into one shared layer, each with a written list of what must stay per account.
+- [claude-swap](https://github.com/realiti4/claude-swap) — swaps the login under one home, with rate-limit rotation.
+- [claude-sync](https://github.com/tawanorg/claude-sync) — sync Claude Code sessions across devices, end-to-end
+  encrypted.
 
 `csm`'s own scope is narrower: one conversation, moved between two config homes on one machine, onto another of
 your own logins.
@@ -500,6 +526,8 @@ changes nothing about who pays for what — it changes which of *your* accounts 
 
 ## Documentation
 
+- [LESSONS.md](LESSONS.md) — rules for moving sessions between accounts and machines: rule, why, check, verified
+  version, and stable or Beta, plus the related tools.
 - [docs/fungibility-matrix.md](docs/fungibility-matrix.md) — the matrix in full, one section per layer: where it
   lives, the verdict on each axis, how to make it fungible, and which `csm matrix` row reports it.
 - [docs/setup.md](docs/setup.md) — the recipe for making accounts fungible, on one machine and across machines.

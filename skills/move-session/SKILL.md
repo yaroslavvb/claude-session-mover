@@ -107,6 +107,12 @@ measure.
   not, unless both homes point at one directory.
 - **Auto-memory is per home** unless both resolve to one store. csm never copies memory, in any
   configuration — a copy becomes a second set that drifts.
+- **`⚠ ONE TRANSCRIPT`**: the two homes' `projects/` are one directory, so the move copies
+  nothing — the moved session resumes the very file the source is using. If the source is
+  RUNNING, two CLIs then append to one file and their lines interleave: pass `--stop-source`,
+  or `csm stop <session>` right after the move. If the source IS the session running the move,
+  it keeps writing to that file until it ends, so type to the moved window, not the old one.
+  `csm list` flags the rows that are one shared transcript.
 - **Bypass consent / "Enable Remote Control?"** never answered in the target home: the window
   may stop on that question.
 - **`⚠ UNVERIFIED`**: the credential store could not be asked, so whether that login still

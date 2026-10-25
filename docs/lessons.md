@@ -7,6 +7,10 @@ any of them. Every technical detail here was measured on those builds: Claude Co
 dialogs get re-drawn, so re-check anything load-bearing against the version you actually run. Where a lesson is
 something `csm` already does for you, it says so in a few words.
 
+Most of this ground is also covered in [LESSONS.md](../LESSONS.md), as one-line rules — each with the incident
+behind it, a command to check it, and the Claude Code version it was verified against. Those go up to 2.1.308,
+newer than this page, so where the two differ, trust that one.
+
 Contents: [Accounts and identity](#accounts) · [Credentials and signing in](#credentials) ·
 [Sharing configuration](#sharing) · [Memory](#memory) · [Moving a session](#moving) ·
 [Permission modes](#modes) · [Remote Control](#remote-control) · [Connectors and MCP](#mcp) ·

@@ -5,6 +5,11 @@
 #                           because each CLAUDE_CONFIG_DIR reads its own skills directory
 # CSM_BIN_DIR overrides ~/.local/bin. Nothing that already exists and is not ours is replaced.
 set -eu
+case "${1:-}" in
+  ""|--skill) ;;
+  -h|--help|help) echo "usage: $0 [--skill]"; exit 0 ;;
+  *) echo "unknown option: $1 (usage: $0 [--skill])" >&2; exit 2 ;;
+esac
 here=$(cd "$(dirname "$0")" && pwd)
 tool="$here/claude-session-mover"
 bin="${CSM_BIN_DIR:-$HOME/.local/bin}"

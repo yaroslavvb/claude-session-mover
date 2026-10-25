@@ -1,5 +1,7 @@
 # Claude Session Mover
 
+[![tests](https://github.com/yaroslavvb/claude-session-mover/actions/workflows/test.yml/badge.svg)](https://github.com/yaroslavvb/claude-session-mover/actions/workflows/test.yml)
+
 `csm` moves a running [Claude Code](https://docs.claude.com/en/docs/claude-code/overview) session from one of your
 own Claude accounts to another, keeping the whole conversation. One account hits its usage limit while another has
 quota to spare; instead of starting the work over and losing the thread, you move the thread. `csm` copies the
@@ -275,12 +277,19 @@ simply have not set up yet.
 | `CSM_CLAUDE` | the `claude` binary, when it is not on `PATH` |
 | `CSM_TMUX` | the `tmux` binary, when it is not on `PATH` |
 | `CSM_STATE_DIR` | the **state dir**: where the log and the `list` numbering are kept (default `$XDG_STATE_HOME/claude-session-mover`, falling back to `~/.local/state/claude-session-mover`) |
+| `CSM_LOG` | the log file itself (default `<state dir>/log`) |
+| `CSM_PICKS` | where `list` leaves its numbering, so `move 3` means the row you just read (default `<state dir>/picks.json`) |
 | `CSM_CAPTURES` | where the pane captures `csm stop` and `csm move --stop-source` write are kept (default `<state dir>/captures`, 0700, each file 0600) |
 | `CSM_CONNECT_WAIT` | seconds to wait for the moved window's claude.ai link (default 150) |
 | `CSM_LOCK_WAIT` | seconds to wait for the CLI's `.claude.json.lock` before writing anyway with a warning (default 2) |
 | `CSM_LOGIN_PROBE` | `true`, `false`, `unknown` or `off` — force the answer of the credential-existence check instead of asking the store, for a machine where asking it is not possible. It announces itself on stderr and in the log on every run |
 | `CSM_TMUX_SOCKET` | add `-L <socket>` to every `tmux` call, to keep `csm`'s windows on a server of their own |
 | `CSM_BIN_DIR` | where `install.sh` links the command (default `~/.local/bin`) |
+
+Three knobs are for the test suite and for a machine where the credential store cannot be asked:
+`CSM_LOGIN_PROBE` and `CSM_TMUX_SOCKET` above, and `CSM_NO_HOLD`, which the table leaves out because it drops the
+held-open window a move's scrollback is read from. The tuning internals (`CSM_HEAD_BYTES`, `CSM_TAIL_BYTES`,
+`CSM_POLL`, `CSM_SETTLE`) and the full list are in [docs/design.md](docs/design.md#env).
 
 ## What a move does
 
@@ -388,7 +397,7 @@ machine; connectors are free, because they follow the account.
 
 ## Lessons
 
-Eight of the rules that cost the most to learn. **[LESSONS.md](LESSONS.md)** has 36, each with a one-line rule,
+Nine of the rules that cost the most to learn. **[LESSONS.md](LESSONS.md)** has 36, each with a one-line rule,
 the incident behind it, a command to check it, and the Claude Code version it was verified against, with the
 fast-changing (Beta) facts marked. The longer narrative is in [docs/lessons.md](docs/lessons.md).
 

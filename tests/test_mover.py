@@ -2708,6 +2708,9 @@ class MatrixCommand(Base):
     def test_the_table_names_every_home_every_layer_and_what_to_do(self):
         (self.work / "settings.json").write_text('{"a": 1}')
         out = self.table()
+        # the advice column wraps, so prose is matched against the unwrapped text: how
+        # wide a path prints (a symlinked TMPDIR vs a real one) is not what is pinned
+        flat = " ".join(out.split())
         self.assertIn("fungibility matrix on", out)
         for col in ("work", "personal"):
             self.assertIn(col, out)
@@ -2716,18 +2719,19 @@ class MatrixCommand(Base):
                       "folder trust", "permissions mode", "disableAutoMode",
                       "bypass consent", "CLI version", "connectors", "MCP sign-ins"):
             self.assertIn(layer, out)
-        self.assertIn("point every home's settings.json at one copy", out)
-        self.assertIn("shareable layer(s) agree across 2 home(s)", out)
+        self.assertIn("point every home's settings.json at one copy", flat)
+        self.assertIn("shareable layer(s) agree across 2 home(s)", flat)
         # the legend explains every verdict the table used
-        self.assertIn("one shared file or key away", out)
-        self.assertIn("could not look", out)
+        self.assertIn("one shared file or key away", flat)
+        self.assertIn("could not look", flat)
 
     def test_connectors_and_mcp_signins_are_stated_whatever_is_measured(self):
         out = self.table()
         # a span row wraps instead of being truncated: these are the rows people quote
-        self.assertIn("claude.ai/customize/connectors, not readable", out)
-        self.assertIn("offline", out.split("claude.ai/customize/connectors")[1])
-        self.assertIn("per home — stored inside the login credential, not read", out)
+        flat = " ".join(out.split())
+        self.assertIn("claude.ai/customize/connectors, not readable", flat)
+        self.assertIn("offline", flat.split("claude.ai/customize/connectors")[1])
+        self.assertIn("per home — stored inside the login credential, not read", flat)
 
     def test_the_json_carries_the_homes_the_rows_the_cells_and_the_exit(self):
         d = json.loads(self.table("--json"))

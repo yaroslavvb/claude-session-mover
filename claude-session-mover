@@ -99,7 +99,7 @@ try:                                      # POSIX only; the tool is macOS/Linux 
 except ImportError:                       # pragma: no cover
     pwd = None
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 PROG = "claude-session-mover"
 
 HOME = Path(os.path.expanduser("~"))

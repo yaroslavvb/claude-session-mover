@@ -1,6 +1,6 @@
 # Claude Session Mover: design and implementation
 
-Version 0.3.0 · code **[github.com/yaroslavvb/claude-session-mover](https://github.com/yaroslavvb/claude-session-mover)**
+Version 0.3.1 · code **[github.com/yaroslavvb/claude-session-mover](https://github.com/yaroslavvb/claude-session-mover)**
 (MIT, one Python file, standard library only).
 
 Everything here is Claude Code's own **undocumented on-disk state**. It has already changed inside one minor

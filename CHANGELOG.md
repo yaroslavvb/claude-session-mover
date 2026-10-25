@@ -9,6 +9,40 @@ Every fact below was measured against Claude Code 2.1.296–2.1.300 on macOS. Th
 state it reads is undocumented and can change in any CLI release; the tests pin every shape
 the tool depends on.
 
+## [0.3.1] — 2026-10-25
+
+Nothing about moving a session changed. CI, the installer and the documentation.
+
+### Fixed
+
+- **The ubuntu CI cells were red for a test, not for the tool.** `csm matrix`'s advice column
+  wraps at 100 columns, and two matrix tests matched that prose against the wrapped
+  output; on a runner whose `TMPDIR` is a long real path rather than a short symlink, the extra
+  path width pushed `point every home's settings.json at one copy` across a line break. The two
+  tests now match against the unwrapped text (`" ".join(out.split())`), so what is pinned is the
+  advice, not how wide a path prints. The matrix itself was always right. Reproduce the old
+  failure on macOS with `TMPDIR=$(cd /some/real/directory && pwd -P) python3 tests/test_mover.py`.
+  Still 232 tests.
+- **`install.sh` is executable** (it was committed `100644`, so the README's own `./install.sh`
+  failed for anyone who cloned the repo), and it now **rejects an unknown option** instead of
+  silently installing the command only: the check runs before the first link, `-h`/`--help`
+  prints the usage, and anything but `--skill` exits 2.
+
+### Documentation
+
+- README: a CI badge under the title; the Lessons section says "Nine" of the rules, which is how
+  many bullets it has; the Environment table gains `CSM_LOG` and `CSM_PICKS`, with one line under
+  it naming the test and locked-down-machine knobs (`CSM_LOGIN_PROBE`, `CSM_TMUX_SOCKET`,
+  `CSM_NO_HOLD`) and the tuning internals, and pointing at
+  [docs/design.md](docs/design.md#env) for the full list.
+- `docs/setup.md`: the `projects/` row of "Never link or share these" now states the two costs of
+  linking it anyway — on a machine that runs Remote Control servers the accounts' servers
+  overwrite one `projects/<slug>/bridge-pointer.json`, and any home still on the default
+  `cleanupPeriodDays` prunes every account's history — with the mitigation for each.
+- `docs/lessons.md`: links back to `LESSONS.md`, and says that where the two differ `LESSONS.md`
+  is the newer measurement (2.1.308, against this page's 2.1.29x–2.1.300).
+- The `move-session` skill passes on the `⚠ ONE TRANSCRIPT` warning 0.3.0 added.
+
 ## [0.3.0] — 2026-10-22
 
 Verified against Claude Code 2.1.308 on macOS.
@@ -317,6 +351,7 @@ Initial public release.
 - Fixture-only tests (fake homes, fake `claude`, fake tmux; no network, no account) and CI on
   ubuntu and macOS × Python 3.9 and 3.12.
 
-[0.3.0]: https://github.com/yaroslavvb/claude-session-mover/compare/484f855...main
+[0.3.1]: https://github.com/yaroslavvb/claude-session-mover/compare/301b3b3...main
+[0.3.0]: https://github.com/yaroslavvb/claude-session-mover/compare/484f855...301b3b3
 [0.2.0]: https://github.com/yaroslavvb/claude-session-mover/compare/48dde4b...484f855
 [0.1.0]: https://github.com/yaroslavvb/claude-session-mover/commit/48dde4b

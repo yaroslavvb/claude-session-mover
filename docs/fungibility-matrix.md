@@ -22,7 +22,7 @@ account, per config home or per machine by design · ⚠️ changes when a sessi
 
 | Layer | Lives in | Across accounts (one machine) | Across machines | What to do |
 |---|---|---|---|---|
-| [Conversation (transcript)](#conversation) | `<home>/projects/<folder>/<id>.jsonl` + optional `<id>/` | ✅ `csm` copies it | 🔧 copy by hand — `csm` moves within one machine | the folder name is derived from the absolute path; `claude --resume` also takes a file path |
+| [Conversation (transcript)](#conversation) | `<home>/projects/<folder>/<id>.jsonl` + optional `<id>/` | ✅ `csm` copies it | ✅ `csm move --from-machine` copies it | the folder name is derived from the absolute path; `claude --resume` also takes a file path |
 | [Usage limits](#quota) | the account | 🛑 per account — the reason to move | ✅ one account, one quota, every machine | move the session; never pool credentials |
 | [Login (OAuth credential)](#login) | macOS: Keychain item named from the literal `CLAUDE_CONFIG_DIR`; Linux: `<home>/.credentials.json` | 🛑 one login per config home | 🛑 sign in on each machine | renaming a home on macOS orphans its login |
 | [**claude.ai connectors**](#connectors) (Gmail, Drive, Calendar, …) | your claude.ai account (server-side) | 🛑 **per account — no terminal can attach one** | ✅ follow the account to every machine | enable the same set on every account at `claude.ai/customize/connectors`; a moved session sees only the target account's connectors |
@@ -73,14 +73,18 @@ exactly one matches) — but it never looks in another config home. So moving a 
 target home. `--resume` also accepts a path to a `.jsonl` file directly, which is the simplest way to resume a
 transcript that is not where the slug says it should be.
 
-**Across machines: 🔧 by hand.** Nothing syncs transcripts. Copy the file, and expect the folder name to differ if
-the project's absolute path differs. `CLAUDE_CODE_PROJECT_DIR_NAME` (`[A-Za-z0-9_-]{1,64}`, no Windows device names)
+**Across machines: ✅ with a copy, too.** Nothing *syncs* transcripts, and the folder name differs wherever the
+project's absolute path does. `CLAUDE_CODE_PROJECT_DIR_NAME` (`[A-Za-z0-9_-]{1,64}`, no Windows device names)
 overrides the project directory name outright, which is the clean answer to "the same repo lives at a different path
-on my other machine".
+on my other machine"; failing that, the path has to be translated when the file is carried over.
 
 **What `csm` does.** Copies the `.jsonl` and its sibling `<id>/` directory into the target home, reusing the
 **source's** folder name rather than recomputing a slug, and never moves, edits or deletes the source. Each move
-leaves one copy per home.
+leaves one copy per home. With `move <id> --from-machine M` it does the same across machines: the session is found
+over there, the file crosses over ssh, the working directory is translated into this machine's spelling by
+configured path roots, and one hidden line is appended to the copy telling the resumed session what changed under
+it. What does **not** cross is everything the conversation was touching: the processes it started, the devices it
+was driving and the data outside the repo — `--mirror-cwd` brings the code and says what it left.
 
 **`csm matrix` row.** None — the matrix describes homes, not sessions. `csm list` shows the transcripts.
 
@@ -460,6 +464,13 @@ it says "asked for X (not measured)" rather than claiming.
 
 **`csm matrix` rows.** `permissions mode` and `disableAutoMode`, reported verbatim per home, never coerced to
 a boolean.
+
+**And the sessions, not just the files.** `csm modes` is the complement: every **live** session here, the mode it is
+really in, and whether that is weaker than this machine's `permissions.defaultMode`. The matrix reads the settings,
+and a settings file can be right while a worker a Remote Control server spawned sits in `auto` — because such a
+worker records the mode the stored session record holds, not the one its server was launched with. `csm modes
+--check` is the one-line form, and `--restart-idle` prints what a restart would signal (it never signals without
+`--apply`, which is gated).
 
 <a id="model-title"></a>
 

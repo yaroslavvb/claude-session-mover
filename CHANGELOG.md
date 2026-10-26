@@ -9,6 +9,302 @@ Every fact below was measured against Claude Code 2.1.296–2.1.300 on macOS. Th
 state it reads is undocumented and can change in any CLI release; the tests pin every shape
 the tool depends on.
 
+## [0.4.0] — 2026-10-25
+
+**One engine.** This release merges in a private fork that had been used daily for two weeks and
+had grown the features this repository lacked: a permission sweep, a session search, moves between
+machines, a quota-driven target and a note that tells the moved session what changed under it.
+Everything that was specific to one person's machines left the code on the way over and became a
+documented knob, so the merged tool still runs with nothing configured — and the two places where
+the fork was *less* careful were not adopted: it copied a project's `memory/` when the target home
+had none (this one never copies memory, in any configuration, because that is how stores fork),
+and it fell back to an argv name test when a pid's recorded start time was missing (this one
+refuses: a name does not say *which* session). A setup with inputs of its own now supplies them
+from a wrapper that sets the `CSM_*` variables and `exec`s the tool, instead of carrying a second
+copy of the tool.
+
+232 tests became **466**, and CI gained an Ubuntu 22.04 × Python 3.7 cell, so the floor the README
+promises is measured rather than claimed, and Python 3.14 cells: from 3.14 pathlib's `exists()` and
+`is_file()` answer False on a permission error instead of raising, which made the two refusals
+that guard an unreadable project folder pass silently. They now ask `os.stat` directly.
+
+### Added
+
+- **`CSM_TMUX_SESSION`: the tmux session a moved window is opened in**, as a template over
+  `{name}`, `{handle}` and `{label}`, still defaulting to `csm-{name}`. For an install that
+  already keeps a tmux session per account, `claude-{handle}` puts a moved window in the session
+  you already attach to. It is also what makes that choice reversible: `csm stop` looks for a
+  `moved-<id8>` window only in the session the spelling in force names, so a window opened under
+  one spelling is invisible to `stop` under another — the knob is how you hand the old spelling
+  back instead of being told csm has moved nothing here. A template naming a field it does not
+  know falls back to the default rather than refusing, and the result is sanitised whatever it
+  said: tmux reads `.` and `:` as window and pane, and a leading `-` would reach `tmux -s` as a
+  flag.
+
+- **`csm modes`: the permission sweep.** Every live session in every config home here, the mode it
+  is *really* in, and whether that is weaker than this machine's `permissions.defaultMode`. It is
+  the complement of a settings check: a worker a Remote Control server spawned records the mode
+  the stored session record holds, not the one its server was launched with, so a settings file
+  can read correct while live sessions sit in `auto` — and nothing looked. It reads every live
+  registry row, including the ones `csm list` drops (a server's pre-created session has a 0-byte
+  transcript), and where a transcript records no mode it reads the mode off the process's own
+  command line. `fault` is only a Remote Control worker in a mode such a worker records by
+  accident; `plan`, `acceptEdits` and terminal sessions are `info` and never restarted; what could
+  not be read is `unknown`, never `ok`.
+  - `--check` prints **one line on stdout and nothing on stderr**, with the exit code agreeing
+    with the prefix (`ok:` 0, `FAULT:` 1, `INCOMPLETE:` 3), so a scheduled check can match it.
+    Every diagnostic on that path goes to the log, and the credential probe does not run there.
+  - `--restart-idle` prints which idle workers a restart would `SIGTERM`, and why each other row
+    is refused. `--apply` is **gated and refuses**: the respawn is measured, the mode a respawned
+    worker comes back in is not. No environment variable can open the gate — a constant in the
+    file is the only switch, because a stray variable in a scheduled pass's environment must never
+    be able to stop a session.
+- **`csm find TEXT [--on M]`.** Finds a session by id or prefix, claude.ai link or title text in
+  *every* config home on a machine — the default one included, where the **desktop app** keeps its
+  sessions, with its titles read from the app's own index, which no transcript holds. `--on M`
+  runs the search over there by piping a self-contained, standard-library-only, 3.6-safe helper to
+  that machine's system python, so nothing has to be installed on the far side; it is read-only
+  and run with `-I`. The table labels what it cannot know: the age is the transcript *file's* last
+  write, not the last turn, and a moved session shows as two rows, because a move is a copy.
+- **Moves between machines: `move <id> --from-machine M`**, with `--mirror-cwd`. The session is
+  found over there, the transcript and its sibling directory cross in one `tar` pipe over ssh into
+  a staging directory that stays as the record of what crossed, and the copy is resumed here. The
+  **source is never stopped** — a process over there may be driving work this tool cannot see —
+  and the plan lists what it started that is still running, so `--stop-source` is refused across
+  machines. `--mirror-cwd` brings the session's **code** when its folder is only on the other
+  machine (git-tracked and untracked, never ignored, 25 MB a file, 2 GB in all, `.git` included);
+  data stays where it was made, a folder that already exists here is never written into, and a
+  mirror whose remote cannot be pushed over ssh from here gets an https rewrite in its *own*
+  `.git/config`.
+- **Folder translation between machines** (`CSM_MACHINES`, `CSM_SYNC_DIRS`): named roots present
+  on both machines first, longest prefix first, then the home-relative directories that are one
+  synced folder everywhere — the rule a sync root needs, because such a directory is usually a
+  symlink into the sync client's tree and the transcript records the symlink spelling — then home
+  to home. A folder no rule reaches and that is not here is a refusal, not a guess.
+- **The move note.** Every move appends one hidden `isMeta` line to the copy, chained by
+  `parentUuid`, saying when the session moved, from which account and machine to which, that the
+  original still exists, what above it is now stale, where auto-memory is read from, and — across
+  machines — that commands now run here, what the mirror brought, what stayed behind and what is
+  still running there. A resumed session reads its transcript as its own past: measured, one
+  resumed on another machine went looking for a process it had started on the old one, and the
+  CLI's own banner told it that background tasks "didn't finish" when they were in fact still
+  running over there. `--dry-run` prints it.
+- **`move --to auto`**, and a quota meter. `CSM_METERS` names a JSON file of percentages used per
+  account, written by whatever tool you like; `auto` takes the account here with the most weekly
+  room among those with a *fresh* reading under both cutoffs (`CSM_AUTO_MAX_5H` 90 %,
+  `CSM_AUTO_MAX_7D` 95 %) and a usable login, never the source, and prints which one it chose and
+  its numbers. With no meter it **refuses**: unread is never room, and a guess here is a move into
+  a second exhausted account, which looks exactly like a success. `csm accounts` gains a meter
+  column, and a *named* target at or over a cutoff gets a `near its limit` warning with the
+  numbers.
+- **`--machine M` as the configured spelling of `--ssh HOST`.** `--machine` is checked against the
+  machines the configuration knows, refuses this machine ("drop the flag") and names the
+  alternatives; `--ssh` still takes any host. Both strip the flag by name and never by value, run
+  ssh with `BatchMode` and a connect timeout so an unattended call cannot sit on a password
+  prompt, log the remote leg's **exit code** as well as its dispatch, and obey `CSM_REMOTE_CMD` —
+  which is how a machine with a wrapper of its own says where its command is, so a remote leg gets
+  *that* machine's environment. A remote listing ends by saying whose rows they are.
+- **The accounts file reads a tab-separated table**, as a second dialect chosen per line, with the
+  columns taken by name from a commented header and otherwise by position (1 name, 2 email, 3
+  home, 6 machines, 7 handle) and every other column ignored — so a table some other tool already
+  owns can be read where it is, instead of being copied into a second table that goes stale the
+  day an account is added. With it:
+  - **handles**: a short alias that resolves wherever a name does and is what every listing
+    prints, with its shape enforced where it is read (one lower-case `[a-z0-9-]` token, never all
+    digits, never leading-hyphen) because `resolve` has an exact rung for it;
+  - **`machines`** (against `CSM_MACHINE`, the short hostname by default): a row for another
+    machine is not listed, and a row naming *no* machine is listed but refused as a target, so the
+    refusal can name it. A file whose `machines` column names this machine nowhere lists every
+    account rather than none;
+  - 🛑 **`home` may not be `-`, `default` or `~/.claude` in a table**: those are three different
+    things, and any non-empty spelling of the default home takes the hashed-Keychain branch onto
+    an empty slot that reads exactly like signed out. The simple dialect keeps `-`.
+  - A file that mixes the dialects, repeats a name or repeats a handle is refused naming the line.
+- **`move --copy-only`**: every refusal, the first-run gates, the copy and the move note — and
+  nothing started, for a program that resumes the copy under its own supervision. And **`move
+  --from-account A`**, for the case a move creates: after one move the same id is in two homes,
+  and `pick` correctly refuses to guess which.
+- **A session another program owns is refused**, before the target is even resolved. Where
+  `CSM_BOTS_DIR` holds a supervisor's `<name>.json` naming a `session_id`, a plain move would
+  start a second copy nothing is talking to while the supervisor kept answering on the old
+  account; the refusal names the owner, and `--copy-only` is how that supervisor changes account
+  itself. A directory that cannot be *read* is a refusal too, never a "no".
+- **Two more notes in the plan**: a **room** note (only with `CSM_ROOM_CMD`) saying whatever runs
+  sessions here for the target account has no way into this folder yet — silent when the probe
+  exits non-zero, because "could not look" is never a verdict — and a **retention** note when the
+  transcript's own file is older than the home's `cleanupPeriodDays`, which prunes.
+- **`CSM_KEEP_ENV`**: `CLAUDE*` / `ANTHROPIC*` names the environment scrub puts back for the moved
+  session, for a tool *inside* it that needs the same input this one had. Empty by default, and a
+  name outside those two families is dropped rather than honoured, so it cannot become a general
+  allowlist.
+- **`install.sh --no-short-name`**: link the long name only, for a machine where `csm` is already
+  a wrapper of your own. Without it the link shadows that wrapper and hands you the tool with none
+  of its inputs.
+
+### Changed
+
+- 🛑 **`--limit N` is a hard cap.** It was advertised and inert: live rows were exempt from it, so
+  on a machine where every Remote Control worker is a live session `--limit 6` printed 45 rows. It
+  now means **at most N rows**, the N newest, live or not, and it outranks `--all` and a session
+  pinned by its full id, because `csm move 3` is numbered against the table that was printed. The
+  table says how many rows it left out. The default is unchanged at 20 (`CSM_LIMIT`, with
+  `CSM_ALL_LIMIT` for `--all`) and still never cuts a live session — "move my *running* session"
+  is the common ask, and that session can be the oldest file in the home.
+- **The account column in `csm list` and in every message is the handle** where the accounts file
+  gives one, and the name otherwise. Its width is measured from the rows, so short handles no
+  longer leave the header a column to the right of what is under it.
+- **The connector note distinguishes "has used" from "mentions".** A `mcp__…` name is also carried
+  by a deferred-tool metadata block, with no call having been made, so a single regex over the
+  transcript claimed calls that never happened. The used bucket is matched only where
+  `"type":"tool_use"` and the name sit on one JSON line.
+- **The live-twin sweep is per home, by resolved `projects/` path.** It used to run only when the
+  source and target shared one tree, which is false by construction for a `--from-machine` move —
+  the move most likely to overwrite a transcript a live process on a *third* home is writing.
+  Measured before the fix: the move completed and copied over that home's transcript. The default
+  home is asked first, because the desktop app registers its sessions there and no accounts-file
+  row names it.
+- **The ambiguous-id guard compares paths by `stat`, not by spelling.** With a shared `projects/`
+  tree `normpath` could call one file two paths and manufacture a refusal.
+- **This machine's `permissions.defaultMode` is read from `CSM_SHARED_HOME` first** (default
+  `~/.claude`), so one shared `settings.json` answers for every account at once, and then from
+  each account home, so a home whose symlink has been replaced still reports its own drift. It is
+  deliberately *not* where a home's memory store is read from: that is a question about one home,
+  which the CLI answers from that home's own settings.
+- **The three test-only `CSM_*` switches are dropped from a moved session's environment by name**
+  (`CSM_LOGIN_PROBE`, `CSM_REMOTE_LOCAL`, `CSM_REMOTE_HOME`), although `CSM_*` is outside the
+  scrubbed families: a stale export inside a window nobody is watching would force a safety
+  check's answer, or make "the other machine" that process.
+- **The plan's target line uses `→`**, not `->`, which is what a caller parsing the dry run reads.
+
+### Fixed
+
+- **An ssh that never connected read as an answer.** `--machine` / `--ssh` hinted at exit 126 and
+  127 but said nothing at **255**, ssh's own "could not connect" — so a machine that was asleep,
+  or one reachable only through a VPN that was down, printed ssh's words (`Connection closed by
+  UNKNOWN port 65535`) and stopped, which reads exactly like a machine with nothing to list. It now
+  names 255 as usually the transport's and not the far side's, says the lines above it are ssh's,
+  and gives `ssh <host> true` as the one line that tells which. It claims neither, because a remote
+  command may return 255 itself. Both transport hints now say `csm:` like every other line this
+  tool addresses to a person; the 126/127 one had said `claude-session-mover:`, so one stderr could
+  carry two spellings of the tool's name and read as a third program talking.
+
+- **A home that could not be read was listed as empty.** `pathlib`'s `glob` swallows a
+  `PermissionError` from its own directory scan and yields nothing, so an `except OSError` around
+  a glob is dead code; the registry read uses `os.listdir`, which raises and is therefore
+  *reported* — while a home with no `sessions/` directory stays a quiet zero, because reporting
+  that as unread would make every `modes --check` on the machine a permanent `INCOMPLETE:`.
+- **A move's own refusals could be blinded the same way, and then opened.** Three of `preflight`'s
+  inputs answered "nothing there" for "I was not allowed to look". The live-twin check read an
+  unreadable `sessions/` as *no process is running this*, which is the quietest possible path to
+  the one outcome that check exists to prevent — two CLIs appending to one transcript. The
+  ambiguous-id guard globbed the target's project folders, so a second copy of the id sitting in a
+  folder this process may not read was invisible (and the `except OSError` written around the glob
+  was dead code); it uses `os.listdir` and a stat per folder now, which also stops treating the
+  transcript's own name as a glob pattern. And `Path.exists()` on the destination raised straight
+  out of `preflight` — a traceback from the one function whose whole contract is to answer in
+  sentences. All three are blockers now, named and reported together like every other refusal, on
+  the same doctrine as `login_usable` and the registry read: *could not look* is never a verdict.
+  Every guard still asks `preflight`; the plan builder's own stats, which only choose what to
+  print about a move that is already refused, answer `False` instead of raising, so `--dry-run`
+  prints "a real move would be REFUSED" where it used to print a stack.
+- **`__run` deleted the file it was pointed at and started what that file named.** The plan is a
+  hand-off read once, so `__run` unlinks it and then execs the program its JSON holds — and
+  `make_plan` has stamped `kind` and `version` on every plan since 0.1.0 with nothing ever reading
+  them. Pointed by hand or by a typo at some other JSON file, it removed that file and tried to
+  start whatever its `claude` key happened to say, in whatever `cwd` it happened to name. The file
+  is identified first; nothing is deleted and nothing is started otherwise.
+- **A machine with no `permissions.defaultMode` printed a malformed verdict.** `modes --check`
+  interpolated the empty reading straight into three of its four lines, so the first thing a fresh
+  install saw was `ok: every live session is at  or stronger` — a hole where the mode belongs, in
+  the one line this tool promises to keep stable, claiming sessions are at or stronger than a
+  baseline that is not there. All four lines now use the `(no defaultMode on this machine)` the
+  `INCOMPLETE:` line already carried, which is also the reading `csm modes`' own table has always
+  shown as `(none named)`. A machine that names a default — every machine that has been set up,
+  and the only case a scheduled caller sees — is unchanged byte for byte.
+- **A `ps` that would not answer was read as an empty machine.** The sweep asks `ps` once for the
+  whole machine, and `subprocess.run` without `check` raises for nothing — so a `ps` that rejects
+  that argument spelling exits non-zero with an empty stdout, and returning a table with no rows
+  in it says every process on the machine is gone. The sweep then explained an unread session with
+  "pid N is not in `ps` output", a claim about a question it never got to ask, in the one
+  `INCOMPLETE:` line a scheduled caller prints. A non-zero exit is "could not be asked" now, which
+  is how the per-pid prover beside it has always read the same thing. Whether that one prover
+  answered is also carried out of the sweep, as `coverage.ps` in `--json`: every `coverage.unread`
+  reason turns on it, and a reader diagnosing an `INCOMPLETE:` otherwise cannot tell a quiet
+  machine from a blinded one.
+- **`csm modes --apply` on its own** printed the read-only table and exited 0 instead of refusing
+  its one destructive flag.
+- **`--mirror-cwd` raised an `OSError` mid-move** where no rule mapped the folder and its parent
+  here was not writable — the case that section's own comment warns about. It is a one-line
+  refusal now.
+- **An `effort` value from a plan file is validated** before it is passed to the CLI.
+- **A home-relative `CSM_REMOTE_CMD` could not name the other machine's home.** Every token is
+  quoted, and `shlex.quote` has to quote both `~/…` and `$HOME/…`, so a wrapper's own path
+  reached the far side as a filename whose first component was literally `~` and exited 127 —
+  while an absolute path is no answer either, because two machines rarely share a home. A
+  leading `~/` or `$HOME/` is now the one part of that variable the remote shell expands.
+- **A folder that is not a git tree got `<project>` for its memory store.** The slug is the
+  realpath of the worktree root, and returning nothing without one was meant as honesty — but
+  the caller then wrote a literal `<project>` into the move note, a path no directory matches,
+  handed to a session the same note tells to write its notes nowhere else. Such a folder is
+  keyed on the realpath of the folder itself, which is what the store on disk shows.
+- **Every log line names the machine the rest of the output does.** It carried the hostname,
+  which is often a third name again (a collision suffix, a domain), so a `grep <machine>` over
+  the log was incomplete. With nothing configured it still *is* the hostname.
+- **`csm matrix` headed its columns with the account's name, not its handle.** It was the one
+  command the handle never reached. A matrix column is about ten characters wide — it is one
+  column per home — so the heading is truncated, and a layout whose account names share a
+  prefix (one login per project, one per client) produced several columns headed with the same
+  truncated string and nothing to say which was which: measured on a six-home machine, four of
+  the six headings read alike. The notes under the table named the homes the same way, so a
+  divergence was reported about a name that was nowhere in the table above it, and the heading
+  named the hostname while every other heading names the configured machine. The identity the
+  table compares homes by is still the name — a handle that happened to equal another
+  account's name must not make one home read as another — and `--json` keeps its `name` field,
+  which a cell's `home` names, and gains `handle` beside it as `accounts --json` has. The same
+  sweep reached the one ambiguity list that still named accounts by key while the listing it is
+  read beside named them by handle.
+- **An empty `machines` cell at the END of a table row read as "the column is not there".** The
+  two are opposites: an empty cell says this account is on no machine, which is a refusal as a
+  move target, while an absent column says the file never said, and then every row is a target.
+  Trailing tabs were stripped with the trailing spaces, so the guard opened on exactly the row
+  the file had ruled out. A tab is column structure, not whitespace.
+- **A numeric knob that is not a number no longer takes the tool down.** All fifteen are read at
+  import time, so a `ValueError` there is a traceback *before* `main` has run — on every
+  subcommand, `modes --check` included, whose whole promise is one line on stdout and nothing on
+  stderr. A scheduled caller then reports a fault in the machine's permission modes when what
+  happened is that somebody typed `CSM_LIMIT=lots` in a shell profile. This release added nine
+  such knobs, several of them the kind a person really does export, so the reach was new even
+  though the shape was not. Each one falls back to its documented default and says so in the log,
+  which is the rule the rest of the file already follows for a value it cannot use.
+- **`CSM_IMPORTS` is refused inside a config home's `projects/`.** A cross-machine copy is staged
+  there, and a leftover staging file is deleted before the fetch so that "the copy did not
+  arrive" can be told from "a file was already there" — the one delete in this tool, and it is
+  aimed by a knob. Pointed at a `projects/` tree, the first `--from-machine` move of a session
+  that home already had would have deleted that home's transcript, which is the one thing this
+  tool promises never to do. The knob's own note said never anybody's `projects/`; now something
+  holds it to that, by resolved path, before a byte is fetched.
+
+### Documentation
+
+- README: `csm find` and `csm modes` sections; `--to auto`, `--from-machine`, `--mirror-cwd`,
+  `--copy-only` and `--from-account` in the `move` table; both accounts-file dialects; **every**
+  `CSM_*` knob in the Environment section, grouped, with the test-only ones named; a *Running it
+  from a wrapper* note; and the FAQ's "can I move a session to another machine" answer rewritten,
+  since the answer is now yes.
+- `docs/design.md`: new sections for `--to auto`, the move note, an owned session, between
+  machines (including the translation rules and the remote helper) and the permission sweep; the
+  accounts section covers both dialects, handles and `machines`; the knob table is complete; the
+  step-by-step gains the note and `--copy-only`.
+- `docs/setup.md`: the two translation knobs beside the path-mismatch problem, and the skill in
+  the per-home checklist, with `--no-short-name`.
+- `LESSONS.md`, `docs/lessons.md` and `docs/fungibility-matrix.md`: the statements that a move
+  never crosses machines are corrected — with what still does not cross (the data, the devices,
+  the jobs) named.
+- The `move-session` skill is **one** skill again, merged from both copies: the command map
+  checked against `--help`, `modes`, `find`, between-machines moves, `--to auto`, `--limit`, the
+  move note, the warnings to pass on, and a refusal table with the fix for each. Nothing in it
+  names a particular account, machine or path.
+
 ## [0.3.1] — 2026-10-25
 
 Nothing about moving a session changed. CI, the installer and the documentation.
@@ -351,7 +647,8 @@ Initial public release.
 - Fixture-only tests (fake homes, fake `claude`, fake tmux; no network, no account) and CI on
   ubuntu and macOS × Python 3.9 and 3.12.
 
-[0.3.1]: https://github.com/yaroslavvb/claude-session-mover/compare/301b3b3...main
-[0.3.0]: https://github.com/yaroslavvb/claude-session-mover/compare/484f855...301b3b3
-[0.2.0]: https://github.com/yaroslavvb/claude-session-mover/compare/48dde4b...484f855
-[0.1.0]: https://github.com/yaroslavvb/claude-session-mover/commit/48dde4b
+[0.4.0]: https://github.com/yaroslavvb/claude-session-mover/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/yaroslavvb/claude-session-mover/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/yaroslavvb/claude-session-mover/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/yaroslavvb/claude-session-mover/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/yaroslavvb/claude-session-mover/releases/tag/v0.1.0

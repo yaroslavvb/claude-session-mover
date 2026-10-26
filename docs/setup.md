@@ -320,6 +320,13 @@ Do these once per home, per machine. Nothing here can be shared; it is the irred
       that capability mid-task. This is the one layer that is never fungible from a terminal; see
       [the matrix](fungibility-matrix.md#connectors).
 - [ ] **Link the shared entries** ([§4](#layout)), including `plugins/` if you want one install to serve everyone.
+- [ ] **Link the `move-session` skill into the home**, so a session in it can be told "move this to the other
+      account" from a phone: `./install.sh --skill` does every home at once, and re-running it after an update
+      repoints the links it made itself. Each config home reads its own `skills/`, so a shared `settings.json` does
+      not cover this. 🛑 A `skills/move-session` that already links somewhere else is **skipped, not replaced** —
+      the line says where it points — so a home you wired by hand keeps reading that copy until you repoint it or
+      point it at this one. On a machine where `csm` is already a wrapper of your own that supplies this tool's
+      environment, install with `./install.sh --skill --no-short-name`, or the link would shadow that wrapper.
 - [ ] **Plugins:** if `plugins/` is *not* linked, install them in this home too, and check for version drift.
 - [ ] **First-run gates:** a new home has answered neither the onboarding flow nor the folder-trust dialog, and both
       put the cancelling option first and focused, so an unattended start just sits there. Either run the home once
@@ -343,7 +350,7 @@ What crosses, what does not:
 | Plugins | Install once per machine. |
 | Memory | A store inside a synced folder, each machine spelling its own literal absolute path. |
 | Scheduled tasks | Per machine — a task runs where its scheduler runs. |
-| Transcripts | Not synced. `csm` moves sessions **between accounts on one machine**, never between machines. |
+| Transcripts | Not synced. `csm` moves one between accounts on a machine, and between machines with `csm move <id> --from-machine M` — found over there, copied over ssh, the folder translated into this machine's spelling, and resumed here. |
 | Connectors | Free: a connector belongs to the account, so one consent covers every machine that account serves. |
 
 **The path-mismatch problem.** Both the memory folder and the transcript folder are named from the project's
@@ -355,6 +362,15 @@ ways out:
   device names) — the clean answer when you control both machines.
 - Otherwise keep one **real** directory per spelling, holding the same notes, and converge them with a copy-based
   sync. Do **not** symlink one folder to another: a symlinked memory directory breaks the write auto-allow.
+
+The same mismatch decides whether `csm move <id> --from-machine M` can resume a session here at all, because the
+*working directory* recorded in its transcript is the other machine's spelling. Two knobs say how to translate it:
+`CSM_MACHINES`, a JSON file of each machine's path roots (`{"laptop": {"home": "/Users/you", "shared":
+"/Users/you/Sync"}, …}`), matched by label across machines; and `CSM_SYNC_DIRS`, the home-relative names that are
+*the same synced folder everywhere* — the rule a sync root needs, because such a folder is usually a symlink into
+the sync client's own tree and the transcript records the symlink spelling. With neither set, a folder is only ever
+translated home-to-home, and one that is not here is a refusal rather than a guess; `--mirror-cwd` is how the code
+comes along when the folder is genuinely per machine.
 
 <a id="rename"></a>
 

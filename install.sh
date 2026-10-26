@@ -1,15 +1,27 @@
 #!/bin/sh
 # install.sh: link claude-session-mover (and its short name, csm) into ~/.local/bin.
-#   ./install.sh            the command only
-#   ./install.sh --skill    also link skills/move-session into every account home's skills/,
-#                           because each CLAUDE_CONFIG_DIR reads its own skills directory
+#   ./install.sh                  the command only
+#   ./install.sh --skill          also link skills/move-session into every account home's
+#                                 skills/, because each CLAUDE_CONFIG_DIR reads its own
+#   ./install.sh --no-short-name  link claude-session-mover only, NOT csm: for a machine
+#                                 where something else already owns the name `csm` — most
+#                                 usefully a wrapper of your own that sets this tool's
+#                                 environment (an accounts file, a quota meter, a log) and
+#                                 execs it. A `csm` here would shadow that wrapper and hand
+#                                 you the bare tool with none of its inputs.
+# The two options may be given together, in either order.
 # CSM_BIN_DIR overrides ~/.local/bin. Nothing that already exists and is not ours is replaced.
 set -eu
-case "${1:-}" in
-  ""|--skill) ;;
-  -h|--help|help) echo "usage: $0 [--skill]"; exit 0 ;;
-  *) echo "unknown option: $1 (usage: $0 [--skill])" >&2; exit 2 ;;
-esac
+skill=no
+short=yes
+for arg in "$@"; do
+  case "$arg" in
+    --skill) skill=yes ;;
+    --no-short-name) short=no ;;
+    -h|--help|help) echo "usage: $0 [--skill] [--no-short-name]"; exit 0 ;;
+    *) echo "unknown option: $arg (usage: $0 [--skill] [--no-short-name])" >&2; exit 2 ;;
+  esac
+done
 here=$(cd "$(dirname "$0")" && pwd)
 tool="$here/claude-session-mover"
 bin="${CSM_BIN_DIR:-$HOME/.local/bin}"
@@ -32,13 +44,17 @@ link() {   # link <source> <destination>
 
 chmod +x "$tool"
 link "$tool" "$bin/claude-session-mover"
-link "$tool" "$bin/csm"
+if [ "$short" = yes ]; then
+  link "$tool" "$bin/csm"
+else
+  echo "not linking $bin/csm (--no-short-name)"
+fi
 case ":$PATH:" in
   *":$bin:"*) ;;
   *) echo "note: $bin is not on your PATH" ;;
 esac
 
-if [ "${1:-}" = "--skill" ]; then
+if [ "$skill" = yes ]; then
   homes=$(python3 "$tool" accounts --json | python3 -c \
     'import json, sys; print("\n".join(a["home"] for a in json.load(sys.stdin)))')
   if [ -z "$homes" ]; then

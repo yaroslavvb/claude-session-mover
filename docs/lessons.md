@@ -216,7 +216,9 @@ unreliable: with no explicit title, a session's title is its last prompt, so use
 Memory can live on a shared store and follow you everywhere; transcripts do not sync. A cross-machine move means
 copying the file to the other machine, pre-answering that machine's per-home gates, and making sure that machine
 actually serves the working directory — the list of folders an account has registered is per account and per machine.
-Be explicit about which of the two your tooling does: `csm` moves a session between accounts on one machine.
+Be explicit about which of the two your tooling does: `csm` moves the conversation — between accounts on a machine,
+and between machines with `--from-machine`, which brings the transcript and, with `--mirror-cwd`, the code. Never the
+data, the devices or the jobs: those stay where they were made, and the moved session is told so.
 
 **Scrub the environment of any process you start for another account.**
 Claude Code exports a family of `CLAUDE*` variables, at least one of which carries a token, so a child inherited from

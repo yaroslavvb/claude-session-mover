@@ -10,7 +10,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python: ["3.9", "3.12"]
+        python: ["3.9", "3.12", "3.14"]
+        # The README promises Python 3.7, so one cell measures it. actions/setup-python no
+        # longer serves 3.7 on ubuntu-latest, hence 22.04 for that one cell only.
+        include:
+          - os: ubuntu-22.04
+            python: "3.7"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

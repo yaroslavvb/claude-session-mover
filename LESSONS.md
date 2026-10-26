@@ -218,8 +218,9 @@ Contents: [A. What a move is](#a) · [B. Doing the move safely](#b) ·
   source account inside itself, so never trust a moved session's description of its own account.
 - **Check.** Ask the moved session which account and machine it is on, and compare with
   `jq -r .oauthAccount.emailAddress ~/.claude-b/.claude.json` and `hostname`.
-- **Verified.** 2.1.300. **Beta.** `csm` does not append such a line yet: say it in your first
-  prompt.
+- **Verified.** 2.1.300. **Beta.** `csm` appends exactly such a line to the copy on every move —
+  one hidden `isMeta` line, chained by `parentUuid` — so it survives a restart, a later move and a
+  compaction's re-read, which a first prompt does not.
 
 ### L15 · Memory can follow a session to another machine; its work often cannot
 
@@ -227,8 +228,9 @@ Contents: [A. What a move is](#a) · [B. Doing the move safely](#b) ·
   processes, paired devices, data outside the repo, an uncommitted working tree. Never stop the
   source of a cross-machine move.
 - **Why.** The first machine-to-machine move took about 90 seconds and left six processes, a
-  paired device and 20 GB of data behind. `csm` moves between homes on one machine only, and
-  `--ssh HOST` runs the move *on* that host rather than across.
+  paired device and 20 GB of data behind. `csm` carries the conversation — between homes on a
+  machine, and between machines with `--from-machine`, which never stops the source and lists
+  what it left running. `--ssh HOST` is the other thing: it runs the move *on* that host.
 - **Check.** `pgrep -P <source pid>` and `git -C <cwd> status --short` on the origin.
 - **Verified.** 2.1.300. **Stable.**
 

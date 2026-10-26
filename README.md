@@ -7,7 +7,8 @@ own Claude accounts to another, keeping the whole conversation. One account hits
 quota to spare; instead of starting the work over and losing the thread, you move the thread. `csm` copies the
 session's transcript into the other account's config home, pre-answers that home's first-run dialogs, and resumes
 it there under the other login. The agent remembers everything that was said, every turn from then on is spent on
-the other account, and nothing is deleted from the old one.
+the other account, and nothing is deleted from the old one. With `--from-machine` it does the same across two
+machines: the session is found on the other one, copied over ssh, and resumed here.
 
 Behind the tool is one idea: **an account is a payment layer — a login and a quota. Everything that should follow
 you lives outside the account's config home and is shared.** Instructions, skills, plugins, hooks, memory and
@@ -26,7 +27,7 @@ account, per config home or per machine by design · ⚠️ changes when a sessi
 
 | Layer | Across accounts (one machine) | Across machines | Notes |
 |---|---|---|---|
-| [Conversation (transcript)](docs/fungibility-matrix.md#conversation) | ✅ `csm` copies it | 🔧 copy by hand | `<home>/projects/<folder>/<id>.jsonl`; the folder name comes from the absolute path |
+| [Conversation (transcript)](docs/fungibility-matrix.md#conversation) | ✅ `csm` copies it | ✅ `csm move --from-machine` copies it | `<home>/projects/<folder>/<id>.jsonl`; the folder name comes from the absolute path |
 | [Usage limits](docs/fungibility-matrix.md#quota) | 🛑 per account — the reason to move | ✅ one account, one quota, every machine | move the session; never pool credentials |
 | [Login (OAuth credential)](docs/fungibility-matrix.md#login) | 🛑 one login per config home | 🛑 sign in on each machine | macOS: a Keychain item named from the literal `CLAUDE_CONFIG_DIR`; Linux: `<home>/.credentials.json` |
 | [**claude.ai connectors**](docs/fungibility-matrix.md#connectors) (Gmail, Drive, Calendar, …) | 🛑 **per account — no terminal can attach one** | ✅ follow the account to every machine | enable the same set on every account at `claude.ai/customize/connectors`; a moved session sees only the target account's |
@@ -137,9 +138,14 @@ mode. macOS and Linux.
 ```sh
 git clone https://github.com/yaroslavvb/claude-session-mover
 cd claude-session-mover
-./install.sh            # links claude-session-mover and csm into ~/.local/bin
-./install.sh --skill    # ...and the move-session skill into every account home (for phones)
+./install.sh                  # links claude-session-mover and csm into ~/.local/bin
+./install.sh --skill          # ...and the move-session skill into every account home (for phones)
+./install.sh --no-short-name  # ...the long name only, when something else owns `csm` here
 ```
+
+`--no-short-name` is for a machine where `csm` is already a wrapper of your own that sets this tool's environment
+and `exec`s it — see [Running it from a wrapper](#wrapper). A link installed over it would hand you the bare tool
+with none of its inputs.
 
 Each account needs its own config home, signed in once:
 
@@ -158,23 +164,34 @@ csm list                            # recent sessions in every account, newest f
 csm move 3 --to work --dry-run      # the plan, and any refusal; nothing changes
 csm move 3 --to work                # row 3 of the last list -> the account "work"
 csm stop 3                          # end that moved session and free its window
+csm modes --check                   # one line: is any live session weaker than this machine's default
+csm find "refactor" --on laptop     # where is that session, on this machine or another
+csm move 7f3a --from-machine laptop --to work   # ...bring it here
 ```
 
 ## Commands
 
-Two global options sit in front of the subcommand:
+Three global options sit in front of the subcommand:
 
 | option | effect |
 |---|---|
 | `--version` | print the version |
-| `--ssh HOST` | run this same command **on** that machine, where `csm` is installed too. A move is always between two config homes of one machine, so this moves sessions over there, never from here to there |
+| `--machine M` | run this same command **on** that machine, where `csm` is installed too, so it moves sessions between two homes **over there**. It brings nothing here — `move <id> --from-machine M` is the one that does. `M` is a name the accounts file's `machines` column uses |
+| `--ssh HOST` | the same thing, naming an ssh host instead of a configured machine. Any host goes: unlike `--machine`, it is not checked against the machines the configuration knows |
+
+Both run the remote command with `BatchMode` and a connect timeout, so an unattended call can never sit on a
+password prompt, and the remote leg's exit code is logged as well as its dispatch.
 
 ### `csm accounts`
 
-The config homes on this machine, and who is signed in. `--json` for the machine-readable form.
+The config homes on this machine, and who is signed in. `--json` for the machine-readable form. When
+`CSM_METERS` points at a quota meter, each account's 5-hour and weekly usage is a column too.
 
 Accounts are discovered by default. To name them yourself, or to pin which login each must hold, write
 `~/.config/claude-session-mover/accounts` (or point `CSM_ACCOUNTS` at a file); it then replaces discovery entirely.
+`#` comments, one account per line, in either of two dialects — a line holding a TAB is a table row.
+
+**Simple**, for one machine and a handful of homes:
 
 ```
 # name      home               [expected email]
@@ -183,8 +200,32 @@ work        ~/.claude-work     you@work.example
 personal    ~/.claude-me
 ```
 
-`-` is the default home. With an expected email, a home signed in as anyone else is refused as a move target,
-because the move would spend the wrong quota.
+`-` (or `default`) is the default home, i.e. `CLAUDE_CONFIG_DIR` unset.
+
+**Table**, when the same file is read on several machines or by other tools. The columns this tool reads are taken
+by name from a commented header line when there is one, and otherwise by position: 1 name, 2 email, 3 home,
+6 machines, 7 handle. Every other column is ignored by design, so the file may belong to another tool.
+
+```
+# name	email	home	x	x	machines	handle
+work	you@work.example	~/.claude-work	-	-	laptop,desktop	wk
+personal	you@example.com	~/.claude-me	-	-	laptop	me
+```
+
+| column | what |
+|---|---|
+| `machines` | which machines this account is on, matched against `CSM_MACHINE` (default: this machine's short hostname). A row that names no machine (`-` or empty) is refused as a move target. A file whose `machines` names this machine nowhere lists **every** account rather than none, so an unrecognised `CSM_MACHINE` cannot read as "nothing here" |
+| `handle` | a short alias that resolves wherever the name does, and is what listings print. One lower-case token of `[a-z0-9-]`, not all digits, not starting with a hyphen, unique in the file |
+
+🛑 `home` in a **table** may not be `-`, `default` or `~/.claude`. `-` means "the default home with
+`CLAUDE_CONFIG_DIR` unset", and spelling the default home out is a third thing again — any non-empty value takes
+the hashed-Keychain branch and lands on an empty slot that reads exactly like signed out. A table row that wants
+the default home is a row that wants a home of its own. The simple dialect keeps `-`, where there is one home and
+it is unambiguous.
+
+With an expected email, a home signed in as anyone else is refused as a move target, because the move would spend
+the wrong quota. A file that mixes the two dialects, a duplicate name or a duplicate handle is refused naming the
+line.
 
 ### `csm list`
 
@@ -193,13 +234,14 @@ Recent sessions in every account, newest first, numbered so `move 3` means the r
 | flag | effect |
 |---|---|
 | `--account NAME` | only this account |
-| `--all` | up to 300 sessions |
-| `--limit N` | how many sessions to list (default 20). It caps the **ended** ones only: every live session is listed whatever the limit, so a small number can still print a long table |
+| `--all` | up to 300 sessions (`CSM_ALL_LIMIT`) |
+| `--limit N` | **at most N rows**, the N newest, live or not — for a shorter table than the default on a small screen. An explicit `--limit` is a hard cap: it outranks `--all`, and the table says how many rows it left out, because `move 3` is numbered against *that* table. Left out, the default is 20 (`CSM_LIMIT`) and never cuts a live session |
 | `--json` | the machine-readable form |
 
 Rows are marked `● live`, `  ended`, or `  closed` when the session was ended from the app. The session you are
 typing in is marked `← this session`, and a session whose last turn hit a usage limit is marked
-`⚠ OUT OF QUOTA (5h|week, resets HH:MM)` — a heuristic read off the transcript, not the meter.
+`⚠ OUT OF QUOTA (5h|week, resets HH:MM)` — a heuristic read off the transcript, not the meter. The account column
+is the account's handle where the accounts file gives one, and its name otherwise.
 
 ### `csm move`
 
@@ -208,20 +250,24 @@ csm move SESSION --to ACCOUNT [flags]
 ```
 
 `SESSION` can be a row number from the last `csm list`, a session id or a prefix of one (4 characters or more), a
-`https://claude.ai/code/session_…` link, or a piece of the title. `--to` takes an account's name, its email, or a
-unique prefix of either. Anything ambiguous is refused with the candidates listed, never guessed, and so is a bare
-number unless an account is literally named that.
+`https://claude.ai/code/session_…` link, or a piece of the title. `--to` takes an account's name, its handle, its
+email, or a unique prefix of any of those. Anything ambiguous is refused with the candidates listed, never guessed,
+and so is a bare number unless an account is literally named that.
 
 | flag | effect |
 |---|---|
-| `--to ACCOUNT` | the account to move it to (required) |
-| `--dry-run` | print the plan and any refusal; copy, write and start nothing |
+| `--to ACCOUNT` | the account to move it to (required). `--to auto` picks the account here with the most weekly room from the quota meter `CSM_METERS` names — never the source, never an account at or over a cutoff or whose reading is stale, and it prints which one it chose and its numbers. With no fresh reading it refuses rather than guess |
+| `--dry-run` | print the plan, the move note and any refusal; copy, write and start nothing |
 | `--stop-source` | stop the old process once the new one has printed its claude.ai link. Only in the default Remote Control mode, where that link is the proof it connected. The source pane's scrollback is captured to `<state dir>/captures/<date>/` first, and the path is printed |
 | `--no-remote-control` | start a plain interactive session in tmux, without Remote Control |
 | `--foreground` | resume in this terminal instead of tmux |
 | `--permission-mode MODE` | the mode to resume in: `plan`, `default`, `acceptEdits`, `auto`, `dontAsk`, `bypassPermissions` (`manual` is an alias of `default`) |
 | `--name NAME` | the Remote Control name of the moved session |
 | `--all` | search every session, not just the newest |
+| `--from-machine M` | bring the session **from** that machine to this one: it is found there in every config home, the default one the desktop app uses included, copied over ssh, and resumed here. The source is **never** stopped — a process over there may be driving work this tool cannot see — and the plan lists what it started that is still running |
+| `--mirror-cwd` | with `--from-machine`, when the session's folder is not on this machine: copy its **code** across first — git-tracked and untracked files, never the ignored ones, each under 25 MB, `.git` included. Data stays where it was made. A folder that already exists here is never written into |
+| `--copy-only` | do every refusal, the first-run gates, the copy and the move note — and start nothing. For a program that resumes the copy itself, under its own supervision |
+| `--from-account ACCOUNT` | take the copy in that account's home, when an earlier move left the same session id in more than one |
 
 Without `--permission-mode`, the mode the session was running in is used, raised to the target home's
 `permissions.defaultMode` when that is stronger **and** the session recorded nothing, `default` or `auto` — an
@@ -230,6 +276,27 @@ automatic choice never weakens a session, and the plan line names where the choi
 
 A successful move prints the account to open the app as, the new `https://claude.ai/code/session_…` link, the tmux
 window it runs in, and what the move cost.
+
+**Every move appends a move note to the copy**, and only to the copy — except under one shared `projects/` tree,
+where the copy *is* the source and that one file is the only place the resumed session could read it: one hidden
+line (`isMeta`, the shape the CLI uses for its own reminders) chained to the last line of the conversation by
+`parentUuid`. A resumed session reads its transcript as
+its own past, and after a move the account, the folder and the machine every earlier turn names can all be wrong —
+measured: a session resumed on another machine went looking for a process it had started on the old one. The note
+states what changed under it, what above it is now stale, where auto-memory is read from and, on a cross-machine
+move, what stayed behind and what the code mirror brought. Because it is in the transcript it survives a restart, a
+later move and a compaction's re-read. `--dry-run` prints it and writes nothing.
+
+**Across machines** the session's folder is translated into this machine's spelling where the configuration says
+how (`CSM_MACHINES`, `CSM_SYNC_DIRS`); otherwise a folder that is not here is a refusal rather than a resume in the
+wrong place. The transcript and its sibling directory cross in one `tar` pipe over ssh into `CSM_IMPORTS`, which
+stays as the record of what crossed, and from there the move is the ordinary one. Moving to the **same** account on
+another machine is allowed: it changes the machine, not the quota.
+
+**A session something else owns is refused.** Where `CSM_BOTS_DIR` names a supervisor that keeps one persistent
+session (a bot, a chat bridge, a service), a plain `move` of that session would start a second copy nothing is
+talking to while the supervisor kept answering on the old account. The refusal names the owner, and `--copy-only`
+is the entry point such a supervisor uses to change account itself.
 
 ### `csm stop`
 
@@ -248,6 +315,59 @@ Before anything is signalled, the pane's whole scrollback is written to `<state 
 `tmux kill-window` destroys the pane with the process. The capture can never fail the stop; `--dry-run` writes
 nothing. `csm move --stop-source` captures the source pane the same way. Those files hold conversation text — they
 are deliberately per-machine, under your state directory, and should not be synced or served.
+
+### `csm find`
+
+```sh
+csm find "refactor"             # every config home on this machine, the default one included
+csm find 7f3a --on laptop       # ...on another machine, over ssh, read-only
+csm find "refactor" --all --json
+```
+
+Finds a session by id or prefix (the CLI's uuid, or the desktop app's `local_` id), by a `claude.ai` link, or by
+title text, in **every** config home on a machine — including the default one, where the desktop app keeps its
+sessions — and by the desktop app's own titles, which are in no transcript. The row it prints is what
+`csm move <id> --from-machine M` takes. `--on M` runs the search over there by piping a small standard-library
+helper to that machine's system python, so nothing has to be installed on it; `--all` widens the window from 21
+days (`CSM_FIND_DAYS`) to everything.
+
+Two things the table cannot tell you: the **age column is the transcript file's last write**, not the last turn, so
+a dead copy can read as minutes old; and **a move is a copy**, so a session that has been moved shows up as two
+rows, one per home.
+
+### `csm modes`
+
+```sh
+csm modes                       # the table: which live sessions are weaker, and why
+csm modes --account work
+csm modes --json                # every live row, the verdicts, the counts, the coverage
+csm modes --check               # ONE line. exit 0 ok, 1 a fault, 3 something could not be read
+csm modes --restart-idle        # the plan for the idle ones; it signals nothing
+```
+
+Every live session in every config home here, the mode it is **really** in, and whether that is weaker than this
+machine's `permissions.defaultMode`. It is the complement of a settings check: a settings file can be right while a
+worker a Remote Control server spawned sits in `auto`, because such a worker records the mode the stored session
+record holds, not the one its server was started with — so a session in the wrong mode is invisible to a check that
+reads the file. Read-only, apart from `--restart-idle --apply`.
+
+- It reads **every** live registry row, including the ones `csm list` drops: a server's pre-created session has a
+  0-byte transcript.
+- When a transcript records no mode it reads the mode off the process's own command line — a measurement, not a
+  guess. What it still could not read goes in `coverage.unread` with a reason, and the exit code is **3**: unknown
+  is never `ok`. That command line comes from one `ps` for the whole machine; `coverage.ps` in `--json` says
+  whether it answered, because a `ps` that could not be asked is not a machine with nothing running on it.
+- A **fault** is only a Remote Control worker in a mode such a worker records by accident (nothing, `default`,
+  `auto`). `plan`, `acceptEdits` and anything started in a terminal are reported as **info** and never restarted;
+  an unfamiliar mode is **unknown** and never judged.
+- `--check` writes exactly one line to stdout and **nothing** to stderr, so a scheduled check can match its prefix
+  (`ok:`, `FAULT:`, `INCOMPLETE:`) and agree with the exit code. Every diagnostic on that path goes to the log.
+- `--restart-idle` prints which idle workers a restart would SIGTERM to bring them back in their server's mode, and
+  why each other row is refused: never a server, never a session hosting itself, never this session, never a busy
+  one, never a pid whose recorded start time does not prove it. 🛑 `--apply` is **gated**: while the mode a
+  respawned worker comes back in is unverified it refuses and signals nothing (exit 2). **No environment variable
+  can open that gate** — a constant in the file is the only switch, because a stray variable in a scheduled pass's
+  environment must never be able to stop your sessions.
 
 ### `csm matrix`
 
@@ -271,30 +391,99 @@ simply have not set up yet.
 
 ### Environment
 
+Nothing about one setup is in the code: an accounts table, a machine's name, a quota meter, a room probe and the
+rest are all knobs, with a documented default and a tool that works with none of them set.
+
+**Accounts and machines**
+
 | variable | effect |
 |---|---|
-| `CSM_ACCOUNTS` | the accounts file to read instead of `~/.config/claude-session-mover/accounts` |
-| `CSM_CLAUDE` | the `claude` binary, when it is not on `PATH` |
-| `CSM_TMUX` | the `tmux` binary, when it is not on `PATH` |
+| `CSM_ACCOUNTS` | the accounts file to read instead of `~/.config/claude-session-mover/accounts`. Setting it replaces discovery entirely |
+| `CSM_MACHINE` | what this machine is called in the accounts file's `machines` column, and as a `--machine` target (default: the short hostname). An unrecognised value lists every account rather than none |
+| `CSM_MACHINES` | per-machine path roots, as JSON: `{"<machine>": {"home": "<path>", "<label>": "<path>"}}`. Its keys join the accounts file's `machines` column as the names `--machine` accepts — when both are empty, any host goes; its absolute string values are what translate a folder from one machine's spelling to another's |
+| `CSM_SYNC_DIRS` | home-relative directory names that are **the same synced folder on every machine**, comma-separated (`work,shared`). Such a directory is usually a symlink into a sync client's tree, which no named root above ever matches, so this is the rule that translates it |
+
+**Quota**
+
+| variable | effect |
+|---|---|
+| `CSM_METERS` | a quota meter, as JSON: `{"<account name or handle>": {"five_hour": <percent used>, "seven_day": <percent used>, "at": <epoch>}}`. Unset or unreadable means the meter is **unread**, never "free": `--to auto` then refuses, `csm accounts` prints no meter column, and the plan falls back to the transcript evidence |
+| `CSM_METER_MAX_AGE` | how old a reading may be and still be a reading, in seconds (default 10800). Older is unread |
+| `CSM_AUTO_MAX_5H`, `CSM_AUTO_MAX_7D` | `--to auto` skips an account at or over these percentages used, and the same two numbers make a *named* target "near its limit" in the plan (default 90, 95) |
+
+**Another machine**
+
+| variable | effect |
+|---|---|
+| `CSM_SSH_CMD` | how ssh is invoked (default `ssh -o BatchMode=yes -o ConnectTimeout=15`). The defaults matter: a plain `ssh` meeting a host it has no key for sits on a password prompt forever, and nothing times out the check that called it |
+| `CSM_REMOTE_CMD` | how to invoke this tool **on** the other machine, `shlex.split` and then quoted token by token, so a multi-word command survives. A token may begin `~/` or `$HOME/`, which means the home of the machine it runs *on*. Unset, the remote's widened `PATH` is tried first and `$HOME/git/claude-session-mover/claude-session-mover` second |
+| `CSM_REMOTE_PYTHON` | the interpreter the read-only `find` / `--from-machine` helper is piped to (default `/usr/bin/python3`). The helper is standard-library-only, so a machine with nothing installed still answers |
+| `CSM_DESKTOP_INDEX` | the desktop app's session index, where a session it opened keeps its title (default `~/Library/Application Support/Claude/claude-code-sessions`). It is read from the environment of whichever machine the session is on |
+| `CSM_IMPORTS` | where a copy from another machine is staged, and kept as the record of what crossed (default `<state dir>/imports`). 🛑 Never a `projects/` directory, and a value inside one is **refused**: a leftover staging file is deleted before the fetch, so a `projects/` here would delete that home's own transcript |
+| `CSM_FIND_DAYS` | how far back `find` and `--from-machine` look without `--all`, in days (default 21) |
+| `CSM_MIRROR_FILE_MAX`, `CSM_MIRROR_TOTAL_MAX` | `--mirror-cwd`'s per-file and total ceilings (default 25 MB, 2 GB). Code crosses, data does not |
+
+**Notes the plan can make**
+
+| variable | effect |
+|---|---|
+| `CSM_ROOM_CMD` | an optional probe for whether the **target** account can already be reached in this folder by whatever runs sessions here for it: a command template carrying `{handle}`, whose stdout is a table whose fourth field is a folder. Unset, no such note is made. A probe that exits non-zero says **nothing**: "could not look" is never a verdict |
+| `CSM_ROOM_FIX` | the cure appended to that note, a template carrying `{handle}`, `{name}` and `{cwd}`. Unset, only the fact is printed — inventing a command is worse than naming none |
+| `CSM_BOTS_DIR` | where a supervisor that owns a session keeps its state: one `<name>.json` per owner, each with a `session_id`. A plain `move` of a session named there is refused (default `<state dir>/owners`; absent means no session is owned) |
+| `CSM_BOT_FIX` | the cure in that refusal, a template carrying `{owner}`, `{to}` and `{id}` |
+
+**Listing, state and binaries**
+
+| variable | effect |
+|---|---|
+| `CSM_LIMIT` | how many sessions `list` shows when nothing was asked for (default 20) |
+| `CSM_ALL_LIMIT` | the ceiling `--all` has (default 300) |
+| `CSM_ROW_TITLE` | how much of a title a listing row shows (default 44; `--json` keeps the whole thing) |
 | `CSM_STATE_DIR` | the **state dir**: where the log and the `list` numbering are kept (default `$XDG_STATE_HOME/claude-session-mover`, falling back to `~/.local/state/claude-session-mover`) |
 | `CSM_LOG` | the log file itself (default `<state dir>/log`) |
 | `CSM_PICKS` | where `list` leaves its numbering, so `move 3` means the row you just read (default `<state dir>/picks.json`) |
 | `CSM_CAPTURES` | where the pane captures `csm stop` and `csm move --stop-source` write are kept (default `<state dir>/captures`, 0700, each file 0600) |
+| `CSM_SHARED_HOME` | the machine's shared settings home: the one `settings.json` several homes may symlink to, read **first** when asking what permission mode this machine asks for (default `~/.claude`). It is deliberately *not* where a home's memory store is read from — that is a question about one home, and the CLI answers it from that home's own settings |
+| `CSM_KEEP_ENV` | `CLAUDE*` / `ANTHROPIC*` variable names the environment scrub keeps for the moved session, comma-separated. Empty by default; a name outside those two families is dropped rather than honoured, so this cannot become a general allowlist. What it is for is a tool *inside* the moved session that needs the same input this one had — most usefully the path of an accounts file |
+| `CSM_CLAUDE` | the `claude` binary, when it is not on `PATH` |
+| `CSM_TMUX` | the `tmux` binary, when it is not on `PATH` |
 | `CSM_CONNECT_WAIT` | seconds to wait for the moved window's claude.ai link (default 150) |
 | `CSM_LOCK_WAIT` | seconds to wait for the CLI's `.claude.json.lock` before writing anyway with a warning (default 2) |
-| `CSM_LOGIN_PROBE` | `true`, `false`, `unknown` or `off` — force the answer of the credential-existence check instead of asking the store, for a machine where asking it is not possible. It announces itself on stderr and in the log on every run |
+| `CSM_TMUX_SESSION` | the tmux session a moved window is opened in, as a template over `{name}`, `{handle}` and `{label}` (default `csm-{name}`). Set it to `claude-{handle}` if you already keep a tmux session per account and want moved windows there. 🛑 `csm stop` finds a moved window only in the session the spelling in force names, so changing this while one is open hides it from `stop`: close those windows first, or name the spelling they were opened under. A template naming a field it does not know falls back to the default; `.` and `:` are replaced, because tmux reads them as window and pane, and a leading `-` is dropped, because the name is passed to `tmux -s` and `-t` |
 | `CSM_TMUX_SOCKET` | add `-L <socket>` to every `tmux` call, to keep `csm`'s windows on a server of their own |
+| `CSM_LOGIN_PROBE` | `true`, `false`, `unknown` or `off` — force the answer of the credential-existence check instead of asking the store, for a machine where asking it is not possible. It announces itself on stderr and in the log on every run |
 | `CSM_BIN_DIR` | where `install.sh` links the command (default `~/.local/bin`) |
 
-Three knobs are for the test suite and for a machine where the credential store cannot be asked:
-`CSM_LOGIN_PROBE` and `CSM_TMUX_SOCKET` above, and `CSM_NO_HOLD`, which the table leaves out because it drops the
-held-open window a move's scrollback is read from. The tuning internals (`CSM_HEAD_BYTES`, `CSM_TAIL_BYTES`,
-`CSM_POLL`, `CSM_SETTLE`) and the full list are in [docs/design.md](docs/design.md#env).
+Four knobs are for the test suite and for a machine where the credential store cannot be asked: `CSM_LOGIN_PROBE`
+and `CSM_TMUX_SOCKET` above, `CSM_NO_HOLD`, which the table leaves out because it drops the held-open window a
+move's scrollback is read from, and `CSM_REMOTE_LOCAL` / `CSM_REMOTE_HOME`, which make "the other machine" this
+process with `HOME` pointed at a fixture tree. Three of them — `CSM_LOGIN_PROBE`, `CSM_REMOTE_LOCAL`,
+`CSM_REMOTE_HOME` — are dropped from a moved session's environment **by name**, although `CSM_*` is outside the
+scrubbed families, so a stale export cannot follow a real move. The tuning internals (`CSM_HEAD_BYTES`,
+`CSM_TAIL_BYTES`, `CSM_POLL`, `CSM_SETTLE`) and the full list are in [docs/design.md](docs/design.md#env).
+
+<a id="wrapper"></a>
+
+### Running it from a wrapper
+
+A setup with more than a couple of accounts usually has inputs of its own: an accounts table some other script
+already owns, a quota meter a scheduled job writes, a machine name that is not the hostname, a log everything else
+writes to. None of that belongs in this tool, so the arrangement that keeps working is a small wrapper that sets
+the `CSM_*` variables and `exec`s `claude-session-mover`. Nothing is parsed or reformatted on the way through, so
+every output contract above stays the tool's own. Have the wrapper set each variable only when it is unset: that is
+what lets a test, or you for one command, point a knob somewhere else.
+
+Install with `./install.sh --no-short-name` on such a machine, so `~/.local/bin/csm` cannot shadow the wrapper, and
+set `CSM_REMOTE_CMD` to the wrapper's own path: a `--machine M` leg then runs *that* machine's wrapper, with that
+machine's table, meter and log, instead of a bare tool with no inputs. Spell that path `~/…`, not absolutely —
+two machines rarely share a home directory, and a leading `~/` is the one part of this variable that the far
+side's shell expands.
 
 ## What a move does
 
 1. **Find.** Scan every account home's transcripts — a head and a tail of each file, never a full parse — and its
-   live registry, `sessions/<pid>.json`.
+   live registry, `sessions/<pid>.json`. With `--from-machine`, the same scan runs on that machine instead, and the
+   transcript is fetched into the staging directory first.
 2. **Refuse early.** Every check runs before the first byte is written, and each refusal says what to do instead.
    Refused: a move to the same account, a target that holds no login or the same login, a target whose credential
    is gone, a working directory that no longer exists, a destination copy that is already running, and a window
@@ -306,11 +495,14 @@ held-open window a move's scrollback is read from. The tuning internals (`CSM_HE
    folder, because `--resume` then has two files to choose between.
 4. **Pre-answer.** The target's workspace-trust dialog for that directory, and its onboarding, are answered in its
    state file: additively, atomically, with a backup, keeping the file's mode.
-5. **Resume.** `claude --resume <id> --remote-control=<title> --permission-mode <mode> --model <model>` runs in a
+5. **Note.** The move note is appended to the copy: what changed under this session, and what above it is stale.
+6. **Resume.** `claude --resume <id> --remote-control=<title> --permission-mode <mode> --model <model>` runs in a
    detached tmux window `moved-<id8>` of the tmux session `csm-<account>`, under the target's `CLAUDE_CONFIG_DIR`,
    in the session's recorded working directory, with a scrubbed environment.
-6. **Prove.** Wait for the claude.ai link in the pane; only then, with `--stop-source`, stop the old process. A
+7. **Prove.** Wait for the claude.ai link in the pane; only then, with `--stop-source`, stop the old process. A
    move that does not connect leaves the source running and keeps the window with its scrollback.
+
+`--copy-only` stops after step 5 and starts nothing, for a program that resumes the copy itself.
 
 Should a dialog still appear in the new window, it is answered by reading the focus marker (`❯`) one poll at a
 time: Down only while the marker is not on the wanted option, Enter only when the marker's own line names that
@@ -321,8 +513,10 @@ dialogs put the cancelling answer first and focused, so a blind Enter declines.
 into one tree, say), `csm` compares by resolved path, not by spelling. `csm list` shows one row per transcript, not
 one per home, and names the home running it. A move between two such homes copies nothing — the file the target
 resumes is already the file the source uses — so there is no copy, no backup and no sibling copy, and side data
-that is one directory in both homes is skipped too. The live-twin refusal asks every home on the machine (the
-default home included), because the process holding a shared transcript can belong to a third account. Leaving the
+that is one directory in both homes is skipped too — only the move note is appended, to that one file. The
+live-twin refusal asks every home on the machine (the default home first, because the desktop app registers its
+sessions there and no accounts-file row names that home), because the process holding a shared transcript can
+belong to a third account. Leaving the
 source running then means two CLIs append to one file, so the plan says so and names `--stop-source`. Read
 [LESSONS.md § D](LESSONS.md#d) before choosing this layout.
 
@@ -365,12 +559,24 @@ Every one of these is a rule in the code, and the tests pin them:
   and nothing was proved. There is no name-based fallback, because argv[0] does not say WHICH session.
 - **It never stops the session running it.** Saying "move this session" from inside a session is the main use from
   a phone.
+- **It never stops a process on another machine.** `--stop-source` is refused across machines: a process over
+  there may be driving work this tool cannot see, so the plan lists what the source started and leaves it running.
+- **A session another program owns is not moved, it is handed back.** Where `CSM_BOTS_DIR` names the supervisor of
+  a session, a plain `move` is refused: a second copy would answer to nobody while the supervisor kept answering
+  on the old account. A directory that cannot be read is a refusal too, never a "no".
+- **`modes --restart-idle --apply` is gated by a constant in the file**, not by an environment variable, so no
+  stray variable in a scheduled pass's environment can make it signal anything.
+- **ssh is `BatchMode` with a connect timeout**, so an unattended call can never block on a password prompt.
+- **`--to auto` refuses rather than guesses.** No meter or a reading older than the maximum age leaves an account
+  *unread*, which is never *free*, and an account over a cutoff is passed over: a guess here is a move into a
+  second exhausted account, which looks exactly like a success.
 - **`csm stop` ends only a window `csm` itself opened**, named `moved-<id8>` in `csm-<account>`; everything else is
   refused with the list of windows that do qualify.
 - **tmux targets are exact-matched** (`-t '=name'`), because tmux otherwise matches prefixes.
 - **The child's environment is scrubbed of the whole `CLAUDE*` and `ANTHROPIC*` families** — by prefix, so a
-  variable added in a future release is covered — and only `CLAUDE_CONFIG_DIR` is set back. Your own non-Claude
-  credentials in the environment are deliberately left alone.
+  variable added in a future release is covered — and only `CLAUDE_CONFIG_DIR` is set back, plus whatever
+  `CSM_KEEP_ENV` names by hand, which must itself be in those families. Your own non-Claude credentials in the
+  environment are deliberately left alone.
 - **The one file csm writes in a config home is written under the CLI's own lock.** `.claude.json` is re-read
   inside `.claude.json.lock`, only the trust and onboarding keys are merged in, the old file is kept as
   `.claude.json.csm-bak-<epoch>`, and a lock that cannot be taken is a warning rather than a failed move.
@@ -432,8 +638,15 @@ fast-changing (Beta) facts marked. The longer narrative is in [docs/lessons.md](
 `./install.sh --skill` links [`skills/move-session`](skills/move-session/SKILL.md) into each account home, because
 each config home reads its own `skills/`. Then, from any session that still has quota — a Remote Control session on
 that machine, for example — say *"I'm out of quota, move my refactor session to personal"*, or *"move this session
-to work"*, or *"stop the session you moved"*. The agent lists the candidates, asks when it is ambiguous, moves the
-session, and answers with the account and the new link.
+to work"*, or *"move it to whichever account has quota left"*, or *"bring my laptop's session over here"*, or
+*"stop the session you moved"*. The agent lists the candidates, asks when it is ambiguous, moves the session, and
+answers with the account and the new link.
+
+Re-run `./install.sh --skill` after an update. It repoints a link of its own, and **refuses a link that points
+somewhere else**, printing `skipped <home>/skills/move-session: it links to …` — which is the case to watch for if
+you already kept that skill somewhere of your own: those homes go on reading the old text until you repoint them
+by hand, or point your own copy at this one. Read the lines it prints; a home it skipped is a home it did not
+update.
 
 ## Compatibility
 
@@ -441,10 +654,13 @@ session, and answers with the account and the new link.
 - **macOS and Linux.** The only platform difference that matters is where the login lives: a Keychain item on
   macOS, `<home>/.credentials.json` elsewhere.
 - **tmux** for the default Remote Control mode. `--foreground` resumes in the current terminal and needs no tmux.
+- **ssh** for `--machine` / `--ssh`, and for `find --on` / `move --from-machine`, which also want a python on the
+  far side — the system one is enough, because the helper they pipe over is standard-library-only.
 - **Claude Code's on-disk state is undocumented** and can change in any release. Everything here was measured
   against CLI 2.1.296–2.1.300 (the shared-tree handling and LESSONS.md against 2.1.308); the tests pin every shape the tool depends on, so a format change fails loudly
   rather than quietly. Re-check anything load-bearing against the version you actually run.
-- CI runs the suite on Ubuntu and macOS against Python 3.9 and 3.12, with no tmux and no account.
+- CI runs the suite on Ubuntu and macOS against Python 3.9 and 3.12, and on Ubuntu 22.04 against **3.7** — the
+  floor this page promises, so it is measured and not merely claimed — with no tmux and no account.
 
 ## FAQ
 
@@ -460,11 +676,16 @@ Never. `csm` does not read, print, copy or log a credential — it checks only t
 that by the exit code of a Keychain lookup that asks for no value. Each config home must be signed in once, by you.
 
 **Can I move a session to another machine?**
-Not with `csm`. A transcript lives under a config home, config homes are per machine, and `--resume` only looks
-inside the home it is running under. `--ssh HOST` runs `csm` *on* that machine, so it moves sessions between two
-homes over there. To carry a conversation to another machine by hand, copy the `.jsonl` (and its sibling
-directory) into a home there and resume it: `claude --resume` also accepts a path to a `.jsonl` file, which is the
-simplest answer when the project sits at a different absolute path and so gets a different folder name.
+Yes: `csm move <id> --from-machine M --to <account>`, run on the machine the session is going **to**. The session
+is found over there in every config home, the transcript and its sibling directory cross in one `tar` pipe over
+ssh, the folder is translated into this machine's spelling where the configuration says how, and the copy is
+resumed here. `csm find --on M` is how you get the id, and the desktop app's own sessions are included. Two things
+to know: **the source is never stopped** — a process over there may be driving work this tool cannot see, so the
+plan lists what it started — and the session's **folder** must be here or be brought with `--mirror-cwd`, which
+copies the code and leaves the data where it was made.
+
+Do not confuse that with `--machine M` / `--ssh HOST`, which run the whole command *on* that machine, where it
+again moves between two homes over there.
 
 **Does it delete anything?**
 No. The source transcript stays where it is, readable from the old account. `--stop-source` stops one proved
@@ -490,11 +711,15 @@ the machine can reach. Only move sessions between accounts you own.
 python3 tests/test_mover.py
 ```
 
-Fixtures only: fake homes and transcripts, a fake `claude` that records its argv and environment, and a fake `tmux`
-that really runs the moved window's command on a private socket. No network, no account, no credential store, no
-real tmux server and no real config home. They cover the parsing, both matching ladders, every refusal, the
-environment scrub, the dialog answerer's key-by-key walk, the process proof, `stop`, and the matrix's cells and
-exit codes. What a fixture cannot show — a real resume under another login — was measured instead, and written
+466 tests, fixtures only: fake homes and transcripts, a fake `claude` that records its argv and environment, a fake
+`tmux` that really runs the moved window's command on a private socket, a fake `ssh` that records the command line
+it was handed, and — for `find --on` and `--from-machine` — "the other machine" played by this process with `HOME`
+pointed at a fixture tree, so no test reaches a real host. No network, no account, no credential store, no real
+tmux server and no real config home. They cover
+both accounts-file dialects, both matching ladders, every refusal, the `--limit` cap, the environment scrub, the
+dialog answerer's key-by-key walk, the process proof, the move note, `--to auto`'s meter arithmetic, folder
+translation, the permission sweep's verdicts and its one parsed line, `stop`, and the matrix's cells and exit
+codes. What a fixture cannot show — a real resume under another login — was measured instead, and written
 down in [docs/design.md](docs/design.md).
 
 ## Related tools
@@ -521,8 +746,8 @@ Actively developed tools for neighbouring jobs (as of 22 Oct 2026; the full list
 - [claude-sync](https://github.com/tawanorg/claude-sync) — sync Claude Code sessions across devices, end-to-end
   encrypted.
 
-`csm`'s own scope is narrower: one conversation, moved between two config homes on one machine, onto another of
-your own logins.
+`csm`'s own scope is narrower: one conversation, moved from one of your own config homes into another — on this
+machine, or from another machine with `--from-machine` — onto another of your own logins.
 
 ## Notes
 

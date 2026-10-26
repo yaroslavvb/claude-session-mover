@@ -24,6 +24,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import shutil
 import signal
 import stat
@@ -62,6 +63,16 @@ if any(a.startswith("--remote-control") for a in sys.argv) and not os.environ.ge
 print("fake claude running", flush=True)
 time.sleep(float(os.environ.get("FAKE_CLAUDE_SLEEP") or 1.0))
 sys.exit(int(os.environ.get("FAKE_CLAUDE_RC") or 0))
+'''
+
+#: An `ssh` stand-in: records its whole argv and exits with whatever is asked for. The tool
+#: composes one remote shell line, so what it would really have run is argv[-1].
+FAKE_SSH = r'''#!@PY@
+import json, os, sys
+with open(os.environ["FAKE_SSH_LOG"], "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\n")
+sys.stdout.write(os.environ.get("FAKE_SSH_STDOUT") or "")
+sys.exit(int(os.environ.get("FAKE_SSH_RC") or 0))
 '''
 
 FAKE_TMUX = r'''#!@PY@
@@ -215,18 +226,31 @@ def a_foreign_locale() -> str:
     return ""
 
 
-def user(text, cwd, sid, perm=None, sidechain=False):
+def user(text, cwd, sid, perm=None, sidechain=False, uuid=None, parent=None):
+    """⚠️ `uuid` is OPTIONAL and off by default, which is deliberate: most tests do not
+    care, and a transcript the CLI wrote always has one. Pass it where the CHAIN matters —
+    the move note hangs off the last main-chain line that carries a uuid, and a fixture
+    with none proves nothing about where the note lands."""
     d = {"type": "user", "cwd": cwd, "sessionId": sid, "isSidechain": sidechain,
          "message": {"role": "user", "content": text}}
     if perm:
         d["permissionMode"] = perm
+    if uuid:
+        d["uuid"], d["parentUuid"] = uuid, parent
     return d
 
 
-def assistant(text, cwd, sid, model="claude-sonnet-4-5", error=None, resets=None, kind="five_hour"):
+def assistant(text, cwd, sid, model="claude-sonnet-4-5", error=None, resets=None,
+              kind="five_hour", uuid=None, parent=None, tools=()):
+    """`tools` are MCP tool names, written as real `tool_use` blocks: a name in a block of
+    this shape is a CALL, which is what tells `mcp_used` from `mcp_servers`."""
     d = {"type": "assistant", "cwd": cwd, "sessionId": sid, "isSidechain": False,
          "message": {"role": "assistant", "model": model,
-                     "content": [{"type": "text", "text": text}]}}
+                     "content": [{"type": "text", "text": text}]
+                     + [{"type": "tool_use", "name": t, "id": "tu_%d" % i, "input": {}}
+                        for i, t in enumerate(tools)]}}
+    if uuid:
+        d["uuid"], d["parentUuid"] = uuid, parent
     if error:
         d["apiError"] = error
         d["message"]["model"] = "<synthetic>"
@@ -248,7 +272,9 @@ class World:
         self.tmux_calls = root / "tmux-calls.jsonl"
         self.tmux_state = root / "tmux-state.json"
         self.tmux_env = root / "tmux-env.jsonl"
-        for name, body in (("claude", FAKE_CLAUDE), ("tmux", FAKE_TMUX)):
+        self.ssh_log = root / "ssh-calls.jsonl"
+        for name, body in (("claude", FAKE_CLAUDE), ("tmux", FAKE_TMUX),
+                           ("fake-ssh", FAKE_SSH)):
             p = self.bin / name
             p.write_text(body.replace("@PY@", PY).replace("@LINK@", LINK))
             p.chmod(0o755)
@@ -272,6 +298,35 @@ class World:
         state.chmod(mode)
         return h
 
+    def table(self, *rows, **kw):
+        """A TAB-separated accounts table, the dialect a table another tool keeps is in.
+
+        Each row is `(name, email, home, machines, handle)`. Columns 4, 5 and 8 are filled
+        with `-` so the POSITIONS the readers hard-code (3 home, 6 machines, 7 handle) are
+        the ones exercised, and `header=False` drops the commented header line so the
+        positional fallback is exercised too.
+        """
+        lines = []
+        if kw.get("header", True):
+            lines.append("# " + "\t".join(kw.get("names") or (
+                "name", "email", "home", "tmux", "tmux_other", "machines", "handle",
+                "roles")))
+        for name, email, home, machines, handle in rows:
+            lines.append("\t".join([name, email, str(home), "-", "-", machines, handle,
+                                    "-"]))
+        p = self.root / "accounts.tsv"
+        p.write_text("\n".join(lines) + "\n")
+        return p
+
+    def meters(self, **readings):
+        """`name_or_handle=(five_hour %, seven_day %, age in seconds)` -> the meter file."""
+        now = time.time()
+        p = self.root / "meters.json"
+        p.write_text(json.dumps({
+            k: {"at": now - age, "five_hour": fh, "seven_day": sd, "error": "",
+                "resets_at": ""} for k, (fh, sd, age) in readings.items()}))
+        return p
+
     def session(self, home, sid, cwd=None, lines=None, folder=None, mtime=None, sibling=False):
         cwd = cwd or str(self.work)
         folder = folder or "-" + "".join(c if c.isalnum() else "-" for c in cwd).lstrip("-")
@@ -288,19 +343,35 @@ class World:
             os.utime(str(t), (mtime, mtime))
         return t
 
-    def spawn(self, name="claude"):
+    def spawn(self, name="claude", argv_tail=()):
         """A real process standing for a running session, running an executable named
-        `claude` (or `sleep`, for the negative case)."""
-        exe = str(self.procbin / "claude") if name == "claude" else "/bin/sleep"
-        p = subprocess.Popen([exe, "120"])
+        `claude` (or `sleep`, for the negative case).
+
+        With `argv_tail` the executable is a COPY of /bin/sh instead, run as
+        `claude -c 'sleep N; exit 0' <tail>`, so a test can put flags like
+        `--permission-mode bypassPermissions` on a live process's real command line — which
+        is where `modes` reads a launch mode from. ⚠️ `sleep N; exit 0`, not `sleep N`: a
+        shell given ONE simple command execs it and loses its own argv, so the flags this
+        was spawned for would vanish from `ps`.
+        """
+        if argv_tail:
+            d = self.root / ("shbin%d" % len(self.procs))
+            d.mkdir(exist_ok=True)
+            exe = d / name
+            shutil.copy("/bin/sh", str(exe))
+            cmd = [str(exe), "-c", "sleep 120; exit 0"] + list(argv_tail)
+        else:
+            exe = str(self.procbin / "claude") if name == "claude" else "/bin/sleep"
+            cmd = [exe, "120"]
+        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.procs.append(p)
         return p
 
     def live(self, home, sid, pid, cwd=None, bridge=None, status="idle", tmux="",
-             proc_start=None):
+             proc_start=None, entrypoint="sdk-cli"):
         (home / "sessions").mkdir(exist_ok=True)
         row = {"pid": pid, "sessionId": sid, "cwd": cwd or str(self.work),
-               "bridgeSessionId": bridge or "", "status": status, "entrypoint": "sdk-cli",
+               "bridgeSessionId": bridge or "", "status": status, "entrypoint": entrypoint,
                "name": "rc-name", "tmux": tmux}
         if proc_start is None:
             proc_start = ps_start(pid)       # read with the tool's own command, never hardcoded
@@ -415,6 +486,475 @@ class Accounts(Base):
         self.refused(self.w.run("accounts", CSM_ACCOUNTS=cfg), "used twice")
 
 
+class AccountsTable(Base):
+    """The TAB-separated dialect: columns by header name or by position, handles, the
+    `machines` column, and the refusals that keep a table row from naming a home that is
+    nobody's."""
+
+    def setUp(self):
+        super().setUp()
+        self.spare = self.w.account("spare", "me@spare.example", org="org-3")
+
+    def rows(self, tsv, machine="laptop", *extra):
+        return {r["name"]: r for r in json.loads(self.ok(self.w.run(
+            "accounts", "--json", *extra, CSM_ACCOUNTS=tsv, CSM_MACHINE=machine)))}
+
+    def two_rows(self, **kw):
+        return self.w.table(("job", "me@work.example", self.work, "laptop,desktop", "wk"),
+                            ("me", "me@home.example", self.personal, "laptop", "mine"),
+                            **kw)
+
+    def test_a_table_names_the_homes_and_carries_the_handles(self):
+        by = self.rows(self.two_rows())
+        self.assertEqual(set(by), {"job", "me"})
+        self.assertEqual(by["job"]["handle"], "wk")
+        self.assertEqual(by["job"]["home"], str(self.work))
+        self.assertEqual(by["job"]["email"], "me@work.example")
+        self.assertEqual(by["job"]["machines"], ["laptop", "desktop"])
+        # discovery is replaced entirely, so a home the table leaves out is not an account
+        self.assertNotIn("spare", by)
+
+    def test_columns_are_read_by_header_name_when_the_header_moves_them(self):
+        # The point of reading the header first: a table that re-orders or inserts a column
+        # is survived by NAME. Here `home` and `email` are swapped and a column is added.
+        p = self.w.root / "accounts.tsv"
+        p.write_text("# key\thome\tnote\temail\tmachines\thandle\n"
+                     + "\t".join(["job", str(self.work), "x", "me@work.example", "laptop",
+                                  "wk"]) + "\n")
+        by = self.rows(p)
+        self.assertEqual(by["job"]["home"], str(self.work))
+        self.assertEqual(by["job"]["email"], "me@work.example")
+        self.assertEqual(by["job"]["handle"], "wk")
+
+    def test_a_header_calling_the_first_column_n_is_still_read(self):
+        by = self.rows(self.two_rows(names=("n", "email", "home", "a", "b", "machines",
+                                            "handle", "roles")))
+        self.assertEqual(set(by), {"job", "me"})
+        self.assertEqual(by["me"]["handle"], "mine")
+
+    def test_with_no_header_the_documented_positions_are_used(self):
+        by = self.rows(self.two_rows(header=False))
+        self.assertEqual(set(by), {"job", "me"})
+        self.assertEqual(by["job"]["home"], str(self.work))
+        self.assertEqual(by["job"]["handle"], "wk")
+
+    def test_an_empty_machines_cell_at_the_END_of_a_row_still_says_no_machine(self):
+        """🛑 A TAB IS NOT TRAILING WHITESPACE, and the two answers are opposites.
+
+        `machines` empty means "on no machine", which `check_target` refuses as a move
+        target; the column being ABSENT means the file never said, and then every row is a
+        target. A plain `rstrip()` of the line turns the first into the second whenever the
+        empty cell is the last one on the row — so the guard opened on exactly the row the
+        file had ruled out.
+        """
+        head = "# name\temail\thome\tx\tx\tmachines\thandle\n"
+        src = "\t".join(["me", "me@home.example", str(self.personal), "-", "-",
+                         "laptop", "mine"]) + "\n"
+        p = self.w.root / "accounts.tsv"
+        # the LAST two cells of the `job` row are empty, and the row ends there
+        p.write_text(head + src
+                     + "\t".join(["job", "me@work.example", str(self.work), "-", "-"])
+                     + "\t\t\n")
+        by = self.rows(p)
+        self.assertEqual(by["job"]["machines"], [])        # said, and said "none"
+        self.assertEqual(by["job"]["handle"], "")
+        cwd = str(self.w.work)
+        self.w.session(self.personal, SID_A, lines=[user("go", cwd, SID_A),
+                                                    assistant("ok", cwd, SID_A)])
+        self.refused(self.w.run("move", SID_A, "--to", "job", "--dry-run",
+                                CSM_ACCOUNTS=p, CSM_MACHINE="laptop"),
+                     "is on no machine")
+        # and a NARROW table, which really has not said, keeps every row a target
+        q = self.w.root / "narrow.tsv"
+        q.write_text("# name\temail\thome\n"
+                     "me\tme@home.example\t%s\njob\tme@work.example\t%s\n"
+                     % (self.personal, self.work))
+        self.assertIsNone(self.rows(q)["job"]["machines"])
+        self.ok(self.w.run("move", SID_A, "--to", "job", "--dry-run",
+                           CSM_ACCOUNTS=q, CSM_MACHINE="laptop"))
+
+    def test_a_file_mixing_the_two_dialects_is_refused_naming_the_line(self):
+        p = self.w.root / "accounts.tsv"
+        p.write_text("job\tme@work.example\t%s\t-\t-\tlaptop\twk\t-\n"
+                     "me ~/.claude-personal\n" % self.work)
+        self.refused(self.w.run("accounts", CSM_ACCOUNTS=p, CSM_MACHINE="laptop"),
+                     ":2:", "one dialect")
+
+    def test_two_rows_with_one_name_are_refused(self):
+        p = self.w.table(("job", "me@work.example", self.work, "laptop", "wk"),
+                         ("job", "me@home.example", self.personal, "laptop", "mine"))
+        self.refused(self.w.run("accounts", CSM_ACCOUNTS=p, CSM_MACHINE="laptop"),
+                     "used twice")
+
+    def test_two_rows_with_one_handle_are_refused(self):
+        # 🛑 Not "the first one wins": `--to wk` would then answer with whichever came
+        # first and never ask which was meant, and the listing would print two cells
+        # nobody can tell apart.
+        p = self.w.table(("job", "me@work.example", self.work, "laptop", "wk"),
+                         ("me", "me@home.example", self.personal, "laptop", "wk"))
+        self.refused(self.w.run("accounts", CSM_ACCOUNTS=p, CSM_MACHINE="laptop"),
+                     "handle 'wk' is used twice")
+
+    def test_a_handle_of_the_wrong_shape_drops_its_row_and_says_nothing_on_stderr(self):
+        # The one row-level fault that is not a refusal: the file may be shared with other
+        # tools, and one unusable alias is not a reason to refuse every command. It is said
+        # in the log, where a shape complaint belongs — never on a stream a caller parses.
+        p = self.w.table(("job", "me@work.example", self.work, "laptop", "Work Account"),
+                         ("me", "me@home.example", self.personal, "laptop", "mine"))
+        self.w.session(self.personal, SID_B)
+        r = self.w.run("list", "--json", CSM_ACCOUNTS=p, CSM_MACHINE="laptop")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stderr, "")
+        self.assertEqual([x["handle"] for x in json.loads(r.stdout)], ["mine"])
+        self.assertNotIn("job", self.rows(p))
+        self.assertIn("Work Account", (self.w.state / "log").read_text())
+
+    def test_an_all_digit_handle_is_one_of_those(self):
+        # It would make `--to 2` resolve to an account, while a bare number is refused
+        # everywhere else precisely because a position is not a name.
+        p = self.w.table(("job", "me@work.example", self.work, "laptop", "2"),
+                         ("me", "me@home.example", self.personal, "laptop", "mine"))
+        self.assertEqual(set(self.rows(p)), {"me"})
+
+    def test_a_row_this_machine_is_not_named_in_is_not_an_account_here(self):
+        p = self.w.table(("job", "me@work.example", self.work, "desktop", "wk"),
+                         ("me", "me@home.example", self.personal, "laptop", "mine"))
+        self.assertEqual(set(self.rows(p, "laptop")), {"me"})
+        self.assertEqual(set(self.rows(p, "desktop")), {"job"})
+
+    def test_a_narrow_table_has_not_said_which_machines_so_every_row_is_here(self):
+        # 🛑 Absent is not "none". A table of name/email/home has said nothing about
+        # machines, and reading that as "on no machine" would refuse every move target.
+        p = self.w.root / "accounts.tsv"
+        p.write_text("# name\temail\thome\n"
+                     "job\tme@work.example\t%s\n"
+                     "me\tme@home.example\t%s\n" % (self.work, self.personal))
+        by = self.rows(p, "a-name-nobody-wrote")
+        self.assertEqual(set(by), {"job", "me"})
+        self.assertIsNone(by["job"]["machines"])
+        self.w.session(self.work, SID_A)
+        self.assertIn("→  me", self.ok(self.w.run(
+            "move", SID_A, "--to", "me", "--dry-run", CSM_ACCOUNTS=p,
+            CSM_MACHINE="a-name-nobody-wrote")))
+
+    def test_a_machine_the_table_does_not_name_lists_everything(self):
+        # 🛑 Filtering to nothing reads exactly like "there are no sessions anywhere",
+        # which is the one answer that is never useful.
+        self.assertEqual(set(self.rows(self.two_rows(), "a-name-nobody-wrote")),
+                         {"job", "me"})
+
+    def test_a_row_on_no_machine_is_refused_as_a_move_target(self):
+        p = self.w.table(("job", "me@work.example", self.work, "laptop", "wk"),
+                         ("me", "me@home.example", self.personal, "-", "mine"))
+        self.assertIn("me", self.rows(p))                  # visible in the view...
+        self.w.session(self.work, SID_A)
+        self.refused(self.w.run("move", SID_A, "--to", "mine", "--dry-run",
+                                CSM_ACCOUNTS=p, CSM_MACHINE="laptop"),
+                     "mine is on no machine")              # ...and never a destination
+
+    def test_the_default_home_may_not_be_spelled_in_a_table(self):
+        for home in ("-", "default", "~/.claude", str(self.w.home / ".claude")):
+            p = self.w.table(("job", "me@work.example", home, "laptop", "wk"))
+            self.refused(self.w.run("accounts", CSM_ACCOUNTS=p, CSM_MACHINE="laptop"),
+                         "names no home of its own", home)
+
+    def test_the_simple_dialect_still_takes_a_dash_for_the_default_home(self):
+        self.w.account("default", "me@default.example", default=True)
+        cfg = self.w.root / "accounts"
+        cfg.write_text("home -\nwork ~/.claude-work\n")
+        by = {r["name"]: r for r in json.loads(self.ok(self.w.run(
+            "accounts", "--json", CSM_ACCOUNTS=cfg)))}
+        self.assertTrue(by["home"]["default"])
+        self.assertEqual(by["home"]["email"], "me@default.example")
+        self.assertIsNone(by["home"]["machines"])          # the file did not say
+
+    def test_a_handle_resolves_wherever_a_name_does(self):
+        p = self.two_rows()
+        self.w.session(self.work, SID_A)
+        out = self.ok(self.w.run("move", SID_A, "--to", "mine", "--dry-run",
+                                 CSM_ACCOUNTS=p, CSM_MACHINE="laptop"))
+        self.assertIn("→  mine", out)
+        # and the handle is what the table and the footer print, not the name
+        out = self.ok(self.w.run("list", CSM_ACCOUNTS=p, CSM_MACHINE="laptop"))
+        self.assertIn("account", out.splitlines()[0])
+        self.assertIn(" wk ", out)
+        self.assertIn("accounts: wk, mine", out)
+
+    def test_a_handle_also_works_as_a_prefix_and_a_substring(self):
+        p = self.two_rows()
+        self.w.session(self.work, SID_A)
+        for spec in ("mine", "MINE", "min", "ine", "me@home.example", "me"):
+            self.assertIn("→  mine", self.ok(self.w.run(
+                "move", SID_A, "--to", spec, "--dry-run",
+                CSM_ACCOUNTS=p, CSM_MACHINE="laptop")), spec)
+
+    def test_the_header_lines_up_with_the_rows_under_it(self):
+        # 🛑 `account` is seven characters and a handle is often fewer, so a column sized
+        # by the handles alone pushed every header but `#` one place right of its own
+        # column. A table whose header sits over the wrong column is how somebody reads an
+        # age as a state — and the account cell is what gets typed back at `--to`.
+        p = self.two_rows()
+        self.w.session(self.work, SID_A,
+                       lines=[user("ALPHATITLE", str(self.w.work), SID_A)])
+        out = self.ok(self.w.run("list", CSM_ACCOUNTS=p, CSM_MACHINE="laptop"))
+        head, row = out.splitlines()[0], out.splitlines()[1]
+        self.assertIn("wk", row)
+        self.assertEqual(head.index("title"), row.index("ALPHATITLE"))
+        self.assertTrue(head.index("account") == row.index("wk"), head + "\n" + row)
+
+    def test_accounts_shows_the_meter_only_when_one_is_configured(self):
+        p = self.two_rows()
+        out = self.ok(self.w.run("accounts", CSM_ACCOUNTS=p, CSM_MACHINE="laptop"))
+        self.assertNotIn("quota unread here", out)
+        m = self.w.meters(wk=(12, 34, 60))
+        out = self.ok(self.w.run("accounts", CSM_ACCOUNTS=p, CSM_MACHINE="laptop",
+                                 CSM_METERS=m))
+        self.assertIn("5 h 12% · week 34% used", out)
+        self.assertIn("quota unread here", out)            # the row with no reading
+        by = {r["name"]: r for r in json.loads(self.ok(self.w.run(
+            "accounts", "--json", CSM_ACCOUNTS=p, CSM_MACHINE="laptop", CSM_METERS=m)))}
+        self.assertAlmostEqual(by["job"]["meter"]["seven_day"], 34.0)
+        self.assertIsNone(by["me"]["meter"])
+
+    def test_an_errored_or_non_numeric_meter_row_is_unread_not_zero(self):
+        p = self.two_rows()
+        m = self.w.root / "meters.json"
+        m.write_text(json.dumps({
+            "wk": {"at": time.time(), "five_hour": 1, "seven_day": 2, "error": "timeout"},
+            "mine": {"at": time.time(), "five_hour": "0", "seven_day": 0}}))
+        out = self.ok(self.w.run("accounts", CSM_ACCOUNTS=p, CSM_MACHINE="laptop",
+                                 CSM_METERS=m))
+        self.assertEqual(out.count("quota unread here"), 2)
+
+    def test_a_meter_timestamp_in_milliseconds_is_not_read_as_1970(self):
+        p = self.two_rows()
+        m = self.w.root / "meters.json"
+        m.write_text(json.dumps({"wk": {"at": time.time() * 1000, "five_hour": 5,
+                                        "seven_day": 6}}))
+        out = self.ok(self.w.run("accounts", CSM_ACCOUNTS=p, CSM_MACHINE="laptop",
+                                 CSM_METERS=m))
+        self.assertIn("5 h 5% · week 6% used", out)
+        self.assertNotIn("STALE", out)
+
+
+class RemoteDispatch(Base):
+    """`--machine M` / `--ssh HOST`: one dispatcher, two spellings. No real ssh is run — the
+    ssh invocation itself is a knob, so the test points it at a recorder."""
+
+    def setUp(self):
+        super().setUp()
+        self.tsv = self.w.table(
+            ("job", "me@work.example", self.work, "laptop,desktop", "wk"),
+            ("me", "me@home.example", self.personal, "laptop", "mine"))
+
+    def ssh_run(self, *args, **env):
+        e = {"CSM_SSH_CMD": str(self.w.bin / "fake-ssh"),
+             "FAKE_SSH_LOG": str(self.w.ssh_log),
+             "CSM_ACCOUNTS": str(self.tsv), "CSM_MACHINE": "laptop"}
+        e.update({k: str(v) for k, v in env.items()})
+        return self.w.run(*args, **e)
+
+    def sent(self):
+        return [json.loads(x) for x in self.w.ssh_log.read_text().splitlines() if x.strip()]
+
+    def test_this_machine_is_a_refusal_and_not_a_traceback(self):
+        # 🛑 The dispatch happens inside the Refusal handler, so this comes out as one line
+        # and exit 2. Outside it, the `die()` would escape as a traceback.
+        r = self.ssh_run("--machine", "laptop", "list")
+        self.refused(r, "is this machine", "drop the flag")
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertFalse(self.w.ssh_log.exists())
+
+    def test_a_machine_the_table_does_not_know_is_refused_naming_the_ones_it_does(self):
+        self.refused(self.ssh_run("--machine", "mars", "list"),
+                     "not a machine this tool knows", "desktop", "laptop")
+
+    def test_with_nothing_to_check_against_any_name_goes(self):
+        # 🛑 `--machine` is the spelling that IS checked, so it is the one this has to be
+        # proved on: with no accounts file and no machines file there is nothing to check
+        # against, and an unknown name is then not evidence of a mistake. Discovery is the
+        # whole public default, and it must not need a table to reach another machine.
+        for flag in ("--machine", "--ssh"):
+            if self.w.ssh_log.exists():
+                self.w.ssh_log.unlink()
+            r = self.w.run(flag, "anything", "accounts",
+                           CSM_SSH_CMD=str(self.w.bin / "fake-ssh"),
+                           FAKE_SSH_LOG=str(self.w.ssh_log))
+            self.assertEqual(r.returncode, 0, flag + ": " + r.stderr)
+            self.assertEqual(self.sent()[0][0], "anything")
+
+    def test_the_two_spellings_send_the_same_command(self):
+        self.assertEqual(self.ok(self.ssh_run("--machine", "desktop", "accounts")), "")
+        self.ok(self.ssh_run("--ssh", "desktop", "accounts"))
+        a, b = self.sent()
+        self.assertEqual(a, b)
+        self.assertEqual(a[0], "desktop")
+        self.assertTrue(a[-1].endswith("accounts"), a[-1])
+
+    def test_both_at_once_is_refused(self):
+        r = self.ssh_run("--machine", "desktop", "--ssh", "desktop", "list")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("two spellings of one thing", r.stderr)
+
+    def test_the_flag_is_stripped_by_name_never_by_value(self):
+        # 🛑 `desktop` is also the title being matched here. Filtering the forwarded argv by
+        # VALUE would eat it and move a different session on the far side.
+        self.ok(self.ssh_run("--machine", "desktop", "move", "desktop", "--to", "wk",
+                         "--dry-run"))
+        line = self.sent()[0][-1]
+        self.assertIn("move desktop --to wk --dry-run", line)
+        self.assertNotIn("--machine", line)
+
+    def test_the_equals_spelling_is_stripped_too(self):
+        self.ok(self.ssh_run("--machine=desktop", "accounts"))
+        self.assertNotIn("--machine", self.sent()[0][-1])
+
+    def test_a_multi_word_remote_command_reaches_the_far_side_intact(self):
+        self.ok(self.ssh_run("--machine", "desktop", "list",
+                         CSM_REMOTE_CMD="/opt/bin/env -i /opt/bin/csm"))
+        line = self.sent()[0][-1]
+        self.assertIn("/opt/bin/env -i /opt/bin/csm list", line)
+
+    def test_a_home_relative_remote_command_names_the_far_sides_home(self):
+        # 🛑 Two machines rarely share a home directory, so an absolute path is no answer
+        # and this is the only way to say "your copy, not mine". `shlex.quote` has to quote
+        # both spellings, which is why the prefix needs its own rule: quoted, `~/bin/csm`
+        # is a path whose first component is literally `~`, and the far side exits 127.
+        for spelling in ("~/wrap/csm", "$HOME/wrap/csm"):
+            if self.w.ssh_log.exists():
+                self.w.ssh_log.unlink()
+            self.ok(self.ssh_run("--machine", "desktop", "list",
+                                 CSM_REMOTE_CMD=spelling))
+            line = self.sent()[0][-1]
+            self.assertIn('"$HOME"/wrap/csm list', line, spelling)
+            # and nothing of the word reached the shell as a quoted literal tilde
+            self.assertNotIn("'~", line)
+            self.assertNotIn("'$HOME", line)
+
+    def test_a_remote_command_is_still_quoted_everywhere_but_that_prefix(self):
+        # Only the leading home is unquoted. The rest of a word with a space in it, and a
+        # `$` anywhere but that prefix, stay one quoted word the remote shell never expands.
+        self.ok(self.ssh_run("--machine", "desktop", "accounts",
+                             CSM_REMOTE_CMD="'~/my wrap/csm' --env='$NOPE'"))
+        line = self.sent()[0][-1]
+        self.assertIn('"$HOME"/\'my wrap/csm\' \'--env=$NOPE\' accounts', line)
+
+    def test_without_one_the_remote_path_is_tried_before_a_clone_beside_it(self):
+        self.ok(self.ssh_run("--machine", "desktop", "accounts"))
+        line = self.sent()[0][-1]
+        # The ORDER is the claim: the installed command is looked for first and the clone
+        # is only the fallback, so a machine that has both runs the installed one.
+        self.assertIn("command -v", line)
+        self.assertLess(line.index("command -v"),
+                        line.index("$HOME/git/claude-session-mover/claude-session-mover"),
+                        line)
+
+    def test_an_ssh_host_is_never_checked_against_the_machines_the_table_knows(self):
+        # 🛑 `--ssh HOST` names an SSH HOST: an alias out of ssh_config, a bastion, a
+        # hostname that is in no accounts file by design. Checking it against the table
+        # would break the one spelling that has always meant "that host", and would make
+        # the `--machine` refusal's own advice ("name a host with --ssh") dead advice.
+        self.ok(self.ssh_run("--ssh", "a-bastion-in-no-table", "accounts"))
+        self.assertEqual(self.sent()[0][0], "a-bastion-in-no-table")
+        self.refused(self.ssh_run("--machine", "a-bastion-in-no-table", "accounts"),
+                     "not a machine this tool knows")
+        # and the remote-list gesture echoes the flag that was typed, because `--machine`
+        # would refuse a host the table does not name
+        out = self.ok(self.ssh_run("--ssh", "a-bastion-in-no-table", "list",
+                                   FAKE_SSH_STDOUT="  1  wk  something\n"))
+        self.assertIn("csm --ssh a-bastion-in-no-table move <#> --to <account>", out)
+
+    def test_a_machine_named_only_by_a_row_that_is_elsewhere_is_still_known(self):
+        # 🛑 The known set is the WHOLE `machines` column, not the rows that survive the
+        # here-filter. One account per machine is exactly the layout the column is for, and
+        # reading the filtered list refused a machine the table named while telling you to
+        # fix a column that was right.
+        tsv = self.w.table(("job", "me@work.example", self.work, "laptop", "wk"),
+                           ("me", "me@home.example", self.personal, "desktop", "mine"))
+        self.ok(self.w.run("--machine", "desktop", "accounts",
+                           CSM_SSH_CMD=str(self.w.bin / "fake-ssh"),
+                           FAKE_SSH_LOG=str(self.w.ssh_log),
+                           CSM_ACCOUNTS=tsv, CSM_MACHINE="laptop"))
+        self.assertEqual(self.sent()[0][0], "desktop")
+
+    def test_batchmode_is_the_default_ssh(self):
+        mod = load_tool()
+        self.addCleanup(sys.modules.pop, "csm_mod", None)
+        self.assertIn("BatchMode=yes", mod.SSH_CMD)
+        self.assertIn("ConnectTimeout", mod.SSH_CMD)
+
+    def test_both_the_dispatch_and_its_exit_code_are_logged(self):
+        # A DISPATCH IS NOT AN OUTCOME: the first line is the only record if the ssh never
+        # returns, the second says how it ended. Without both, a remote leg cannot be read
+        # back out of the log at all.
+        r = self.ssh_run("--machine", "desktop", "list", FAKE_SSH_RC="3")
+        self.assertEqual(r.returncode, 3)
+        log = (self.w.state / "log").read_text()
+        self.assertIn("ssh desktop:", log)
+        self.assertIn("ssh desktop: exit 3", log)
+
+    def test_every_log_line_names_the_machine_the_rest_of_the_output_does(self):
+        # One machine, one spelling. The log is the only durable record of a dispatch, and a
+        # hostname there beside `on laptop` everywhere else makes `grep laptop` over it
+        # incomplete — the hostname is often a third name again (a collision suffix, a
+        # domain). With nothing configured, `machine()` IS the hostname, so nothing is lost.
+        self.ok(self.ssh_run("--machine", "desktop", "list"))
+        for line in (self.w.state / "log").read_text().splitlines():
+            if line.strip():
+                self.assertIn("[laptop:", line, line)
+
+    def test_a_remote_list_says_whose_row_numbers_those_are(self):
+        out = self.ok(self.ssh_run("--machine", "desktop", "list",
+                               FAKE_SSH_STDOUT="  1  wk  something\n"))
+        self.assertIn("something", out)
+        self.assertIn("row numbers there are not row numbers here", out)
+        self.assertIn("csm --machine desktop move <#> --to <account>", out)
+
+    def test_a_remote_list_in_json_gets_no_footer_and_a_failed_one_gets_none_either(self):
+        out = self.ok(self.ssh_run("--machine", "desktop", "list", "--json",
+                               FAKE_SSH_STDOUT="[]\n"))
+        self.assertEqual(out, "[]\n")
+        r = self.ssh_run("--machine", "desktop", "list", FAKE_SSH_RC="1")
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("row numbers there", r.stdout)
+
+    def test_the_126_127_hint_names_the_installer_and_the_knob(self):
+        r = self.ssh_run("--machine", "desktop", "list", FAKE_SSH_RC="127")
+        self.assertEqual(r.returncode, 127)
+        self.assertIn("install.sh", r.stderr)
+        self.assertIn("CSM_REMOTE_CMD", r.stderr)
+
+    def test_a_transport_hint_calls_the_tool_what_every_other_line_calls_it(self):
+        # one name per tool: a refusal says `csm:`, so a hint printed under ssh's own
+        # output must not say `claude-session-mover:` and read as a third program
+        for rc in ("127", "255"):
+            r = self.ssh_run("--machine", "desktop", "list", FAKE_SSH_RC=rc)
+            said = [ln for ln in r.stderr.splitlines() if ln.startswith(("csm:", "claude-"))]
+            self.assertTrue(said, rc + ": " + r.stderr)
+            for ln in said:
+                self.assertTrue(ln.startswith("csm:"), ln)
+
+    def test_an_ssh_that_never_connected_says_so_instead_of_leaving_sshs_words(self):
+        """🛑 255 is ssh's own 'could not connect', and what ssh prints on the way there
+        reads like an answer about sessions ('Connection closed by UNKNOWN port 65535').
+        Without this line the reader cannot tell a machine that is asleep from a machine
+        with nothing to list."""
+        r = self.ssh_run("--machine", "desktop", "list", FAKE_SSH_RC="255")
+        self.assertEqual(r.returncode, 255)
+        self.assertIn("255", r.stderr)
+        self.assertIn("could not connect", r.stderr)
+        self.assertIn("ssh desktop true", r.stderr)
+        # and it does not claim to know: the remote command may also return 255
+        self.assertIn("usually", r.stderr)
+
+    def test_an_ordinary_remote_failure_gets_no_transport_hint(self):
+        # rc 1 is the far side answering, so neither hint may fire
+        r = self.ssh_run("--machine", "desktop", "list", FAKE_SSH_RC="1")
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("could not connect", r.stderr)
+        self.assertNotIn("install.sh", r.stderr)
+
+
 class Resolve(Base):
     def setUp(self):
         super().setUp()
@@ -426,7 +966,7 @@ class Resolve(Base):
     def test_name_email_prefix_substring(self):
         # one round trip proves the CLI is wired to the resolver; the ladder itself is
         # pinned in-process, because six more subprocess launches buy nothing
-        self.assertIn("->  personal", self.ok(self.dry("pers")))
+        self.assertIn("→  personal", self.ok(self.dry("pers")))
         mod = load_tool()
         self.addCleanup(sys.modules.pop, "csm_mod", None)
         accts = [mod.Account("work", self.work, expect=""),
@@ -444,7 +984,7 @@ class Resolve(Base):
 
     def test_a_number_that_is_literally_a_name_works(self):
         self.w.account("2", "me3@else.example", org="org-9")
-        self.assertIn("->  2 ", self.ok(self.dry("2")))
+        self.assertIn("→  2 ", self.ok(self.dry("2")))
 
     def test_unknown(self):
         self.refused(self.dry("nobody"), "is no account here")
@@ -471,17 +1011,67 @@ class Listing(Base):
         self.assertEqual(t[SID_B], "AI title")
         self.assertEqual(t[SID_C], "the real first prompt")
 
-    def test_newest_first_and_a_live_session_is_never_cut(self):
+    def one_old_live_and_two_new(self):
         now = time.time()
         self.w.session(self.work, SID_A, mtime=now - 9000)          # old, but live
         self.w.session(self.personal, SID_B, mtime=now - 10)
         self.w.session(self.personal, SID_C, mtime=now - 100)
         self.w.live(self.work, SID_A, self.w.spawn().pid)
-        rows = self.listing("--limit", "1")
-        self.assertEqual([r["local_id"] for r in rows], [SID_A])
-        rows = self.listing("--limit", "3")
+
+    def test_newest_first_and_the_DEFAULT_limit_never_cuts_a_live_session(self):
+        # The default is the path where no number was typed, and there the old rule stands:
+        # the session somebody means to move is running, and it may be the oldest file here.
+        # `CSM_LIMIT` IS the default, so setting it is still the default path.
+        self.one_old_live_and_two_new()
+        rows = json.loads(self.ok(self.w.run("list", "--json", CSM_LIMIT="2")))
+        self.assertEqual([r["local_id"] for r in rows], [SID_B, SID_A])
+        self.assertTrue(rows[1]["live"])   # the oldest file here, and still listed
+        rows = self.listing()
         self.assertEqual([r["local_id"] for r in rows], [SID_B, SID_C, SID_A])
-        self.assertTrue(rows[2]["live"])
+
+    def test_an_explicit_limit_is_a_hard_cap_even_over_a_live_session(self):
+        # Where every Remote Control worker registers as live, the exemption above swallows
+        # the whole list: `--limit 1` printed every row, and the flag was advertised and
+        # inert. An explicit number is at most N rows, the newest, live or not.
+        self.one_old_live_and_two_new()
+        self.assertEqual([r["local_id"] for r in self.listing("--limit", "1")], [SID_B])
+        self.assertEqual([r["local_id"] for r in self.listing("--limit", "2")],
+                         [SID_B, SID_C])
+        self.assertEqual(len(self.listing("--limit", "99")), 3)      # min(N, rows), never N
+
+    def test_an_explicit_limit_beats_all_and_the_table_says_what_it_left_out(self):
+        self.one_old_live_and_two_new()
+        self.assertEqual(len(self.listing("--all", "--limit", "2")), 2)
+        out = self.ok(self.w.run("list", "--limit", "2"))
+        self.assertIn("the newest 2 of at least 3 on this machine", out)
+        self.assertIn("csm list --all", out)
+        # ⚠️ The regression an argparse default of DEFAULT_LIMIT would have shipped: every
+        # run would look explicit, so `--all` here would cap at 20 and claim "of at least".
+        # (A listing that really is capped — more rows than the ceiling — says so under
+        # `--all` too, which is why this world has three sessions and not three hundred.)
+        self.assertNotIn("of at least", self.ok(self.w.run("list", "--all")))
+        self.assertNotIn("of at least", self.ok(self.w.run("list")))
+
+    def test_with_no_accounts_file_the_handle_is_the_name(self):
+        # Discovery gives no handles, so every listing and every `--to` keeps working with
+        # the names — the public audience's experience is unchanged by the column existing.
+        self.w.session(self.work, SID_A)
+        self.assertEqual(self.listing()[0]["handle"], "work")
+        out = self.ok(self.w.run("list"))
+        self.assertIn("accounts: personal, work", out)
+
+    def test_all_limit_and_the_title_width_are_knobs(self):
+        now = time.time()
+        for i, sid in enumerate((SID_A, SID_B, SID_C)):
+            self.w.session(self.work, sid, mtime=now - i,
+                           lines=[user("a very long first prompt indeed, longer than any "
+                                       "column could be", str(self.w.work), sid)])
+        self.assertEqual(len(json.loads(self.ok(self.w.run(
+            "list", "--all", "--json", CSM_ALL_LIMIT="2")))), 2)
+        wide = self.ok(self.w.run("list", CSM_ROW_TITLE="60"))
+        narrow = self.ok(self.w.run("list", CSM_ROW_TITLE="20"))
+        self.assertGreater(max(len(x) for x in wide.splitlines()),
+                           max(len(x) for x in narrow.splitlines()))
 
     def test_a_dead_registry_file_is_not_live(self):
         self.w.session(self.work, SID_A)
@@ -592,7 +1182,7 @@ class Picking(Base):
             user("refactor the parser", str(self.w.work), SID_A)])
         self.w.live(self.work, SID_A, self.w.spawn().pid)
         out = self.ok(self.w.run("move", SID_A, "--to", "personal", "--dry-run"))
-        self.assertIn("work (me@work.example)  ->  personal", out)
+        self.assertIn("work (me@work.example)  →  personal", out)
 
     def test_two_quiet_copies_are_refused(self):
         self.w.session(self.personal, SID_A, lines=[
@@ -649,6 +1239,34 @@ class Refusals(Base):
         self.assertIn("a real move would be REFUSED", self.ok(r))
         self.refused(self.w.run("move", row, "--to", "personal"), "ALREADY running")
 
+    def test_a_registry_that_cannot_be_read_is_not_proof_that_nothing_runs_there(self):
+        """🛑 The twin check's input may not be allowed to fail open.
+
+        `dest` already exists, so the one question left is whether a process is writing
+        it — and the answer comes from `<home>/sessions/`. A directory this process cannot
+        read used to come back empty, which reads exactly like "nothing is running here":
+        the quietest possible path to the one outcome the check exists to prevent, two CLIs
+        appending to one transcript. "Could not look" is never a verdict.
+        """
+        self.w.session(self.personal, SID_A)                 # the file a move would land on
+        d = self.personal / "sessions"
+        d.mkdir(exist_ok=True)
+        row = self.row_of("work", SID_A)
+        os.chmod(str(d), 0o000)
+        # ⚠️ Restored HERE, not with addCleanup: cleanups run after tearDown, and tearDown
+        # is what deletes the fixture tree — which it cannot, through a 000 directory.
+        try:
+            if os.access(str(d), os.R_OK):
+                self.skipTest("this filesystem or user ignores a 000 directory")
+            dry = self.w.run("move", row, "--to", "personal", "--dry-run")
+            real = self.w.run("move", row, "--to", "personal")
+        finally:
+            os.chmod(str(d), 0o700)
+        self.assertIn("a real move would be REFUSED", self.ok(dry))
+        self.refused(real, "cannot be read", "would not open",
+                     "refused rather than guessed")
+        self.assertEqual(self.w.claude_calls(wait=0.2), [], "nothing was started")
+
     def test_window_already_there(self):
         self.w.tmux_state.write_text(json.dumps(
             {"sessions": {"csm-personal": {"moved-11111111": "/dev/null"}}}))
@@ -665,6 +1283,60 @@ class Refusals(Base):
         self.assertIn("another project folder", out)
         self.refused(self.w.run("move", row, "--to", "personal"),
                      "another project folder", "exactly ONE file")
+
+    def test_a_project_folder_that_cannot_be_read_does_not_answer_for_the_whole_home(self):
+        """🛑 The same hole as the registry's, in the guard right below it.
+
+        `Path.glob` swallows the PermissionError its own scan raises and yields nothing, so
+        `tgt.projects.glob("*/<id>.jsonl")` answered "no other copy" about a home it had
+        not finished reading — and the `except OSError` written around it was dead code.
+        The copy here is in a folder this process may not read, which is precisely the one
+        the guard must not miss.
+        """
+        self.w.session(self.personal, SID_A, folder="-some-other-spelling")
+        row = self.row_of("work", SID_A)
+        locked = self.personal / "projects" / "-some-other-spelling"
+        os.chmod(str(locked), 0o000)
+        try:
+            if os.access(str(locked / (SID_A + ".jsonl")), os.F_OK):
+                self.skipTest("this filesystem or user ignores a 000 directory")
+            dry = self.w.run("move", row, "--to", "personal", "--dry-run")
+            real = self.w.run("move", row, "--to", "personal")
+        finally:
+            os.chmod(str(locked), 0o700)
+        self.assertIn("a real move would be REFUSED", self.ok(dry))
+        self.refused(real, "cannot tell whether", "would not open",
+                     "refused rather than guessed")
+        self.assertEqual(self.w.claude_calls(wait=0.2), [], "nothing was started")
+
+    def test_a_destination_folder_that_cannot_be_statted_is_a_sentence_not_a_traceback(self):
+        """`Path.exists()` only swallows ENOENT/ENOTDIR/EBADF/ELOOP, so a target project
+        folder this process may not read raised straight out of `preflight` — a function
+        whose whole contract is to answer in sentences. The answer it could not get is
+        "would this overwrite something", which is a blocker."""
+        self.w.session(self.personal, SID_A)                 # same folder, so dest is here
+        row = self.row_of("work", SID_A)
+        locked = Path(os.path.dirname(str(
+            self.personal / "projects" / slug_of(str(self.w.work)))))
+        folder = self.personal / "projects" / slug_of(str(self.w.work))
+        self.assertTrue(folder.is_dir(), folder)
+        os.chmod(str(folder), 0o000)
+        try:
+            if os.access(str(folder / (SID_A + ".jsonl")), os.F_OK):
+                self.skipTest("this filesystem or user ignores a 000 directory")
+            real = self.w.run("move", row, "--to", "personal")
+            dry = self.w.run("move", row, "--to", "personal", "--dry-run")
+        finally:
+            os.chmod(str(folder), 0o700)
+        err = self.refused(real, "cannot tell whether")
+        self.assertNotIn("Traceback", err)
+        # 🛑 And the DRY RUN answers in the plan, not with a stack: the plan builder makes
+        # the same stats for its prose, and `--dry-run`'s whole answer is what it prints.
+        self.assertEqual(dry.returncode, 0, dry.stdout + dry.stderr)
+        self.assertIn("a real move would be REFUSED", dry.stdout)
+        self.assertNotIn("Traceback", dry.stderr)
+        self.assertEqual(self.w.claude_calls(wait=0.2), [], "nothing was started")
+        self.assertTrue(locked.is_dir())
 
     def test_stop_source_needs_remote_control(self):
         self.refused(self.move("--to", "personal", "--stop-source", "--no-remote-control"),
@@ -904,13 +1576,712 @@ class Moves(Base):
         self.assertIn("may be out of quota TOO", out)
 
 
+# ------------------------------------------------------------------- another machine
+
+def slug_of(cwd: str) -> str:
+    """The project folder name the CLI gives a directory: every non-alphanumeric -> `-`."""
+    return re.sub(r"[^A-Za-z0-9]", "-", cwd)
+
+
+DESK_SID = "90c2bd49-0000-4000-8000-000000000000"
+
+
+class CrossMachine(Base):
+    """🛑 `find` and `--from-machine`, against a fixture "other machine".
+
+    `CSM_REMOTE_LOCAL=1` makes the other machine THIS process, with `HOME` pointed at
+    `<tmp>/remote`, so the real `REMOTE_HELPER` runs (as `python3 -I -`, exactly the way ssh
+    runs it) and the real tar pipe runs — with no ssh, no second machine and no network.
+    The fixture is shaped like the session the feature exists for: a DESKTOP-APP session in
+    the DEFAULT home, its title only in the app's own index, out of quota, and its working
+    directory absent on this machine.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.remote = self.w.root / "remote"
+        self.gone = str(self.w.root / "only-over-there" / "firmware")
+        home = self.remote / ".claude"
+        d = home / "projects" / slug_of(self.gone)
+        d.mkdir(parents=True)
+        (d / (DESK_SID + ".jsonl")).write_text(jl(
+            user("deploy to the handset", self.gone, DESK_SID, perm="bypassPermissions"),
+            assistant("on it", self.gone, DESK_SID, model="claude-opus-4-1"),
+            {"type": "ai-title", "aiTitle": "Handset deploy", "sessionId": DESK_SID}))
+        # a sibling directory, and a subagent transcript that must never be a row of its own
+        (d / DESK_SID / "subagents").mkdir(parents=True)
+        (d / DESK_SID / "subagents" / "agent-1.jsonl").write_text('{"isSidechain": true}\n')
+        (self.remote / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "you@desk.example",
+                              "organizationUuid": "org-desk"}}))
+        idx = (self.remote / "Library" / "Application Support" / "Claude"
+               / "claude-code-sessions" / "acct" / "org")
+        idx.mkdir(parents=True)
+        (idx / ("local_" + DESK_SID + ".json")).write_text(json.dumps({
+            "sessionId": "local_" + DESK_SID, "cliSessionId": DESK_SID, "cwd": self.gone,
+            "title": "Finish the handset deploy and verify it",
+            "permissionMode": "bypassPermissions", "effort": "xhigh",
+            "error": "You've hit your session limit · resets 12:20pm",
+            "bridgeSessionIds": ["session_01QVqhJ3dyik6cTyZ3yMANoy"]}))
+        self.imports = self.w.root / "imports"
+        self.renv = {"CSM_REMOTE_LOCAL": "1", "CSM_REMOTE_HOME": str(self.remote),
+                     "CSM_IMPORTS": str(self.imports), "CSM_MACHINE": "here"}
+
+    def csm(self, *args, **env):
+        e = dict(self.renv)
+        e.update({k: str(v) for k, v in env.items()})
+        return self.w.run(*args, **e)
+
+    def rows(self, *args):
+        return json.loads(self.ok(self.csm("find", *(args + ("--json",)))))
+
+    # --- find -------------------------------------------------------------
+    def test_find_sees_a_desktop_session_in_the_default_home_by_the_apps_own_title(self):
+        # The title is ONLY in the desktop index; the transcript's own is "Handset deploy".
+        out = self.ok(self.csm("find", "finish the handset", "--on", "desktop"))
+        self.assertIn("Finish the handset deploy", out)
+        self.assertIn("[desktop app]", out)
+        self.assertIn("OUT OF QUOTA", out)
+        self.assertIn("you@desk.example", out)
+        self.assertIn("--from-machine desktop", out)
+
+    def test_find_matches_the_cli_id_the_desktop_id_and_the_link(self):
+        for spec in ("90c2bd", "local_90c2bd",
+                     "https://claude.ai/code/session_01QVqhJ3dyik6cTyZ3yMANoy"):
+            self.assertEqual([x["id"] for x in self.rows(spec, "--on", "desktop")],
+                             [DESK_SID], spec)
+        # and the subagent's own transcript is never a row
+        self.assertEqual([x["id"] for x in self.rows("", "--on", "desktop")], [DESK_SID])
+
+    def test_find_says_what_the_age_is_and_that_a_move_is_a_copy(self):
+        out = self.ok(self.csm("find", "handset", "--on", "desktop"))
+        self.assertIn("transcript file's last write", out)
+        self.assertIn("one moved session is two rows", out)
+
+    def test_nothing_matching_is_not_an_error(self):
+        out = self.ok(self.csm("find", "no-such-session", "--on", "desktop"))
+        self.assertIn("no session on desktop matches", out)
+        self.assertNotIn("--from-machine", out)
+
+    def test_find_with_no_on_reads_this_machines_own_homes(self):
+        cwd = str(self.w.work)
+        self.w.session(self.work, SID_A, lines=[user("local work here", cwd, SID_A)])
+        env = dict(self.renv)
+        env.pop("CSM_REMOTE_LOCAL")           # really local: no fixture tree in the way
+        env.pop("CSM_REMOTE_HOME")
+        out = self.ok(self.w.run("find", "local work", **env))
+        self.assertIn(SID_A[:8], out)
+        self.assertIn("local work here", out)
+        self.assertNotIn("--from-machine", out, "nothing to bring: it is already here")
+
+    def test_on_this_machine_is_the_same_as_no_on(self):
+        cwd = str(self.w.work)
+        self.w.session(self.work, SID_A, lines=[user("right here", cwd, SID_A)])
+        env = dict(self.renv)
+        env.pop("CSM_REMOTE_LOCAL")
+        env.pop("CSM_REMOTE_HOME")
+        out = self.ok(self.w.run("find", "right here", "--on", "here", **env))
+        self.assertIn(SID_A[:8], out)
+        self.assertNotIn("--from-machine", out)
+
+    def test_find_on_a_machine_the_table_does_not_know_is_refused(self):
+        tsv = self.w.table(("job", "me@work.example", self.work, "here,desktop", "wk"))
+        self.refused(self.w.run("find", "x", "--on", "mars", CSM_ACCOUNTS=str(tsv),
+                                CSM_MACHINE="here"),
+                     "not a machine this tool knows", "desktop")
+
+    # --- the refusals -----------------------------------------------------
+    def test_a_missing_folder_is_refused_and_names_mirror_cwd(self):
+        r = self.csm("move", "90c2bd", "--from-machine", "desktop", "--to", "personal")
+        self.refused(r, "does not exist on here", "pass --mirror-cwd")
+        self.assertFalse(self.imports.exists(), "nothing is staged on a refusal")
+
+    def test_two_machines_that_spell_home_alike_still_refuse_a_folder_that_is_not_here(self):
+        """⚠️ When the two machines spell home identically, home-to-home is an IDENTITY:
+        a folder translates to itself whether or not it exists here, so nothing in the
+        translation can tell the two cases apart. `preflight`'s missing-folder refusal is
+        the only thing between that and a resume in a directory that is not there."""
+        absent = str(self.w.home / "went-away")
+        d = self.remote / ".claude" / "projects" / slug_of(absent)
+        d.mkdir(parents=True)
+        (d / (SID_B + ".jsonl")).write_text(jl(user("still going", absent, SID_B)))
+        mj = self.w.root / "same-home.json"
+        mj.write_text(json.dumps({"desktop": {"home": str(self.w.home)},
+                                  "here": {"home": str(self.w.home)}}))
+        r = self.csm("move", SID_B[:8], "--from-machine", "desktop", "--to", "personal",
+                     CSM_MACHINES=str(mj))
+        self.refused(r, absent, "does not exist on here", "pass --mirror-cwd")
+        self.assertFalse(self.imports.exists())
+
+    def test_mirror_cwd_without_from_machine_is_refused(self):
+        self.refused(self.csm("move", SID_A, "--to", "personal", "--mirror-cwd"),
+                     "--mirror-cwd goes with --from-machine")
+
+    def test_from_machine_naming_this_machine_is_refused(self):
+        self.refused(self.csm("move", "90c2bd", "--from-machine", "here", "--to", "personal"),
+                     "is this machine", "drop the flag")
+
+    def test_staging_inside_a_config_homes_projects_is_refused_before_anything_is_fetched(self):
+        """🛑 The one delete in this tool is aimed by a knob, so the knob is checked.
+
+        A leftover staging file is removed before the fetch, so that "the copy did not
+        arrive" can be told from "a file was already there". `CSM_IMPORTS` pointed inside a
+        `projects/` tree would make that delete a transcript of that account's — the one
+        thing this tool promises never to do — and the file's own note said "never
+        anybody's `projects/`" with nothing holding it to that.
+        """
+        victim = self.personal / "projects" / slug_of(str(self.w.work))
+        victim.mkdir(parents=True, exist_ok=True)
+        keep = victim / (DESK_SID + ".jsonl")
+        keep.write_text(jl(user("a transcript of its own", str(self.w.work), DESK_SID)))
+        r = self.csm("move", DESK_SID, "--from-machine", "desktop", "--to", "personal",
+                     "--dry-run", CSM_IMPORTS=str(victim))
+        self.refused(r, "CSM_IMPORTS", "projects/", "outside every config home")
+        self.assertIn("a transcript of its own", keep.read_text())
+        # and a staging directory of its own is fine
+        self.ok(self.csm("move", DESK_SID, "--from-machine", "desktop", "--to", "personal",
+                         "--dry-run", "--mirror-cwd"))
+
+    def test_an_unknown_machine_is_refused_naming_the_ones_it_knows(self):
+        tsv = self.w.table(("job", "me@work.example", self.work, "here,desktop", "wk"))
+        self.refused(self.w.run("move", "90c2bd", "--from-machine", "mars", "--to",
+                                "personal", CSM_ACCOUNTS=str(tsv), CSM_MACHINE="here"),
+                     "not a machine this tool knows", "desktop")
+
+    def test_stop_source_is_refused_across_machines(self):
+        os.makedirs(self.gone)
+        out = self.ok(self.csm("move", "90c2bd", "--from-machine", "desktop", "--to",
+                               "personal", "--stop-source", "--dry-run"))
+        self.assertIn("never stops a process on another machine", out)
+        r = self.csm("move", "90c2bd", "--from-machine", "desktop", "--to", "personal",
+                     "--stop-source")
+        self.refused(r, "never stops a process on another machine")
+
+    def test_auto_never_hands_a_session_back_to_the_account_it_already_runs_as(self):
+        """🛑 The whole reason `auto_target` compares FIELDS and not names.
+
+        A `--from-machine` source is a SYNTHESISED account whose name is
+        `<machine>:<home>` by construction, so that it can never equal a target's — moving
+        the same account to another machine is a real move. Comparing names therefore
+        matches nothing here, and `auto` would hand the session straight back to the
+        account it is already running as, on a machine where it has no more quota than it
+        had. The login is what identifies it, and this is the only shape that proves it:
+        the same-machine case passes on the name alone.
+        """
+        os.makedirs(self.gone)
+        twin = self.w.account("twin", "you@desk.example", org="org-desk")
+        tbl = self.w.table(
+            ("work", "me@work.example", self.work, "here", "wk"),
+            ("personal", "me@home.example", self.personal, "here", "pers"),
+            ("twin", "you@desk.example", twin, "here", "tw"))
+        # the account signed in as the SOURCE's own login has by far the most room, so
+        # nothing but the identity check can keep `auto` off it
+        m = self.w.meters(tw=(0, 1, 60), pers=(0, 50, 60), wk=(0, 70, 60))
+        out = self.ok(self.csm("move", "90c2bd", "--from-machine", "desktop", "--to",
+                               "auto", "--dry-run", CSM_ACCOUNTS=str(tbl),
+                               CSM_METERS=str(m)))
+        self.assertIn("--to auto: pers", out)
+        self.assertNotIn("--to auto: tw", out)
+        self.assertIn("→  pers (me@home.example)", out)
+
+    def test_a_mirror_onto_a_folder_that_is_already_here_is_refused(self):
+        os.makedirs(self.gone)
+        out = self.ok(self.csm("move", "90c2bd", "--from-machine", "desktop", "--to",
+                               "personal", "--mirror-cwd", "--dry-run"))
+        self.assertIn("never writes into an existing folder", out)
+
+    def test_a_third_home_that_shares_the_targets_tree_is_asked_before_the_copy(self):
+        """🛑 `dest` can be held by a home that is neither the source nor the target.
+
+        Where several homes' `projects/` are ONE directory the transcript exists once on
+        the machine, so the process writing `dest` need not be in the target home's own
+        registry. The sweep that asks every such home used to be gated on whether the
+        SOURCE and the target file it in one directory — which, for a `--from-machine`
+        move, is false by construction (the source's tree is the staging area), so the
+        sweep never ran on the move most likely to land on a transcript a local process
+        is writing.
+        """
+        os.makedirs(self.gone)
+        third = self.w.account("elsewhere", "me@other.example", org="org-3")
+        shutil.rmtree(str(third / "projects"))
+        os.symlink(str(self.personal / "projects"), str(third / "projects"))
+        # what an earlier move left in the shared tree, and the pid writing it now
+        d = self.personal / "projects" / slug_of(self.gone)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / (DESK_SID + ".jsonl")).write_text(jl(user("deploy", self.gone, DESK_SID)))
+        self.w.live(third, DESK_SID, self.w.spawn().pid, cwd=self.gone)
+        r = self.csm("move", "90c2bd", "--from-machine", "desktop", "--to", "personal")
+        self.refused(r, "ALREADY running", "elsewhere")
+        self.assertFalse(self.imports.exists(), "nothing is staged on a refusal")
+
+    def test_a_home_with_its_own_tree_running_the_same_id_is_not_that_transcripts_writer(self):
+        """The other half of the same rule: a home whose `projects/` is its OWN directory
+        holds its own copy of the id, which is a different file — not a second writer of
+        `dest`, and not a refusal."""
+        os.makedirs(self.gone)
+        third = self.w.account("elsewhere", "me@other.example", org="org-3")
+        d = self.personal / "projects" / slug_of(self.gone)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / (DESK_SID + ".jsonl")).write_text(jl(user("deploy", self.gone, DESK_SID)))
+        self.w.session(third, DESK_SID, cwd=self.gone, folder=slug_of(self.gone))
+        self.w.live(third, DESK_SID, self.w.spawn().pid, cwd=self.gone)
+        out = self.ok(self.csm("move", "90c2bd", "--from-machine", "desktop", "--to",
+                               "personal", "--dry-run"))
+        self.assertNotIn("ALREADY running", out)
+
+    def test_a_mirror_that_cannot_make_the_folder_here_is_refused_in_one_line(self):
+        """🛑 A folder the two machines spell differently and NO rule maps is left as the
+        origin's own absolute path, and its parent here can be a directory this user may
+        not write — another account's home, a system root. That is a sentence to print,
+        not an OSError to raise through the middle of a move."""
+        remote_real = Path(os.path.realpath(str(self.remote)))
+        here_real = Path(os.path.realpath(str(self.w.home)))
+        src = remote_real / "locked" / "sub" / "repo"
+        src.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(src)], check=True)
+        d = self.remote / ".claude" / "projects" / slug_of(str(src))
+        d.mkdir(parents=True)
+        (d / (SID_C + ".jsonl")).write_text(jl(user("build it", str(src), SID_C)))
+        locked = here_real / "locked"
+        locked.mkdir()
+        mj = self.w.root / "machines.json"
+        mj.write_text(json.dumps({"desktop": {"home": str(remote_real)},
+                                  "here": {"home": str(here_real)}}))
+        os.chmod(str(locked), 0o500)                 # traversable, not writable
+        try:
+            r = self.csm("move", SID_C[:8], "--from-machine", "desktop", "--to",
+                         "personal", "--mirror-cwd", CSM_MACHINES=str(mj))
+        finally:
+            # ⚠️ Put it back HERE, not in a cleanup: cleanups run after `tearDown`, which
+            # has already deleted the tree the directory was in.
+            os.chmod(str(locked), 0o700)
+        self.refused(r, "--mirror-cwd cannot create", "Clone the repository here")
+        self.assertEqual(self.w.claude_calls(wait=0.2), [], "nothing was started")
+
+    def test_two_matches_are_refused_naming_the_ids(self):
+        other = "7777aaaa-0000-4000-8000-000000000000"
+        d = self.remote / ".claude" / "projects" / slug_of(self.gone)
+        (d / (other + ".jsonl")).write_text(jl(
+            user("deploy to the handset too", self.gone, other),
+            {"type": "ai-title", "aiTitle": "Handset deploy, again"}))
+        r = self.csm("move", "handset", "--from-machine", "desktop", "--to", "personal")
+        self.refused(r, "sessions on desktop match", DESK_SID[:8], other[:8])
+
+    # --- the plan ---------------------------------------------------------
+    def test_the_dry_run_shows_the_fetch_the_effort_and_what_stayed_behind(self):
+        os.makedirs(self.gone)                      # as if the folder were already here
+        out = self.ok(self.csm("move", "90c2bd", "--from-machine", "desktop", "--to",
+                               "personal", "--dry-run"))
+        self.assertIn("FROM THE MACHINE desktop", out)
+        self.assertIn("fetch 90c2bd49", out)
+        self.assertIn("and 90c2bd49-0000-4000-8000-000000000000/ (1 files", out,
+                      "the sibling directory crosses with it")
+        self.assertIn("--effort xhigh", out)
+        self.assertIn("[desktop app session local_90c2bd49", out)
+        self.assertIn("a separate working tree", out)
+        self.assertIn("out of quota", out)
+        self.assertFalse(self.imports.exists(), "a dry run fetches nothing")
+
+    def test_the_same_account_on_another_machine_is_a_move_not_a_refusal(self):
+        os.makedirs(self.gone)
+        # the target home holds the login the fixture session is signed in as
+        (self.personal / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "you@desk.example",
+                              "organizationUuid": "org-desk"}}))
+        out = self.ok(self.csm("move", "90c2bd", "--from-machine", "desktop", "--to",
+                               "personal", "--dry-run"))
+        self.assertIn("on the same account (you@desk.example)", out)
+        self.assertIn("changes the machine, not the quota", out)
+
+    def test_a_synced_folder_is_named_as_the_same_folder(self):
+        sync = self.w.home / "shared" / "proj"
+        sync.mkdir(parents=True)
+        d = self.remote / ".claude" / "projects" / slug_of(str(sync))
+        d.mkdir(parents=True)
+        (d / (SID_B + ".jsonl")).write_text(jl(user("in the synced tree", str(sync), SID_B)))
+        out = self.ok(self.csm("move", SID_B[:8], "--from-machine", "desktop", "--to",
+                               "personal", "--dry-run", CSM_SYNC_DIRS="shared"))
+        self.assertIn("the same synced folder as on desktop", out)
+
+    # --- the real thing ---------------------------------------------------
+    def test_a_cross_machine_move_stages_the_transcript_and_resumes_it_here(self):
+        os.makedirs(self.gone)
+        out = self.ok(self.csm("move", "90c2bd", "--from-machine", "desktop", "--to",
+                               "personal"))
+        self.assertIn(LINK, out)
+        self.assertIn("the original is NOT stopped", out)
+        self.assertIn("still open in the DESKTOP APP there", out)
+        # staged, under the machine it came from, and KEPT as the record of what crossed
+        staged = self.imports / "desktop" / slug_of(self.gone) / (DESK_SID + ".jsonl")
+        self.assertTrue(staged.is_file(), sorted(str(p) for p in self.imports.rglob("*")))
+        self.assertTrue((staged.parent / DESK_SID / "subagents" / "agent-1.jsonl").is_file(),
+                        "the sibling directory crosses with it")
+        self.assertFalse(any(p.name.startswith("._") for p in staged.parent.iterdir()),
+                         "no AppleDouble files from tar")
+        # and filed into the target home from there
+        dest = self.personal / "projects" / slug_of(self.gone) / (DESK_SID + ".jsonl")
+        self.assertEqual(dest.read_bytes(), staged.read_bytes())
+        # the source on the other machine is untouched
+        there = (self.remote / ".claude" / "projects" / slug_of(self.gone)
+                 / (DESK_SID + ".jsonl"))
+        self.assertTrue(there.is_file())
+        argv = self.w.claude_calls()[0]["argv"]
+        self.assertEqual(argv[-2:], ["--resume", DESK_SID])
+        self.assertEqual(argv[argv.index("--effort") + 1], "xhigh")
+        # 🛑 The Remote Control label keeps the TITLE: the provenance half is the source's
+        # short label, not its `<machine>:<config home>` name, which left eight characters
+        # of title.
+        rc = [a for a in argv if a.startswith("--remote-control=")][0]
+        self.assertIn("Finish the handset", rc, rc)
+        self.assertTrue(rc.endswith("moved from you desk.example desktop"), rc)
+
+    def test_a_mirror_brings_the_code_across_and_the_move_resumes_in_it(self):
+        # ⚠️ Realpaths throughout: `git rev-parse --show-toplevel` resolves symlinks, and a
+        # temporary directory on macOS is reached through one, so a fixture that mixed the
+        # two spellings would measure the symlink and not the rule.
+        remote_real = Path(os.path.realpath(str(self.remote)))
+        here_real = Path(os.path.realpath(str(self.w.home)))
+        src = remote_real / "tree"            # the folder as the other machine spells it
+        src.mkdir()
+        g = ["git", "-C", str(src), "-c", "user.email=t@t", "-c", "user.name=t"]
+        env = dict(os.environ)
+        env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+                    "GIT_CONFIG_NOSYSTEM": "1"})
+        subprocess.run(g + ["init", "-q"], check=True, env=env)
+        (src / ".gitignore").write_text("*.rec\n")
+        (src / "code.py").write_text("print(1)\n")
+        subprocess.run(g + ["add", "-A"], check=True, env=env)
+        subprocess.run(g + ["commit", "-qm", "one"], check=True, env=env)
+        (src / "frames.rec").write_bytes(b"\0" * 4096)
+        # a session in THAT folder, which does not exist here under its own spelling
+        d = self.remote / ".claude" / "projects" / slug_of(str(src))
+        d.mkdir(parents=True)
+        (d / (SID_C + ".jsonl")).write_text(jl(user("build it", str(src), SID_C)))
+        mj = self.w.root / "machines.json"
+        mj.write_text(json.dumps({"desktop": {"home": str(remote_real)},
+                                  "here": {"home": str(here_real)}}))
+        out = self.ok(self.csm("move", SID_C[:8], "--from-machine", "desktop", "--to",
+                               "personal", "--mirror-cwd", CSM_MACHINES=str(mj)))
+        # this machine's OWN spelling of the folder, which is what the plan must promise:
+        # the step used to print the origin's path as the destination.
+        here = self.w.home / "tree"
+        self.assertIn("is %s here" % here, out)
+        self.assertIn("mirror the code into %s on here" % here, out)
+        self.assertEqual((here / "code.py").read_text(), "print(1)\n")
+        self.assertFalse((here / "frames.rec").exists(), "an ignored file never crosses")
+        self.assertTrue((here / ".git").is_dir())
+        self.assertEqual(os.path.realpath(self.w.claude_calls()[0]["cwd"]),
+                         os.path.realpath(str(here)))
+
+
+class RemoteHelper(unittest.TestCase):
+    """The helper's `detail` and `mirror` modes, run the way ssh runs them (`python3 -I -`)."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        # 🛑 A UNIT TEST MAY NOT READ THE MACHINE'S OWN GIT CONFIG. A global
+        # `url.https://github.com/.insteadOf git@github.com:` — a reasonable thing to have
+        # — rewrites every fixture remote on the way out, so a remote added as
+        # `git@github.com:…` reads back as `https://…`, which is not the shape
+        # `github_https_fallback` is about: the test would then measure the machine instead
+        # of the code. Git reads the global and system files for every command, so both are
+        # pinned away here; the one `git commit` below passes user.name/email with `-c`.
+        for var, val in (("GIT_CONFIG_GLOBAL", os.devnull),
+                         ("GIT_CONFIG_SYSTEM", os.devnull),
+                         ("GIT_CONFIG_NOSYSTEM", "1")):
+            was = os.environ.get(var)
+            os.environ[var] = val
+            self.addCleanup(lambda v=var, o=was:
+                            os.environ.__setitem__(v, o) if o is not None
+                            else os.environ.pop(v, None))
+        self.mod = load_tool()
+        self.mod.LOG = self.dir / "log"
+        self.addCleanup(sys.modules.pop, "csm_mod", None)
+
+    def helper(self, *args, **kw):
+        r = subprocess.run([PY] + list(kw.get("flags", ("-I", "-"))) + [str(a) for a in args],
+                           input=self.mod.REMOTE_HELPER, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, universal_newlines=True, timeout=120,
+                           cwd=kw.get("cwd"))
+        if kw.get("raw"):
+            return r
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_the_fixture_is_deaf_to_the_machines_own_git_config(self):
+        """The guard for the setUp above: an ambient `url.…insteadOf` must not reach here."""
+        repo = self.dir / "iso"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "remote", "add", "origin",
+                        "git@github.com:someone/x.git"], check=True)
+        url = subprocess.run(["git", "-C", str(repo), "remote", "get-url", "origin"],
+                             stdout=subprocess.PIPE, universal_newlines=True).stdout.strip()
+        self.assertEqual(url, "git@github.com:someone/x.git",
+                         "a url.insteadOf from the machine's git config is leaking into the "
+                         "fixture — isolate it in setUp, do not relax the assertion")
+
+    def test_a_stray_module_in_the_working_directory_cannot_shadow_the_standard_library(self):
+        """🛑 Over ssh the working directory is the remote account's HOME, and `python3 -`
+        puts it on `sys.path`: a scratch `re.py` there is imported instead of the standard
+        library's. Measured: it broke every mode of the helper with an AttributeError.
+        `-I` is what keeps that out, and this is the test that says so."""
+        (self.dir / "re.py").write_text("raise SystemExit('the stray file ran')\n")
+        (self.dir / "json.py").write_text("raise SystemExit('the stray file ran')\n")
+        bad = self.helper("detail", str(self.dir / "x.jsonl"), "no-such-id",
+                          flags=("-",), cwd=str(self.dir), raw=True)
+        self.assertNotEqual(bad.returncode, 0, "the stray file should have broken this")
+        got = self.helper("detail", str(self.dir / "x.jsonl"), "no-such-id",
+                          cwd=str(self.dir))
+        self.assertEqual(got["owners"], [])
+
+    def test_the_owner_is_matched_by_its_resume_flag_and_its_children_are_listed(self):
+        sid = "4b4b4b4b-0000-4000-8000-000000000000"
+        owner = subprocess.Popen(
+            [PY, "-c", "import subprocess,time; subprocess.Popen(['sleep','40']); "
+                       "time.sleep(40)", "--resume=" + sid])
+        # a DECOY: a side session's argv names the id inside a path, never after --resume
+        decoy = subprocess.Popen([PY, "-c", "import time; time.sleep(40)",
+                                  "/x/side-notes/local_" + sid])
+        for p in (owner, decoy):
+            self.addCleanup(p.wait)        # cleanups run last in first out: kill, then wait
+            self.addCleanup(p.kill)
+        time.sleep(1.0)
+        t = self.dir / (sid + ".jsonl")
+        t.write_text('{"type":"user"}\n{"name":"mcp__ccd_session__start_session"}\n')
+        det = self.helper("detail", str(t), sid)
+        self.assertEqual([o["pid"] for o in det["owners"]], [owner.pid])
+        left = [p for p in det["left"] if p["cmd"].startswith("sleep 40")]
+        self.assertTrue(left, det)
+        self.assertEqual(det["app_tools"], 1)
+        # 🛑 The grandchild is killed BY THE PID `detail` just reported, never by matching
+        # its command line: `pkill -f '^sleep 40$'` reaches outside the fixture and would
+        # end an unrelated `sleep 40` belonging to whoever is running the suite.
+        for p in left:
+            try:
+                os.kill(p["pid"], signal.SIGKILL)
+            except OSError:
+                pass
+
+    def test_the_mirror_copies_code_and_leaves_the_ignored_and_the_big_files(self):
+        repo = self.dir / "repo"
+        repo.mkdir()
+        g = ["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t"]
+        subprocess.run(g + ["init", "-q"], check=True)
+        (repo / ".gitignore").write_text("*.rec\n")
+        (repo / "code.py").write_text("print(1)\n")
+        subprocess.run(g + ["add", "-A"], check=True)
+        subprocess.run(g + ["commit", "-qm", "one"], check=True)
+        (repo / "code.py").write_text("print(2)\n")              # an uncommitted edit
+        (repo / "new.py").write_text("x = 1\n")                  # untracked, small
+        (repo / "frames.rec").write_bytes(b"\0" * 5000)          # ignored
+        (repo / "big.bin").write_bytes(b"\0" * 5000)             # untracked, too big
+        plan = self.helper("mirror", str(repo), 1000)
+        files = set(plan["files"])
+        self.assertTrue({"code.py", "new.py", ".gitignore", ".git/HEAD"} <= files, files)
+        self.assertNotIn("frames.rec", files)
+        self.assertEqual([x[0] for x in plan["skipped"]], ["big.bin"])
+        self.assertEqual(plan["dirty"], 3)                       # code.py, new.py, big.bin
+        dest = self.dir / "mirror"
+        os.environ["CSM_REMOTE_LOCAL"] = "1"
+        self.addCleanup(os.environ.pop, "CSM_REMOTE_LOCAL", None)
+        self.mod.tar_across("desktop", str(repo), plan["files"], dest)
+        self.assertEqual((dest / "code.py").read_text(), "print(2)\n")
+        self.assertFalse((dest / "frames.rec").exists())
+        self.assertFalse(any(p.name.startswith("._") for p in dest.iterdir()))
+        st = subprocess.run(["git", "-C", str(dest), "status", "--porcelain"],
+                            stdout=subprocess.PIPE, universal_newlines=True)
+        self.assertEqual(st.returncode, 0)
+        self.assertIn(" M code.py", st.stdout)
+
+    def test_a_folder_that_is_not_a_git_tree_cannot_be_mirrored(self):
+        plain = self.dir / "plain"
+        plain.mkdir()
+        self.assertEqual(self.helper("mirror", str(plain), 1000).get("git"), False)
+
+    def test_a_mirror_with_an_ssh_remote_pushes_over_https_when_ssh_is_refused(self):
+        repo = self.dir / "r"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "remote", "add", "origin",
+                        "git@github.com:someone/firmware.git"], check=True)
+        self.mod._github_ssh_ok = lambda: True
+        self.assertFalse(self.mod.github_https_fallback(str(repo)), "ssh works: untouched")
+        self.mod._github_ssh_ok = lambda: False
+        self.assertTrue(self.mod.github_https_fallback(str(repo)))
+        got = subprocess.run(["git", "-C", str(repo), "config", "--local", "--get",
+                              "url.https://github.com/.insteadOf"], stdout=subprocess.PIPE,
+                             universal_newlines=True).stdout.strip()
+        self.assertEqual(got, "git@github.com:")
+        other = self.dir / "o"
+        subprocess.run(["git", "init", "-q", str(other)], check=True)
+        subprocess.run(["git", "-C", str(other), "remote", "add", "origin",
+                        "https://github.com/x/y.git"], check=True)
+        self.assertFalse(self.mod.github_https_fallback(str(other)),
+                         "already https: untouched")
+
+    def test_the_helper_is_sent_to_the_remote_python_through_the_ssh_knob(self):
+        """What a REAL `--on` leg sends: the ssh invocation is the knob, so this records it
+        instead of running ssh — and what it records is the whole remote shell word."""
+        log = self.dir / "ssh.jsonl"
+        rec = self.dir / "fake-ssh"
+        rec.write_text("#!" + PY + "\nimport json, os, sys\n"
+                       "open(os.environ['L'], 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                       'sys.stdout.write(\'{"candidates": []}\\n\')\n')
+        rec.chmod(0o755)
+        self.mod.SSH_CMD = str(rec)
+        self.mod.REMOTE_PYTHON = "/usr/bin/python3"
+        os.environ["L"] = str(log)
+        self.addCleanup(os.environ.pop, "L", None)
+        self.assertEqual(self.mod.find_rows("desktop", "x", False), [])
+        sent = json.loads(log.read_text().splitlines()[-1])
+        self.assertEqual(sent[0], "desktop")
+        self.assertIn("/usr/bin/python3 -I - find x", sent[-1])
+
+
+class TranslateCwd(unittest.TestCase):
+    """One project, a different absolute path on each machine: a different user name makes
+    `~/code/p` a different path, and a sync client's own root differs per machine too."""
+
+    def setUp(self):
+        self.mod = load_tool()
+        self.addCleanup(sys.modules.pop, "csm_mod", None)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        # This machine: `~/shared` is a SYMLINK into the sync client's own tree, which is
+        # exactly the case no named root can match.
+        self.here_home = self.root / "one"
+        (self.here_home / "Cloud" / "shared").mkdir(parents=True)
+        os.symlink(str(self.here_home / "Cloud" / "shared"), str(self.here_home / "shared"))
+        self.real_sync = os.path.realpath(str(self.here_home / "shared"))
+        self.mj = self.root / "machines.json"
+        self.mj.write_text(json.dumps({
+            "laptop": {"home": str(self.here_home), "sync": self.real_sync},
+            "desktop": {"home": "/home/two", "sync": "/home/two/Storage/shared"},
+            "twin": {"home": str(self.here_home), "sync": self.real_sync},
+            # not roots: a null, a nested object and a relative value are all ignored
+            "lab": {"home": "/home/lab", "sync": None, "overlay": {"a": 1},
+                    "base": "relative/path"},
+        }))
+        self.mod.MACHINES_FILE = self.mj
+        self.mod.SYNC_DIRS = ("shared",)
+        self.mod.HOME = self.here_home
+
+    def t(self, origin, cwd, path=""):
+        return self.mod.translate_cwd(origin, cwd, path, here_name="laptop",
+                                      here_home=str(self.here_home))
+
+    def test_the_other_machines_sync_root_is_this_machines(self):
+        self.assertEqual(self.t("desktop", "/home/two/Storage/shared/proj"),
+                         self.real_sync + "/proj")
+
+    def test_an_ordinary_home_relative_folder_maps_home_to_home(self):
+        self.assertEqual(self.t("desktop", "/home/two/code/app"),
+                         str(self.here_home) + "/code/app")
+
+    def test_the_symlink_spelling_of_a_synced_directory_maps_through_the_sync_rule(self):
+        """🛑 The rule that named roots alone cannot do. The other machine's transcript
+        records `<home>/shared/...`, its symlink spelling: no named root matches it, and
+        `home` to `home` would answer with this machine's symlink instead of the folder the
+        sync client really keeps."""
+        self.assertEqual(self.t("desktop", "/home/two/shared/proj"),
+                         self.real_sync + "/proj")
+
+    def test_the_sync_rule_is_tried_before_home_to_home(self):
+        # with no sync directory configured, the same path falls through to home -> home
+        self.mod.SYNC_DIRS = ()
+        self.assertEqual(self.t("desktop", "/home/two/shared/proj"),
+                         str(self.here_home) + "/shared/proj")
+
+    def test_two_machines_that_spell_a_folder_the_same_way_need_no_translation(self):
+        self.assertEqual(self.t("twin", str(self.here_home) + "/code/app"), "")
+
+    def test_a_folder_outside_every_root_is_left_alone(self):
+        self.assertEqual(self.t("desktop", "/opt/data/run1"), "")
+
+    def test_a_label_only_one_machine_has_is_no_rule(self):
+        # `lab` has no usable `sync`, so only its home can map
+        self.assertEqual(self.t("lab", "/home/lab/sync/x"), str(self.here_home) + "/sync/x")
+
+    def test_a_machine_the_file_does_not_name_takes_its_home_from_the_transcript_path(self):
+        self.assertEqual(
+            self.t("newbox", "/home/other/code/p",
+                   "/home/other/.claude-work/projects/-home-other-code-p/a.jsonl"),
+            str(self.here_home) + "/code/p")
+
+    def test_with_no_machines_file_at_all_only_home_to_home_applies(self):
+        self.mod.MACHINES_FILE = self.root / "nope.json"
+        self.assertEqual(self.t("desktop", "/home/two/code/app", ""), "")
+        self.assertEqual(
+            self.t("desktop", "/home/two/code/app", "/home/two/.claude/projects/x/a.jsonl"),
+            str(self.here_home) + "/code/app")
+
+    def test_an_unparseable_machines_file_is_not_a_crash(self):
+        self.mj.write_text("{ not json")
+        self.assertEqual(self.t("desktop", "/home/two/code/app"), "")
+
+    def test_an_empty_cwd_translates_to_nothing(self):
+        self.assertEqual(self.t("desktop", ""), "")
+
+    def test_in_sync_dir_knows_the_synced_tree_through_the_symlink(self):
+        self.assertTrue(self.mod.in_sync_dir(str(self.here_home / "shared" / "p")))
+        self.assertTrue(self.mod.in_sync_dir(self.real_sync))
+        self.assertFalse(self.mod.in_sync_dir(str(self.here_home / "code")))
+        self.mod.SYNC_DIRS = ()
+        self.assertFalse(self.mod.in_sync_dir(str(self.here_home / "shared" / "p")),
+                         "with nothing configured, no folder is the same folder anywhere")
+
+    def test_machine_roots_reads_only_absolute_string_values(self):
+        got = self.mod.machine_roots("lab")
+        self.assertEqual(got, {"home": "/home/lab"})
+
+    def test_a_machine_with_no_entry_and_no_guess_has_no_roots(self):
+        self.assertEqual(self.mod.machine_roots("newbox"), {})
+
+
+class OriginAccount(unittest.TestCase):
+    """The synthesised source of a cross-machine move."""
+
+    def setUp(self):
+        self.mod = load_tool()
+        self.addCleanup(sys.modules.pop, "csm_mod", None)
+
+    def test_the_name_carries_the_machine_so_it_can_never_equal_a_target(self):
+        a = self.mod.origin_account("desktop", {"home": "/home/two/.claude-work",
+                                                "email": "you@work.example",
+                                                "org": "org-1"})
+        self.assertEqual(a.name, "desktop:.claude-work")
+        self.assertEqual(a.email, "you@work.example")
+        self.assertEqual(a.org, "org-1")
+        self.assertEqual(a.machines, ("desktop",))
+        self.assertIn("@desktop", a.label)
+
+    def test_a_known_login_lends_its_label_to_the_remote_row(self):
+        accts = [self.mod.Account("work", Path("/x"), handle="wk",
+                                  _oauth={"emailAddress": "you@work.example"})]
+        a = self.mod.origin_account("desktop", {"home": "/home/two/.claude-work",
+                                                "email": "you@work.example"}, accts)
+        self.assertEqual(a.label, "wk@desktop")
+
+    def test_a_home_with_no_login_recorded_there_is_not_invented(self):
+        a = self.mod.origin_account("desktop", {"home": "/home/two/.claude"})
+        self.assertEqual(a.email, "")
+        self.assertEqual(a.label, ".claude@desktop")
+
+
 class RunWindow(Base):
+    # ⚠️ `kind` and `version` are what `make_plan` stamps on every plan it writes, so a
+    # fixture without them is a file the tool would never produce — and since `__run` now
+    # identifies a plan before deleting it, it is also not one it would accept.
+    PLAN = {"kind": "csm-run", "version": 1, "config_dir": None, "local_id": SID_A,
+            "rc_name": None, "perm": "plan", "model": "", "path": "", "title": "t",
+            "from": "a", "to": "b", "window": "moved-x", "session": "csm-b"}
+
     def test_plan_is_read_once_and_the_window_reports_the_exit(self):
         plan = self.w.root / "plan.json"
-        plan.write_text(json.dumps({
-            "cwd": str(self.w.work), "config_dir": None, "local_id": SID_A, "rc_name": None,
-            "perm": "plan", "model": "", "claude": str(self.w.bin / "claude"), "path": "",
-            "title": "t", "from": "a", "to": "b", "window": "moved-x", "session": "csm-b"}))
+        plan.write_text(json.dumps(dict(
+            self.PLAN, cwd=str(self.w.work), claude=str(self.w.bin / "claude"))))
         r = subprocess.run([PY, str(TOOL), "__run", str(plan)], capture_output=True, text=True,
                            env=self.w.env(FAKE_CLAUDE_SLEEP="0", FAKE_CLAUDE_RC="3",
                                           CLAUDE_CONFIG_DIR="/should/be/unset"))
@@ -920,6 +2291,22 @@ class RunWindow(Base):
         call = self.w.claude_calls()[0]
         self.assertNotIn("CLAUDE_CONFIG_DIR", call["env"])
         self.assertEqual(call["argv"], ["--permission-mode", "plan", "--resume", SID_A])
+
+    def test_a_file_that_is_not_a_plan_is_neither_deleted_nor_run(self):
+        """🛑 `__run`'s next two steps are "unlink this path" and "exec what this JSON
+        names". `make_plan` has always stamped `kind`, and nothing read it — so pointed by
+        hand or by a typo at another JSON file, `__run` deleted it and then tried to start
+        whatever its `claude` key said, in whatever `cwd` it named."""
+        other = self.w.root / "not-a-plan.json"
+        other.write_text(json.dumps(
+            {"claude": str(self.w.bin / "claude"), "cwd": str(self.w.work),
+             "local_id": SID_A, "perm": "plan"}))
+        r = subprocess.run([PY, str(TOOL), "__run", str(other)], capture_output=True,
+                           text=True, env=self.w.env(FAKE_CLAUDE_SLEEP="0"))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("is not a csm run plan", r.stderr)
+        self.assertTrue(other.exists(), "it deleted a file that was not its hand-off")
+        self.assertEqual(self.w.claude_calls(wait=0.2), [], "nothing was started")
 
 
 # ------------------------------------------------------------------ in-process fixtures
@@ -937,11 +2324,23 @@ class InProc(unittest.TestCase):
         self.mod = load_tool()
         self.addCleanup(self._tmp.cleanup)
         self.addCleanup(sys.modules.pop, "csm_mod", None)
-        # module-level env reads happen at import: point them at the tempdir afterwards
+        # 🛑 EVERY module-level path, not just the obvious three. These are read at IMPORT,
+        # from the real environment, so one left alone is a test reading — or writing —
+        # the machine's own state: the pane captures, the accounts table, the quota meter,
+        # the owner directory, the machine's shared settings home. A test that reads a
+        # real file passes here and means nothing anywhere else, and the one that WRITES
+        # one is worse. A test that wants any of these points it at its own fixture.
         self.mod.HOME = self.root / "home"
         self.mod.LOG = self.root / "log"
         self.mod.STATE_DIR = self.root / "state"
         self.mod.PICKS = self.root / "picks.json"
+        self.mod.CAPTURES = self.root / "captures"
+        self.mod.IMPORTS = self.root / "imports"
+        self.mod.SHARED_HOME = self.root / "home" / ".claude"
+        self.mod.ACCOUNTS_FILE = self.root / "accounts"
+        self.mod.MACHINES_FILE = self.root / "machines.json"
+        self.mod.METERS_FILE = self.root / "meters.json"
+        self.mod.BOTS_DIR = self.root / "owners"
         self.mod.LOGIN_PROBE = "true"
         self.procs = []
         self.addCleanup(self.kill_all)
@@ -1522,7 +2921,16 @@ class MemoryStore(InProc):
         self.assertTrue(slug)
         self.assertEqual(slug, self.mod.memory_slug(str(repo)))
         self.assertNotIn("/", slug)
-        self.assertEqual(self.mod.memory_slug(str(self.root / "work")), "")  # no repo: ""
+
+    def test_a_folder_that_is_no_git_tree_is_keyed_on_its_own_path(self):
+        # 🛑 It has a store all the same, under the slug of its own realpath. Returning ""
+        # here put a literal `<project>` in the move note — a path nothing matches, handed
+        # to a session the same note tells to write its notes nowhere else.
+        plain = self.root / "work"
+        slug = self.mod.memory_slug(str(plain))
+        self.assertEqual(slug, re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(str(plain))))
+        self.assertNotIn("/", slug)
+        self.assertEqual(self.mod.memory_slug(""), "")   # nothing to key on at all
 
     def notes(self, src, tgt):
         mem = src.transcript.parent / "memory"
@@ -1682,6 +3090,30 @@ class SettingsResolution(InProc):
 
 # ------------------------------------------------------------------- the side data
 
+class OtherHomes(InProc):
+    """Which homes the live-twin check asks, and the one case a cross-machine move changes."""
+
+    def test_a_cross_machine_source_home_is_not_excluded_from_the_twin_check(self):
+        """🛑 Two machines often spell one config home identically (the same user name).
+        For a `--from-machine` move `s.account.home` is a path over THERE, so excluding
+        this machine's home of the same name would drop a real local home from the check
+        and let a move land on a transcript a local process is writing."""
+        a = self.account("work")
+        b = self.account("personal", email="me@home.example")
+        s = self.session(a)
+        self.assertNotIn("work", [x.name for x in self.mod.other_homes(s, b, [a, b])],
+                         "on one machine the source is the source, and not a third home")
+        s.origin = "desktop"
+        self.assertIn("work", [x.name for x in self.mod.other_homes(s, b, [a, b])])
+
+    def test_the_target_is_always_excluded(self):
+        a = self.account("work")
+        b = self.account("personal", email="me@home.example")
+        s = self.session(a)
+        s.origin = "desktop"
+        self.assertNotIn("personal", [x.name for x in self.mod.other_homes(s, b, [a, b])])
+
+
 class SideData(InProc):
     def test_the_sessions_own_side_data_travels_additively(self):
         src_a = self.account("work")
@@ -1697,6 +3129,22 @@ class SideData(InProc):
         self.mod.copy_in(s, tgt, apply=True)
         self.assertEqual((mine / "abc@v1").read_text(), "the target's own, newer")
         self.assertTrue((tgt.home / "tasks" / SID_A / "t1.json").exists())
+
+    def test_side_data_never_crosses_machines(self):
+        """🛑 For a `--from-machine` move the source home is a path on the OTHER machine,
+        and two machines often spell one home identically. Reading it here would pick up
+        THIS machine's `file-history/<id>/` — an earlier local copy's rewind history — and
+        file it under the moved session as if it were its own."""
+        src_a = self.account("work")
+        tgt = self.account("personal", email="me@home.example", org="org-2")
+        s = self.session(src_a)
+        (src_a.home / "file-history" / SID_A).mkdir(parents=True)
+        (src_a.home / "file-history" / SID_A / "abc@v1").write_text("one")
+        self.assertTrue(self.mod.side_data(s, tgt), "on one machine it travels")
+        s.origin = "desktop"
+        self.assertEqual(self.mod.side_data(s, tgt), [])
+        self.mod.copy_in(s, tgt, apply=True)
+        self.assertFalse((tgt.home / "file-history" / SID_A).exists())
 
     def test_nothing_else_from_the_home_is_ever_carried(self):
         src_a = self.account("work")
@@ -1738,6 +3186,38 @@ class Scrub(InProc):
         for kept in MINE:
             self.assertEqual(out[kept], MINE[kept])
         self.assertEqual(self.mod.SCRUB_PREFIXES, ("CLAUDE", "ANTHROPIC"))
+
+    def test_csm_keep_env_puts_back_exactly_what_it_names_and_nothing_else(self):
+        env = dict(DIRTY)
+        env["CLAUDE_SESSION_TOOL_ACCOUNTS"] = "/etc/accounts"
+        self.mod.KEEP_EXACT = frozenset({"CLAUDE_SESSION_TOOL_ACCOUNTS"})
+        out = self.mod.scrubbed_env(env)
+        self.assertEqual(out["CLAUDE_SESSION_TOOL_ACCOUNTS"], "/etc/accounts")
+        for gone in DIRTY:
+            self.assertNotIn(gone, out, gone)
+
+    def test_a_name_outside_the_two_families_is_not_a_keep_list_entry(self):
+        # 🛑 The knob is a put-back inside the scrub, not a general allowlist: a name the
+        # scrub never touches has no business being named here, and honouring it would turn
+        # one env var into a way to re-open the families it is carved out of.
+        import subprocess as sp
+        r = sp.run([PY, "-I", "-c", "import os, importlib.machinery as m, importlib.util as u;"
+                    "import sys;l=m.SourceFileLoader('csm_x', %r);"
+                    "s=u.spec_from_loader('csm_x', l);"
+                    "mod=u.module_from_spec(s);sys.modules['csm_x']=mod;"
+                    "l.exec_module(mod);"
+                    "print(sorted(mod.KEEP_EXACT))" % str(TOOL)],
+                   capture_output=True, text=True,
+                   env=dict(os.environ, CSM_KEEP_ENV="AWS_PROFILE,CLAUDE_X,PATH"))
+        self.assertEqual(r.stdout.strip(), "['CLAUDE_X']", r.stdout + r.stderr)
+
+    def test_the_test_only_knobs_never_follow_a_move(self):
+        # A stale export of one of these inside a moved window would force a credential
+        # probe's answer, or make "the other machine" this very process.
+        out = self.mod.scrubbed_env({"CSM_LOGIN_PROBE": "true", "CSM_REMOTE_LOCAL": "1",
+                                     "CSM_REMOTE_HOME": "/x", "CSM_TMUX_SOCKET": "sock",
+                                     "CSM_POLL": "0.05"})
+        self.assertEqual(sorted(out), ["CSM_POLL", "CSM_TMUX_SOCKET"])
 
 
 # --------------------------------------------------------------------- the login probe
@@ -1908,7 +3388,11 @@ class OnOtherMachines(InProc):
             self.assertTrue(argv[-1].endswith("move host --to work"), argv)
             self.assertNotIn("--ssh", argv[-1])
 
-    def test_the_help_says_a_move_never_crosses_machines(self):
+    def test_the_help_distinguishes_the_two_ways_a_second_machine_is_involved(self):
+        """🛑 The two are confusable and the help has to separate them: `--machine M` runs
+        the command OVER THERE and brings nothing here, while `move --from-machine M`
+        brings a session here. The help used to say a move never crosses machines at all,
+        which `--from-machine` made untrue."""
         import argparse
         import contextlib
         import io
@@ -1916,7 +3400,10 @@ class OnOtherMachines(InProc):
         with contextlib.redirect_stdout(out):
             with self.assertRaises(SystemExit):
                 self.mod.main(["--help"])
-        self.assertIn("ONE machine", out.getvalue())
+        txt = out.getvalue()
+        self.assertIn("Both homes are on this machine", txt)
+        self.assertIn("--from-machine", txt)
+        self.assertIn("It brings nothing here", txt)
         self.assertIsInstance(argparse.ArgumentParser(), argparse.ArgumentParser)
 
 
@@ -2087,9 +3574,10 @@ class MoveNotes(Base):
         self.assertIn("UNVERIFIED", self.ok(self.w.run("accounts",
                                                        CSM_LOGIN_PROBE="unknown")))
 
-    def test_the_one_machine_limit_is_in_the_help(self):
+    def test_the_one_machine_default_and_its_one_exception_are_in_the_help(self):
         out = self.ok(self.w.run("--help"))
-        self.assertIn("ONE machine", out)
+        self.assertIn("Both homes are on this machine", out)
+        self.assertIn("`move --from-machine M` brings the session over", out)
 
 
 class MoveCost(Base):
@@ -2219,8 +3707,8 @@ class Stop(Base):
         self.move()
         cwd = str(self.w.work)
         self.w.session(self.personal, SID_B, lines=[user("mine", cwd, SID_B)])
-        self.refused(self.w.run("stop", SID_B), "not a session csm moved",
-                     "moved-11111111")
+        self.refused(self.w.run("stop", SID_B), "csm did not start",
+                     "csm only ends what it started", "moved-11111111")
 
     def test_a_dry_run_stops_nothing(self):
         self.move()
@@ -2278,8 +3766,815 @@ class Stop(Base):
                      "from another session")
 
     def test_with_no_tmux_session_at_all_it_refuses_rather_than_fails(self):
-        self.refused(self.w.run("stop", SID_A), "not a session csm moved",
+        self.refused(self.w.run("stop", SID_A), "csm did not start",
                      "csm has moved nothing here")
+
+    # --- CSM_TMUX_SESSION: a tmux session per account that is already yours -------
+
+    def test_the_window_goes_in_the_tmux_session_the_template_names(self):
+        tsv = self.w.table(("work", "me@work.example", self.work, "laptop", "w"),
+                           ("personal", "me@home.example", self.personal, "laptop", "p"))
+        env = {"CSM_TMUX_SESSION": "mine-{handle}", "CSM_ACCOUNTS": str(tsv),
+               "CSM_MACHINE": "laptop"}
+        out = self.ok(self.w.run("move", SID_A, "--to", "personal", **env))
+        self.assertIn("mine-p:moved-11111111", out)
+        self.assertEqual(self.windows(), {"mine-p": ["moved-11111111"]})
+
+    def test_a_window_moved_under_one_template_is_still_stopped_under_it(self):
+        """🛑 The reason the knob exists. `stop`'s whole candidate set is the `moved-`
+        windows of each account's tmux session, so a session already moved is only
+        reachable while that session is spelled the way the move spelled it."""
+        env = {"CSM_TMUX_SESSION": "mine-{name}"}
+        self.ok(self.w.run("move", SID_A, "--to", "personal", **env))
+        self.assertEqual(self.windows(), {"mine-personal": ["moved-11111111"]})
+        # The DEFAULT spelling cannot see it. It refuses — here as "which copy did you
+        # mean", because without the `moved-` window to point at the copy the id sits in
+        # two homes — and nothing is signalled or closed either way.
+        r = self.w.run("stop", SID_A)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual(self.windows(), {"mine-personal": ["moved-11111111"]})
+        # and named by its row, so is the copy, it is the window that cannot be found
+        row = str([x["pos"] for x in json.loads(self.ok(self.w.run("list", "--json")))
+                   if x["account"] == "personal" and x["local_id"] == SID_A][0])
+        self.refused(self.w.run("stop", row), "csm has moved nothing here")
+        self.assertEqual(self.windows(), {"mine-personal": ["moved-11111111"]})
+        # the spelling it was opened under does
+        out = self.ok(self.w.run("stop", SID_A, **env))
+        self.assertIn("✅ stopped", out)
+        self.assertEqual(self.windows(), {"mine-personal": []})
+
+    def test_a_template_naming_nothing_it_knows_falls_back_instead_of_failing(self):
+        # a bad knob must not take `move` down: the default spelling is used
+        out = self.ok(self.w.run("move", SID_A, "--to", "personal",
+                                 CSM_TMUX_SESSION="broken-{nosuchfield}"))
+        self.assertIn("csm-personal:moved-11111111", out)
+        self.assertEqual(self.windows(), {"csm-personal": ["moved-11111111"]})
+
+    def test_a_template_may_not_smuggle_a_dot_or_a_colon_into_a_session_name(self):
+        # tmux reads `a:b.c` as session:window.pane, so the name is sanitised whatever
+        # the template said
+        self.ok(self.w.run("move", SID_A, "--to", "personal",
+                           CSM_TMUX_SESSION="a.b:c-{name}"))
+        self.assertEqual(self.windows(), {"a-b-c-personal": ["moved-11111111"]})
+
+    def test_a_name_that_would_read_as_a_flag_is_not_passed_to_tmux_as_one(self):
+        # the name goes to `tmux -s` and `-t`, so a leading hyphen is dropped rather than
+        # handed to tmux as an option
+        self.ok(self.w.run("move", SID_A, "--to", "personal",
+                           CSM_TMUX_SESSION=".x-{name}"))
+        self.assertEqual(self.windows(), {"x-personal": ["moved-11111111"]})
+
+    def test_a_template_that_sanitises_away_to_nothing_falls_back(self):
+        self.ok(self.w.run("move", SID_A, "--to", "personal", CSM_TMUX_SESSION=":::"))
+        self.assertEqual(self.windows(), {"csm-personal": ["moved-11111111"]})
+
+
+# -------------------------------------------------------------------------- csm modes
+
+class Modes(Base):
+    """`csm modes` — which LIVE sessions run weaker than this machine's defaultMode.
+
+    Why the subcommand exists: a settings check reads the FILE, and the file can be right on
+    every machine while a live Remote Control worker sits in `auto`, because such a worker
+    records the mode the stored session record holds rather than the one its server was
+    started with. The exit contract is the one scheduled callers read: 0 `ok:`, 1 `FAULT:`,
+    3 `INCOMPLETE:` — unknown is never ok.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # An accounts file, so discovery never turns the SHARED settings home below into a
+        # third account, and so the rows print handles the way a configured install does.
+        self.third = self.w.account("elsewhere", "me@other.example")
+        self.tsv = self.w.table(("work", "me@work.example", self.work, "laptop", "w"),
+                                ("personal", "me@home.example", self.personal, "laptop", "p"),
+                                ("elsewhere", "me@other.example", self.third, "desktop", "e"))
+        self.shared = self.w.home / ".claude"
+        self.shared.mkdir(exist_ok=True)
+        self.default_mode("bypassPermissions")
+
+    def default_mode(self, mode):
+        f = self.shared / "settings.json"
+        f.write_text(json.dumps({"permissions": {"defaultMode": mode} if mode
+                                 else {}}))
+
+    def csm(self, *args, **env):
+        """⚠️ NOT called `run`: a method of that name shadows `TestCase.run` and the
+        fixture is never built at all."""
+        e = {"CSM_ACCOUNTS": str(self.tsv), "CSM_MACHINE": "laptop"}
+        e.update(env)
+        return self.w.run(*args, **e)
+
+    def listing(self, *extra):
+        return json.loads(self.ok(self.csm("list", "--json", *extra)))
+
+    def worker(self, sid, perm, home=None, title=None, status="idle", entrypoint="sdk-cli",
+               pid=None, proc_start=None, empty=False, argv_tail=()):
+        """One live session: a transcript (or an empty one) plus a live registry row."""
+        home = self.work if home is None else home
+        cwd = str(self.w.work)
+        if empty:
+            self.w.session(home, sid, lines=[])
+        else:
+            self.w.session(home, sid, lines=[
+                user(title or "Phone work", cwd, sid, perm=perm or None),
+                assistant("ok", cwd, sid)])
+        p = self.w.spawn(argv_tail=argv_tail) if pid is None else None
+        pid = p.pid if p is not None else pid
+        self.w.live(home, sid, pid, status=status, entrypoint=entrypoint,
+                    proc_start=proc_start)
+        return pid
+
+    def report(self, *args):
+        r = self.csm("modes", "--json", *args)
+        self.assertIn(r.returncode, (0, 1, 3), r.stdout + r.stderr)
+        return json.loads(r.stdout)
+
+    # --- the verdicts ----------------------------------------------------
+
+    def test_a_remote_control_worker_in_auto_is_a_fault_and_check_exits_1(self):
+        self.worker(SID_A, "auto", title="Stuck in auto")
+        rep = self.report()
+        self.assertEqual(rep["faults"], 1)
+        self.assertEqual(rep["default_mode"], "bypassPermissions")
+        row = rep["rows"][0]
+        self.assertEqual((row["mode"], row["verdict"], row["mode_source"]),
+                         ("auto", "fault", "its transcript"))
+        r = self.csm("modes", "--check")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertTrue(r.stdout.startswith("FAULT: "), r.stdout)
+        self.assertIn("auto", r.stdout)
+        self.assertIn("w 11111111 (auto)", r.stdout)       # the HANDLE, not the name
+
+    def test_everything_at_the_machines_mode_reads_ok_and_exits_0(self):
+        self.worker(SID_A, "bypassPermissions")
+        r = self.csm("modes", "--check")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(r.stdout.startswith("ok: "), r.stdout)
+        self.assertEqual(self.report()["faults"], 0)
+
+    def test_plan_and_accept_edits_are_deliberate_and_never_faults(self):
+        self.worker(SID_A, "plan")
+        self.worker(SID_B, "acceptEdits")
+        rep = self.report()
+        self.assertEqual((rep["faults"], rep["deliberate"]), (0, 2))
+        self.assertEqual(self.csm("modes", "--check").returncode, 0)
+
+    def test_a_terminal_session_is_reported_but_is_not_a_fault(self):
+        # entrypoint `cli` = somebody started it themselves; its mode is their own choice.
+        self.worker(SID_A, "default", entrypoint="cli")
+        rep = self.report()
+        self.assertEqual((rep["faults"], rep["deliberate"]), (0, 1))
+        self.assertIn("not spawned by a Remote Control server", rep["rows"][0]["why"])
+
+    def test_no_defaultMode_on_this_machine_is_INCOMPLETE_not_ok(self):
+        self.default_mode(None)
+        self.worker(SID_A, "auto")
+        r = self.csm("modes", "--check")
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertTrue(r.stdout.startswith("INCOMPLETE: "), r.stdout)
+        self.assertIn("(no defaultMode on this machine)", r.stdout)
+        self.assertEqual(self.report()["unknown"], 1)
+
+    def test_a_quiet_machine_with_no_defaultMode_still_reads_as_a_sentence(self):
+        """🛑 The other side of the one above, and the FIRST thing a fresh install prints.
+        With nothing live there is nothing to judge, so this is the `ok:` path — and that
+        path used to interpolate an empty `default_mode` raw, giving `ok: every live
+        session is at  or stronger`: a malformed sentence, with a double space where the
+        mode should be, in the one line this tool promises to keep stable, claiming
+        sessions are at or stronger than a baseline that is not there. `render_modes` has
+        always said `(none named)` for the same reading.
+        """
+        self.default_mode(None)
+        r = self.csm("modes", "--check")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(r.stdout.startswith("ok: "), r.stdout)
+        self.assertIn("(no defaultMode on this machine)", r.stdout)
+        self.assertNotIn("is at  or stronger", r.stdout)
+        self.assertNotIn("  ", r.stdout.strip())      # no hole where a value belongs
+        self.assertEqual(len(r.stdout.strip().splitlines()), 1, r.stdout)
+        self.assertEqual(r.stderr, "")
+
+    def test_a_machine_that_names_a_default_is_unchanged_byte_for_byte(self):
+        """The fallback above may not cost a byte on the path a scheduled caller reads: it
+        is a prefix-matched contract, and every machine that has been set up names a mode.
+        """
+        self.worker(SID_A, "bypassPermissions")
+        r = self.csm("modes", "--check")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(r.stdout.startswith(
+            "ok: every live session is at bypassPermissions or stronger — "), r.stdout)
+        self.assertNotIn("no defaultMode", r.stdout)
+
+    def test_an_unknown_mode_is_never_judged_and_never_ok(self):
+        self.worker(SID_A, "telepathy")
+        rep = self.report()
+        self.assertEqual((rep["faults"], rep["unknown"]), (0, 1))
+        self.assertIn("not a mode this tool knows", rep["rows"][0]["why"])
+        self.assertEqual(self.csm("modes", "--check").returncode, 3)
+
+    def test_a_live_session_list_drops_is_still_counted_here(self):
+        """🛑 The hole this subcommand was written around: a server's pre-created session
+        has a 0-byte transcript, which `list`'s subagent rule skips. `modes` reads every
+        live registry row and puts what it could not measure in `coverage.unread`."""
+        pid = self.worker(SID_A, "", empty=True)
+        self.assertEqual(self.listing(), [])                 # list cannot see it
+        rep = self.report()
+        self.assertEqual(rep["live"], 1)
+        self.assertEqual(len(rep["coverage"]["unread"]), 1)
+        u = rep["coverage"]["unread"][0]
+        self.assertIn("pid %d" % pid, u["name"])
+        self.assertIn("0 bytes", u["reason"])
+        self.assertIsNotNone(u["age_s"])
+        r = self.csm("modes", "--check")
+        self.assertEqual(r.returncode, 3, r.stdout)
+        self.assertTrue(r.stdout.startswith("INCOMPLETE: "), r.stdout)
+
+    def test_the_launch_mode_is_read_off_the_live_command_line(self):
+        """A session with nothing recorded is not unknown if its own argv says the mode."""
+        self.worker(SID_A, "", empty=True,
+                    argv_tail=("--permission-mode", "bypassPermissions"))
+        rep = self.report()
+        row = rep["rows"][0]
+        self.assertEqual((row["mode"], row["mode_source"], row["verdict"]),
+                         ("bypassPermissions", "its own command line", "ok"))
+        self.assertEqual(rep["coverage"]["unread"], [])
+        self.assertEqual(self.csm("modes", "--check").returncode, 0)
+
+    def test_coverage_names_the_homes_read_and_the_ones_with_none(self):
+        self.worker(SID_A, "bypassPermissions")
+        shutil.rmtree(str(self.personal))
+        cov = self.report()["coverage"]
+        self.assertIn("w", cov["read"])
+        self.assertIn("p", cov["absent"])     # no home here: nothing of theirs runs here
+        self.assertNotIn("e", cov["read"] + cov["absent"])   # on another machine
+        self.assertEqual(cov["unread"], [])
+
+    def test_a_row_the_table_puts_on_no_machine_is_not_swept(self):
+        """`machines` = `-` means "on no machine": there is nothing there to measure. It is
+        not the same as a table that never named machines at all, which sweeps every row."""
+        nowhere = self.w.account("nowhere", "me@nowhere.example")
+        self.tsv = self.w.table(
+            ("work", "me@work.example", self.work, "laptop", "w"),
+            ("nowhere", "me@nowhere.example", nowhere, "-", "n"))
+        self.worker(SID_A, "bypassPermissions")
+        cov = self.report()["coverage"]
+        self.assertEqual(cov["read"], ["w"])
+        self.assertNotIn("n", cov["read"] + cov["absent"])
+
+    def test_a_registry_file_that_will_not_parse_is_unread_not_absent(self):
+        """🛑 An unreadable registry row beside a LIVE pid used to read downstream exactly
+        like "this home runs nothing" — the one answer that is never true."""
+        p = self.w.spawn()
+        (self.work / "sessions").mkdir(exist_ok=True)
+        (self.work / "sessions" / ("%d.json" % p.pid)).write_text("{not json")
+        rep = self.report()
+        self.assertEqual(rep["live"], 0)
+        self.assertEqual(len(rep["coverage"]["unread"]), 1)
+        u = rep["coverage"]["unread"][0]
+        self.assertIn("could not be read as JSON", u["reason"])
+        self.assertIn("pid %d" % p.pid, u["reason"])
+        r = self.csm("modes", "--check")
+        self.assertEqual(r.returncode, 3, r.stdout)
+        self.assertTrue(r.stdout.startswith("INCOMPLETE: "), r.stdout)
+
+    def test_a_home_with_no_sessions_directory_at_all_is_a_quiet_zero_not_unread(self):
+        """🛑 The other half of the one above, and the half a scheduled caller feels. The
+        CLI creates `sessions/` the first time a session runs in a home, so its ABSENCE is
+        a measurement — nothing has ever run there. Calling that "unread" would turn every
+        machine with a quiet home into a permanent INCOMPLETE, and a daily check reads a
+        permanent INCOMPLETE as a broken sweep.
+        """
+        self.worker(SID_A, "bypassPermissions")          # work gets a sessions/ dir
+        self.assertFalse((self.personal / "sessions").exists())
+        rep = self.report()
+        self.assertEqual(rep["coverage"]["unread"], [])
+        self.assertIn("p", rep["coverage"]["read"])
+        r = self.csm("modes", "--check")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(r.stdout.startswith("ok: "), r.stdout)
+
+    def test_a_registry_directory_that_will_not_open_is_unread_not_quiet(self):
+        """🛑 `modes --check` must say INCOMPLETE about a home it could not look into. The
+        bare `except OSError` under it returned `{}`, which reads downstream exactly like
+        "this home runs nothing" — so a locked-out home used to pass as ok."""
+        self.worker(SID_A, "bypassPermissions")
+        d = self.personal / "sessions"
+        d.mkdir(exist_ok=True)
+        os.chmod(str(d), 0o000)
+        # ⚠️ Restored in the test body, not with addCleanup: cleanups run AFTER tearDown,
+        # and tearDown is what deletes the fixture tree — which it cannot, through a 000
+        # directory.
+        try:
+            if os.access(str(d), os.R_OK):
+                self.skipTest("this filesystem or user ignores a 000 directory")
+            rep = self.report()
+            r = self.csm("modes", "--check")
+        finally:
+            os.chmod(str(d), 0o700)
+        unread = rep["coverage"]["unread"]
+        self.assertEqual(len(unread), 1, unread)
+        self.assertEqual(unread[0]["name"], "p")
+        self.assertIn("would not open", unread[0]["reason"])
+        self.assertIn("nothing says what is running", unread[0]["reason"])
+        self.assertIsNone(unread[0]["age_s"])
+        self.assertIn("p", rep["coverage"]["read"])     # read in part, not absent
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertTrue(r.stdout.startswith("INCOMPLETE: "), r.stdout)
+        self.assertEqual(r.stderr, "")
+
+    def test_a_ps_that_will_not_answer_is_unread_not_an_empty_machine(self):
+        """🛑 The third shape of the same mistake, in the sweep's OTHER prover. `ps_table`
+        asks `ps` once for the whole machine, and `subprocess.run` without `check` raises
+        for nothing — so a `ps` that rejects the argument spelling (a different `ps` than
+        the one this was measured against, a container's cut-down one) exits non-zero with
+        an empty stdout. Returning `{}` for that says every pid on the machine is gone, and
+        the sweep then explains an unread row with "pid N is not in `ps` output" — a claim
+        about a question it never got to ask, printed in the one `INCOMPLETE:` line a
+        scheduled caller reads.
+        """
+        self.worker(SID_A, None, empty=True)            # mode readable only from argv
+        ps = self.w.bin / "ps"                          # the fixture bin is FIRST on PATH
+        ps.write_text("#!/bin/sh\necho 'ps: illegal option' >&2\nexit 1\n")
+        ps.chmod(0o755)
+        rep = self.report()
+        self.assertIs(rep["coverage"]["ps"], False,
+                      "coverage claimed ps was read when it exited non-zero")
+        unread = rep["coverage"]["unread"]
+        self.assertEqual(len(unread), 1, unread)
+        self.assertIn("could not be asked", unread[0]["reason"])
+        self.assertNotIn("not in `ps` output", unread[0]["reason"])
+        r = self.csm("modes", "--check")
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertTrue(r.stdout.startswith("INCOMPLETE: "), r.stdout)
+        self.assertIn("could not be asked", r.stdout)
+        # the parsed contract survives a blinded prover: one line, and nothing on stderr
+        self.assertEqual(len(r.stdout.strip().splitlines()), 1, r.stdout)
+        self.assertEqual(r.stderr, "")
+
+    def test_the_account_filter_narrows_the_sweep(self):
+        self.worker(SID_A, "auto", home=self.work)
+        self.worker(SID_B, "auto", home=self.personal)
+        self.assertEqual(self.report()["faults"], 2)
+        rep = self.report("--account", "p")
+        self.assertEqual(rep["faults"], 1)
+        self.assertEqual(rep["coverage"]["read"], ["p"])
+
+    def test_an_unknown_account_is_one_refusal_and_not_a_traceback(self):
+        self.refused(self.csm("modes", "--account", "nope"), "is no account here")
+
+    # --- the one parsed line ---------------------------------------------
+
+    def test_the_ok_line_names_a_deliberate_session_instead_of_claiming_bypass(self):
+        """🛑 `ok:` may not say "every live session is at bypassPermissions or stronger"
+        while a session sits in `plan`. It is not a fault — somebody chose it — but the one
+        line a scheduled pass prints has to agree with the table above it."""
+        self.worker(SID_A, "plan", title="Planning")
+        r = self.csm("modes", "--check")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(r.stdout.startswith("ok: "), r.stdout)
+        self.assertNotIn("every live session is at bypassPermissions or stronger", r.stdout)
+        self.assertIn("1 deliberately weaker session(s)", r.stdout)
+        self.assertIn("(plan)", r.stdout)
+
+    def test_a_machine_with_nothing_running_reads_cleanly(self):
+        """A quiet machine once answered `0 live session(s) on laptop, ; 2 home(s) read` —
+        the dangling comma of an empty count list. It is a normal state."""
+        r = self.csm("modes", "--check")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("0 live session(s) on laptop;", r.stdout)
+        self.assertNotIn(", ;", r.stdout)
+        self.assertIn("live sessions: 0\n", self.ok(self.csm("modes")))
+
+    def test_check_writes_one_line_to_stdout_and_nothing_at_all_to_stderr(self):
+        """🛑 THE CONTRACT. A scheduled caller captures stdout AND stderr together, deletes
+        the newlines, truncates and matches the prefix — so one stray byte on either stream
+        turns a reading of the machine into a fault report about the tool. This runs with
+        the credential probe forced (which announces itself on stderr on every run that
+        touches it) and with a table row that is dropped (which is logged, never printed).
+        """
+        self.worker(SID_A, "bypassPermissions")
+        bad = self.w.table(("work", "me@work.example", self.work, "laptop", "w"),
+                           ("personal", "me@home.example", self.personal, "laptop", "-BAD"))
+        r = self.csm("modes", "--check", CSM_ACCOUNTS=str(bad))
+        self.assertEqual(r.stderr, "", "stderr must be EMPTY: %r" % r.stderr)
+        self.assertEqual(len(r.stdout.rstrip("\n").split("\n")), 1, r.stdout)
+        self.assertTrue(r.stdout.endswith("\n"))
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_a_numeric_knob_that_is_not_a_number_does_not_take_the_check_down(self):
+        """🛑 NOT A TRACEBACK, because of where these are read.
+
+        Every numeric knob is read at IMPORT time, so a `ValueError` there lands before
+        `main` has run — on every subcommand, `modes --check` included, whose whole promise
+        is one line on stdout and nothing on stderr. A scheduled caller then reports a
+        fault in the machine's permission modes when what happened is that somebody typed
+        `CSM_LIMIT=lots` in a shell profile. The knob falls back to its default and the log
+        says so, which is the rule the rest of the file follows for a value it cannot use.
+        """
+        self.worker(SID_A, "bypassPermissions")
+        log = self.w.root / "knoblog"
+        r = self.csm("modes", "--check", CSM_LIMIT="lots", CSM_METER_MAX_AGE="soon",
+                     CSM_LOG=str(log))
+        self.assertEqual(r.stderr, "", "stderr must be EMPTY: %r" % r.stderr)
+        self.assertEqual(len(r.stdout.rstrip("\n").split("\n")), 1, r.stdout)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertTrue(r.stdout.startswith("ok: "), r.stdout)
+        said = log.read_text()
+        self.assertIn("CSM_LIMIT='lots' is not a number: using 20", said)
+        self.assertIn("CSM_METER_MAX_AGE='soon' is not a number", said)
+        # and the default really is what took effect
+        self.assertIn("(default 20", self.ok(self.csm("list", "--help", CSM_LIMIT="lots")))
+
+    def test_the_check_line_survives_being_flattened_the_way_a_caller_flattens_it(self):
+        """What the callers actually do: `2>&1 | tr -d '\\n' | cut -c1-220`, then match the
+        prefix. The flattened line still has to start with the verdict."""
+        self.worker(SID_A, "auto")
+        r = self.csm("modes", "--check")
+        flat = (r.stdout + r.stderr).replace("\n", "")[:220]
+        self.assertTrue(flat.startswith("FAULT: "), flat)
+        self.assertEqual(r.returncode, 1)
+
+    def test_check_in_json_carries_the_line_and_its_exit_code(self):
+        self.worker(SID_A, "auto")
+        r = self.csm("modes", "--check", "--json")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        d = json.loads(r.stdout)
+        self.assertTrue(d["check"]["line"].startswith("FAULT: "))
+        self.assertEqual(d["check"]["exit"], 1)
+
+    # --- the restart plan ------------------------------------------------
+
+    def test_restart_idle_plans_the_idle_workers_and_apply_is_refused(self):
+        """🛑 `--apply` stays shut while `RESPAWN_VERIFIED` is False: the respawn itself is
+        measured, the MODE a respawned worker comes back in is not."""
+        pid = self.worker(SID_A, "auto")
+        r = self.csm("modes", "--restart-idle")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("SIGTERM  pid %d" % pid, r.stdout)
+        self.assertIn("--apply is REFUSED", r.stdout)
+        self.assertIn("dry run — nothing was signalled", r.stdout)
+        a = self.csm("modes", "--restart-idle", "--apply")
+        self.assertEqual(a.returncode, 2, a.stdout + a.stderr)
+        self.assertIn("refused", a.stderr)
+        self.assertIn("would be SIGTERMed", a.stdout)       # the plan is still printed
+        os.kill(pid, 0)                     # still there: nothing was signalled
+
+    def test_restart_idle_refuses_a_busy_row_a_reused_pid_and_a_pid_that_is_not_claude(self):
+        busy = self.worker(SID_A, "auto", status="busy")
+        other = self.w.spawn()
+        self.worker(SID_B, "auto", home=self.personal, pid=other.pid,
+                    proc_start="Mon Jan  1 00:00:00 2001")
+        notclaude = self.w.spawn("sleep")
+        self.worker(SID_C, "auto", home=self.third, pid=notclaude.pid,
+                    proc_start=ps_start(notclaude.pid))
+        self.tsv = self.w.table(
+            ("work", "me@work.example", self.work, "laptop", "w"),
+            ("personal", "me@home.example", self.personal, "laptop", "p"),
+            ("elsewhere", "me@other.example", self.third, "laptop", "e"))
+        r = self.csm("modes", "--restart-idle")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("  SIGTERM  pid", r.stdout)
+        self.assertIn("0 idle Remote Control worker(s) would be SIGTERMed", r.stdout)
+        self.assertIn("3 fault row(s) refused", r.stdout)
+        self.assertIn("not idle", r.stdout)
+        self.assertIn("has been reused", r.stdout)
+        self.assertIn("not running the Claude Code CLI", r.stdout)
+        for p in (busy, other.pid, notclaude.pid):
+            os.kill(p, 0)
+
+    def test_a_registry_row_with_no_start_time_is_refused_and_never_name_matched(self):
+        """🛑 There is NO name-based fallback. Accepting "argv[0] is the Claude Code CLI" as
+        proof when a row recorded no start time is exactly what pid reuse passes on a machine
+        running dozens of them."""
+        p = self.w.spawn()
+        self.worker(SID_A, "auto", pid=p.pid, proc_start="")
+        r = self.csm("modes", "--restart-idle")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("0 idle Remote Control worker(s) would be SIGTERMed", r.stdout)
+        self.assertIn("recorded no start time", r.stdout)
+        os.kill(p.pid, 0)
+
+    def test_the_restart_plan_in_json_says_it_applied_nothing(self):
+        pid = self.worker(SID_A, "auto")
+        r = self.csm("modes", "--restart-idle", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        res = json.loads(r.stdout)["restart"]
+        self.assertEqual((res["applied"], res["stopped"], res["respawn_verified"]),
+                         (False, [], False))
+        self.assertEqual(len(res["would_stop"]), 1)
+        os.kill(pid, 0)                     # still there: a plan signals nothing
+
+    def test_this_session_is_never_a_candidate_however_wrong_its_mode(self):
+        pid = self.worker(SID_A, "auto")
+        r = self.csm("modes", "--restart-idle", CLAUDE_CODE_SESSION_ID=SID_A)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("0 idle Remote Control worker(s) would be SIGTERMed", r.stdout)
+        self.assertIn("it is THIS session", r.stdout)
+        os.kill(pid, 0)
+
+    def test_the_table_header_lines_up_with_the_rows_under_it(self):
+        self.worker(SID_A, "auto", title="Phone work")
+        out = self.ok(self.csm("modes"))
+        head = next(l for l in out.splitlines() if l.lstrip().startswith("#  "))
+        row = next(l for l in out.splitlines() if " FAULT" in l)
+        for word in ("mode", "state", "age", "session"):
+            self.assertIn(word, head)
+        self.assertEqual(head.index("mode"), row.index("auto"),
+                         "the `mode` header is not over its column:\n%s\n%s" % (head, row))
+        self.assertEqual(head.index("session"), row.index(SID_A[:8]),
+                         "the `session` header is not over its column:\n%s\n%s"
+                         % (head, row))
+
+    def test_apply_on_its_own_is_refused_and_prints_no_reading_at_all(self):
+        """🛑 `--apply` is the only destructive switch here, and on its own it is a refusal,
+        not a flag quietly dropped: `csm modes --apply` used to print the read-only table
+        and exit 0 — a reading of the machine that looks exactly like a report of work
+        done."""
+        pid = self.worker(SID_A, "auto")
+        r = self.csm("modes", "--apply")
+        self.refused(r, "--apply does nothing on its own", "--restart-idle")
+        self.assertEqual(r.stdout, "", "a refusal may not also print a reading")
+        os.kill(pid, 0)
+
+    def test_the_advice_names_the_session_id_and_not_a_row_number(self):
+        """🛑 These row numbers are this sweep's; `csm move 3` resolves against whatever
+        `csm list` last wrote. An id means the same thing in both."""
+        self.worker(SID_A, "auto")
+        out = self.ok(self.csm("modes", "--restart-idle"))
+        self.assertIn("csm move %s --to <account>" % SID_A[:8], out)
+        self.assertIn("not a row number", out)
+
+
+class RestartApplyGate(InProc):
+    """`modes --restart-idle --apply`: the SIGTERM half, which the gate keeps shut today.
+
+    🛑 Why these run IN PROCESS and flip the constant themselves: `RESPAWN_VERIFIED` is
+    False in the shipped file and there is deliberately no environment variable that can
+    turn it on — a stray export in a scheduled pass must never be able to stop a session. So
+    the CLI path is pinned above (nothing signalled, exit 2), and the behaviour AFTER the one
+    experiment in `RESPAWN_VERIFIED`'s note is pinned here, against this suite's own
+    throwaway processes.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.mod.RESPAWN_VERIFIED = True                 # the experiment, pretended done
+        self.mod.CAPTURES = self.root / "captures"
+
+    def row(self, pid, **extra):
+        r = {"pos": 1, "verdict": "fault", "handle": "w", "account": "work",
+             "home": str(self.root / "home" / ".claude-work"), "local_id": SID_A,
+             "short": SID_A[:8], "pid": pid, "proc_start": ps_start(pid), "mode": "auto",
+             "status": "idle", "entrypoint": "sdk-cli", "is_self": False,
+             "is_server": False, "hosts_itself": False, "tmux": "", "transcript": "",
+             "mtime": 0.0, "title": "Stuck in auto", "age": "3h"}
+        r.update(extra)
+        return r
+
+    def gone(self, pid, seconds=5.0):
+        """The signal this suite's own child died of, or None if it is still running.
+
+        ⚠️ Not `os.kill(pid, 0)`: this process is the child's parent and does not reap it,
+        so a SIGTERMed child is a ZOMBIE and `kill(pid, 0)` still succeeds. `wait()` is what
+        tells the two apart, and its return code names the signal (−15 = SIGTERM).
+        """
+        kid = next((k for k in self.procs if k.pid == pid), None)
+        self.assertIsNotNone(kid, "pid %d is not one of this test's children" % pid)
+        try:
+            return kid.wait(timeout=seconds)
+        except subprocess.TimeoutExpired:
+            return None
+
+    def test_a_proven_idle_worker_is_signalled_and_reported(self):
+        pid = self.claude_proc().pid
+        done, failed = self.mod.apply_restart([self.row(pid)])
+        self.assertEqual(([r["pid"] for r in done], failed), ([pid], []))
+        self.assertEqual(self.gone(pid), -15, "pid %d was not SIGTERMed" % pid)
+        self.assertIn("SIGTERM pid %d" % pid, self.mod.LOG.read_text())
+
+    def test_the_refusals_are_read_again_between_the_plan_and_the_kill(self):
+        """A plan is not a licence: a row that turned busy, or is a server, or is this
+        session, is left alone even though it reached `apply_restart`."""
+        cases = [("status", "busy", "not idle"),
+                 ("is_self", True, "THIS session"),
+                 ("is_server", True, "SERVER"),
+                 ("hosts_itself", True, "hosts its own"),
+                 ("entrypoint", "cli", "not sdk-cli"),
+                 ("verdict", "info", "not fault")]
+        for field, value, words in cases:
+            with self.subTest(field=field):
+                pid = self.claude_proc().pid
+                done, failed = self.mod.apply_restart([self.row(pid, **{field: value})])
+                self.assertEqual(done, [])
+                self.assertEqual(len(failed), 1)
+                self.assertIn(words, failed[0][1])
+                self.assertIn("left alone at the last gate", failed[0][1])
+                os.kill(pid, 0)                                   # untouched
+
+    def test_a_pid_whose_start_time_does_not_match_is_never_signalled(self):
+        pid = self.claude_proc().pid
+        done, failed = self.mod.apply_restart(
+            [self.row(pid, proc_start="Mon Jan  1 00:00:00 2001")])
+        self.assertEqual(done, [])
+        self.assertIn("has been reused", failed[0][1])
+        os.kill(pid, 0)
+
+    def test_a_pid_that_is_not_a_claude_is_never_signalled(self):
+        """`is_claude_exe` stays an EXTRA condition on top of the start time. The row here
+        carries a real `procStart`, so the start time MATCHES and the only thing left to
+        refuse on is what the pid is running."""
+        p = subprocess.Popen(["/bin/sleep", "120"])
+        self.procs.append(p)
+        done, failed = self.mod.apply_restart([self.row(p.pid)])
+        self.assertEqual(done, [])
+        self.assertIn("not running the Claude Code CLI", failed[0][1])
+        os.kill(p.pid, 0)
+
+    def test_a_row_with_no_recorded_start_time_is_refused_and_not_name_matched(self):
+        """🛑 No name-based fallback. The process IS a `claude`, and it is still refused,
+        because nothing says WHICH session that pid is."""
+        pid = self.claude_proc().pid
+        done, failed = self.mod.apply_restart([self.row(pid, proc_start="")])
+        self.assertEqual(done, [])
+        self.assertIn("recorded no start time", failed[0][1])
+        os.kill(pid, 0)
+
+    def test_one_bad_row_does_not_stop_the_good_one_and_the_render_says_both(self):
+        good, busy = self.claude_proc().pid, self.claude_proc().pid
+        done, failed = self.mod.apply_restart(
+            [self.row(good), self.row(busy, pos=2, status="busy", short="bb000000")])
+        self.assertEqual([r["pid"] for r in done], [good])
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(self.gone(good), -15)
+        os.kill(busy, 0)
+        text = self.mod.render_restart({"machine": "laptop", "at": "2026-10-15T16:00:00"},
+                                       [], [], done, failed, applied=True)
+        self.assertIn("STOPPED  pid %d" % good, text)
+        self.assertIn("1 signalled, 1 left alone", text)
+        self.assertNotIn("dry run", text)
+
+    def test_a_capture_that_answers_nothing_never_blocks_the_signal(self):
+        pid = self.claude_proc().pid
+        # No tmux pane on the row: the capture answers "" and the stop goes ahead anyway.
+        done, failed = self.mod.apply_restart([self.row(pid)])
+        self.assertEqual(([r["pid"] for r in done], failed), ([pid], []))
+        self.assertEqual(done[0]["pane_kept"], "")
+        self.assertEqual(self.gone(pid), -15)
+
+    def test_the_pane_is_captured_while_the_worker_is_still_running(self):
+        """🛑 CAPTURE FIRST, PROVE, THEN SIGNAL. A pane is the one thing a SIGTERM destroys
+        that is nowhere else on disk, so the read has to happen while the worker is still
+        up — which is what the fake tmux here measures, rather than the capture merely
+        having happened at some point."""
+        pid = self.claude_proc().pid
+        kid = next(k for k in self.procs if k.pid == pid)
+        alive_when_read = []
+
+        def fake_tmux(*a, **kw):
+            alive_when_read.append(kid.poll() is None)
+            return types.SimpleNamespace(returncode=0, stdout="> a draft nobody sent\n",
+                                         stderr="")
+
+        self.mod.tmux = fake_tmux
+        done, failed = self.mod.apply_restart([self.row(pid, tmux="csm-work:@3.%7")])
+        self.assertEqual(([r["pid"] for r in done], failed), ([pid], []))
+        self.assertEqual(alive_when_read, [True],
+                         "the pane was read after the SIGTERM, not before it")
+        kept = Path(done[0]["pane_kept"])
+        self.assertTrue(kept.is_file(), "nothing was parked: %r" % done[0]["pane_kept"])
+        body = kept.read_text()
+        self.assertIn("a draft nobody sent", body)
+        self.assertIn("modes --restart-idle", body)      # why it was parked
+        self.assertEqual(self.gone(pid), -15)
+
+
+class ModeSweepUnits(InProc):
+    """The sweep's pure pieces: the launch-mode reader, the judge and the check line."""
+
+    def test_the_launch_mode_is_read_in_both_spellings_and_canonicalised(self):
+        self.assertEqual(self.mod.launch_mode("claude --permission-mode auto"), "auto")
+        self.assertEqual(self.mod.launch_mode("claude --permission-mode=acceptEdits"),
+                         "acceptEdits")
+        self.assertEqual(self.mod.launch_mode("claude --permission-mode manual"), "default")
+        self.assertEqual(self.mod.launch_mode("claude --resume x"), "")
+        self.assertEqual(self.mod.launch_mode(None), "")
+
+    def test_a_server_and_a_self_hosting_session_are_told_apart(self):
+        server = "/x/claude remote-control --name room"
+        itself = "/x/claude --resume abc --remote-control=moved-abc"
+        self.assertTrue(self.mod.RC_SERVER_RE.search(server))
+        self.assertFalse(self.mod.RC_SERVER_RE.search(itself))
+        self.assertTrue(self.mod.RC_REPL_RE.search(itself))
+        # 🛑 Anchored to argv[0]: a binary whose name merely ENDS in the word is not it.
+        self.assertFalse(self.mod.RC_SERVER_RE.search("/x/myclaude remote-control"))
+
+    def base_row(self, **extra):
+        r = {"mode": "auto", "entrypoint": "sdk-cli"}
+        r.update(extra)
+        return r
+
+    def test_an_unmeasurable_mode_is_unknown_and_never_ok(self):
+        v, why = self.mod.judge_mode(self.base_row(mode=""), "bypassPermissions")
+        self.assertEqual(v, "unknown")
+        self.assertIn("nothing could say", why)
+
+    def test_a_stronger_mode_than_the_default_is_ok(self):
+        v, _ = self.mod.judge_mode(self.base_row(mode="bypassPermissions"), "acceptEdits")
+        self.assertEqual(v, "ok")
+
+    def test_a_mode_the_tool_does_not_know_is_unknown_not_weakest(self):
+        v, _ = self.mod.judge_mode(self.base_row(mode="telepathy"), "bypassPermissions")
+        self.assertEqual(v, "unknown")
+
+    def test_the_counts_tail_has_no_dangling_comma_when_nothing_runs(self):
+        rep = {"coverage": {"unread": [], "read": ["w", "p"]}, "live": 0, "mode_counts": {},
+               "faults": 0, "unknown": 0, "deliberate": 0, "machine": "laptop",
+               "default_mode": "bypassPermissions", "rows": []}
+        line, code = self.mod.modes_check_line(rep)
+        self.assertEqual(code, 0)
+        self.assertIn("0 live session(s) on laptop;", line)
+        self.assertNotIn(", ;", line)
+
+    def test_a_fault_outranks_an_incomplete_read(self):
+        rep = {"coverage": {"unread": [{"name": "w:pid 1", "reason": "no transcript"}],
+                            "read": ["w"]},
+               "live": 2, "mode_counts": {"auto": 1}, "faults": 1, "unknown": 1,
+               "deliberate": 0, "machine": "laptop", "default_mode": "bypassPermissions",
+               "rows": [{"verdict": "fault", "handle": "w", "short": "aaaaaaaa",
+                         "mode": "auto"}]}
+        line, code = self.mod.modes_check_line(rep)
+        self.assertEqual(code, 1)
+        self.assertTrue(line.startswith("FAULT: "))
+        self.assertIn("1 not measured (w:pid 1: no transcript)", line)
+
+    def test_more_than_four_deliberate_sessions_are_counted_not_listed(self):
+        rows = [{"verdict": "info", "handle": "w", "short": "s%d" % i, "mode": "plan"}
+                for i in range(6)]
+        rep = {"coverage": {"unread": [], "read": ["w"]}, "live": 6,
+               "mode_counts": {"plan": 6}, "faults": 0, "unknown": 0, "deliberate": 6,
+               "machine": "laptop", "default_mode": "bypassPermissions", "rows": rows}
+        line, code = self.mod.modes_check_line(rep)
+        self.assertEqual(code, 0)
+        self.assertIn("+2 more", line)
+
+    def test_the_shared_settings_home_decides_the_machines_mode_before_an_account_home(self):
+        shared = self.root / "shared"
+        shared.mkdir()
+        (shared / "settings.json").write_text(
+            json.dumps({"permissions": {"defaultMode": "bypassPermissions"}}))
+        self.mod.SHARED_HOME = shared
+        a = self.account("work", settings={"permissions": {"defaultMode": "plan"}})
+        mode, where = self.mod.machine_default_mode([a])
+        self.assertEqual(mode, "bypassPermissions")
+        self.assertIn("shared", where)
+
+    def test_with_no_shared_settings_an_account_home_answers(self):
+        self.mod.SHARED_HOME = self.root / "no-such-home"
+        a = self.account("work", settings={"permissions": {"defaultMode": "acceptEdits"}})
+        mode, where = self.mod.machine_default_mode([a])
+        self.assertEqual(mode, "acceptEdits")
+        self.assertIn(".claude-work", where)
+
+    def test_a_row_session_is_built_from_the_row_and_never_resolved_again(self):
+        """What `apply_restart` proves a pid with must not depend on the accounts file:
+        the table may have been edited between the plan and the kill."""
+        s = self.mod.row_session({"account": "work", "handle": "w", "pid": 42,
+                                  "proc_start": "x", "local_id": SID_A, "home": "/nope"})
+        self.assertEqual((s.pid, s.proc_start, s.account.name, s.account.label),
+                         (42, "x", "work", "w"))
+        self.assertEqual(s.short, SID_A[:8])
+
+    def test_a_transcript_that_cannot_be_stat_d_is_not_an_empty_one(self):
+        """🛑 The sweep's "0 bytes" clause asks `file_size(...) == 0`, so `None` may not
+        pass for empty — and the read may never RAISE, because on the `--check` path a
+        traceback is one stray byte on stderr and every scheduled reader of that one line
+        turns that into a FAULT about the machine. A transcript deleted between the listing
+        and this read is exactly that race.
+        """
+        empty = self.root / "empty.jsonl"
+        empty.write_text("")
+        self.assertEqual(self.mod.file_size(empty), 0)
+        gone = self.root / "no-such-transcript.jsonl"
+        self.assertIsNone(self.mod.file_size(gone))
+        self.assertNotEqual(self.mod.file_size(gone), 0)
+        locked = self.root / "locked"
+        locked.mkdir()
+        os.chmod(str(locked), 0o000)
+        try:
+            if os.access(str(locked / "x.jsonl"), os.F_OK):
+                self.skipTest("this filesystem or user ignores a 000 directory")
+            self.assertIsNone(self.mod.file_size(locked / "x.jsonl"))
+        finally:
+            os.chmod(str(locked), 0o700)
+
+    def test_the_settings_local_layer_is_read_for_the_machines_mode_too(self):
+        self.mod.SHARED_HOME = self.root / "no-such-home"
+        a = self.account("work", settings={"permissions": {"defaultMode": "plan"}})
+        (a.home / "settings.local.json").write_text(
+            json.dumps({"permissions": {"defaultMode": "bypassPermissions"}}))
+        mode, _ = self.mod.machine_default_mode([a])
+        self.assertEqual(mode, "bypassPermissions")
 
 
 # --------------------------------------------------------------------------- csm matrix
@@ -2796,6 +5091,43 @@ class MatrixCommand(Base):
     def test_accounts_points_at_it(self):
         self.assertIn("csm matrix", self.ok(self.w.run("accounts")))
 
+    def test_the_columns_and_the_notes_name_the_homes_the_way_the_rest_does(self):
+        """🛑 THE HANDLE, like every other command, and for a reason the names make plain.
+
+        A matrix column is about ten characters wide — the table is one column per home —
+        so the heading is truncated, and a layout whose account names share a prefix (one
+        login per project, one per client) produced several columns headed with the same
+        truncated string, with nothing to tell a reader which column was which account.
+        Measured on a real six-home machine: four of the six headings read alike. The
+        notes under the table have to agree with the headings, or a divergence is reported
+        about a name that is nowhere in the table above it.
+        """
+        p = self.w.table(("acme-production-eu", "me@work.example", self.work,
+                          "laptop", "prod"),
+                         ("acme-production-us", "me@home.example", self.personal,
+                          "laptop", "us"))
+        # a divergence, so the note that lists the homes by name is printed too
+        (self.work / "CLAUDE.md").write_text("# mine\n")
+        (self.personal / "CLAUDE.md").write_text("# theirs\n")
+        out = self.table(CSM_ACCOUNTS=p, CSM_MACHINE="laptop")
+        head = [ln for ln in out.splitlines() if ln.startswith("layer")][0]
+        self.assertIn("prod", head)
+        self.assertIn("us", head)
+        # and not the truncation that made two columns read alike
+        self.assertNotIn("acme-produ", out)
+        flat = " ".join(out.split())
+        self.assertIn("prod → ", flat)
+        self.assertIn("us → ", flat)
+        # the heading names the machine this tool is configured as, not the hostname
+        self.assertIn("fungibility matrix on laptop", out)
+        # --json keeps `name` (a cell's `home` field is that name) and gains `handle`
+        d = json.loads(self.table("--json", CSM_ACCOUNTS=p, CSM_MACHINE="laptop"))
+        self.assertEqual(sorted((h["name"], h["handle"]) for h in d["homes"]),
+                         [("acme-production-eu", "prod"), ("acme-production-us", "us")])
+        for row in d["rows"]:
+            for c in row["cells"]:
+                self.assertIn(c["home"], ("acme-production-eu", "acme-production-us", "*"))
+
     def snapshot(self):
         """Every config home, byte for byte. (Only the homes: an interpreter is free to
         drop its own caches elsewhere under HOME, and that is not the tool writing.)"""
@@ -2900,6 +5232,9 @@ class SharedTree(Base):
         self.assertNotIn("REFUSED", out)
 
     def test_a_real_move_copies_nothing_and_leaves_no_backup(self):
+        # ⚠️ The bytes are unchanged because the COPY step writes nothing here — this
+        # fixture's lines carry no `uuid`, so the move note has no chain to hang on
+        # either. The note's own behaviour on a shared tree is the next test.
         out = self.ok(self.w.run("move", SID_A, "--to", "work"))
         self.assertIn(LINK, out)
         self.assertEqual(self.t.read_bytes(), self.before)
@@ -2908,6 +5243,28 @@ class SharedTree(Base):
         call = self.w.claude_calls()[0]
         self.assertEqual(call["argv"][-2:], ["--resume", SID_A])
         self.assertEqual(call["env"]["CLAUDE_CONFIG_DIR"], str(self.work))
+
+    def test_the_move_note_is_appended_to_the_one_shared_file(self):
+        """🛑 There is no second file to put it in, and that is the right answer.
+
+        The note is what the resumed session reads; under one tree the file it resumes IS
+        the source's file, so the note goes there or nowhere. It does mean a source still
+        running can see it — the plan and `target_notes` both say the two share a file,
+        and `--stop-source` is what stops them interleaving.
+        """
+        cwd = str(self.w.work)
+        t = self.w.session(self.work, SID_B, lines=[
+            user("go", cwd, SID_B, uuid="u1"),
+            assistant("ok", cwd, SID_B, uuid="a1", parent="u1")])
+        before = len(t.read_text().splitlines())
+        out = self.ok(self.w.run("move", SID_B, "--to", "work"))
+        self.assertIn("the move note is appended to it", out)
+        rows = [json.loads(x) for x in t.read_text().splitlines() if x.strip()]
+        notes = [r for r in rows if r.get("isMeta")]
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(rows.index(notes[0]), before)
+        self.assertEqual(len(list(self.central.rglob(SID_B + ".jsonl"))), 1)
+        self.assertEqual(list(self.central.rglob("*.csm-bak-*")), [])
 
     def test_the_row_names_the_account_that_is_running_it(self):
         self.w.live(self.personal, SID_A, self.w.spawn().pid)
@@ -2992,6 +5349,784 @@ class SharedTreeUnits(InProc):
         self.assertEqual(s.transcript.read_bytes(), before)
         self.assertEqual(oct(s.transcript.stat().st_mode & 0o777), "0o644", "not even a chmod")
         self.assertEqual(list(central.rglob("*.csm-bak-*")), [])
+
+
+# ------------------------------------------------------------------------ the quota meter
+
+class Meters(Base):
+    """`--to auto`, the near-limit warning on a NAMED target, and what "unread" means.
+
+    🛑 The whole point of the feature is that a reading is a reading. A stale one is
+    neither room nor a limit, a missing file is not zero per cent, and `auto` with nothing
+    to read refuses instead of picking the first home it finds — because a move into a
+    second exhausted account looks exactly like a success.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.spare = self.w.account("spare", "me@spare.example", org="org-3")
+        self.other = self.w.account("other", "me@other.example", org="org-4")
+        cwd = str(self.w.work)
+        self.w.session(self.work, SID_A, lines=[user("go", cwd, SID_A),
+                                                assistant("ok", cwd, SID_A)])
+        self.tbl = self.w.table(
+            ("work", "me@work.example", self.work, "here", "wk"),
+            ("personal", "me@home.example", self.personal, "here", "pers"),
+            ("spare", "me@spare.example", self.spare, "here", "sp"),
+            ("other", "me@other.example", self.other, "here", "oth"))
+
+    def go(self, *extra, **readings):
+        e = {"CSM_ACCOUNTS": str(self.tbl), "CSM_MACHINE": "here"}
+        if readings:
+            e["CSM_METERS"] = str(self.w.meters(**readings))
+        return self.w.run("move", SID_A, *extra, **e)
+
+    def test_auto_picks_the_account_with_the_most_weekly_room(self):
+        out = self.ok(self.go("--to", "auto", "--dry-run",
+                              pers=(10, 80, 60), sp=(5, 20, 60), oth=(0, 50, 60)))
+        self.assertIn("--to auto: sp", out)
+        # 🛑 The arrow too: a supervisor reads the chosen account off this line BY the
+        # arrow (`→\s+(\S+)\s+\(`), so an ASCII `->` here is a caller that stops working.
+        self.assertIn("→  sp (me@spare.example)", out)
+
+    def test_auto_skips_a_near_limit_and_a_stale_reading(self):
+        # pers is over the 5-hour cutoff, sp's reading is hours old: neither is room.
+        out = self.ok(self.go("--to", "auto", "--dry-run",
+                              pers=(95, 10, 60), sp=(0, 1, 5 * 3600), oth=(0, 60, 60)))
+        self.assertIn("--to auto: oth", out)
+
+    def test_auto_never_picks_the_account_the_session_is_already_on(self):
+        out = self.ok(self.go("--to", "auto", "--dry-run",
+                              wk=(0, 0, 60), pers=(0, 40, 60)))
+        self.assertIn("--to auto: pers", out)
+
+    def test_auto_with_no_fresh_reading_refuses_and_says_how_to_name_one(self):
+        self.refused(self.go("--to", "auto", "--dry-run", pers=(0, 1, 9 * 3600)),
+                     "found no account", "--to <account>")
+
+    def test_auto_with_no_meter_at_all_refuses_and_names_the_knob(self):
+        self.refused(self.go("--to", "auto", "--dry-run"),
+                     "--to auto needs a quota meter", "CSM_METERS", "--to <account>")
+
+    def test_a_named_target_near_its_limit_is_warned_about_not_refused(self):
+        out = self.ok(self.go("--to", "pers", "--dry-run", pers=(40, 97, 60)))
+        self.assertIn("near its limit", out)
+        self.assertIn("week 97%", out)
+        self.assertIn("--to auto", out)
+
+    def test_a_stale_reading_never_warns_and_never_counts_as_room(self):
+        out = self.ok(self.go("--to", "pers", "--dry-run", pers=(40, 99, 4 * 3600)))
+        self.assertNotIn("near its limit", out)
+
+    def test_the_meter_comes_first_and_the_transcript_is_the_fallback(self):
+        # The target has a live limit in its own transcript AND a fresh meter over the
+        # cutoff: the READING is what is printed, and the evidence is the second path.
+        cwd = str(self.w.work)
+        self.w.session(self.personal, SID_B, lines=[
+            user("x", cwd, SID_B), {"type": "ai-title", "aiTitle": "Theirs",
+                                    "sessionId": SID_B},
+            assistant("limit", cwd, SID_B, error="usage_limit_reached",
+                      resets=int(time.time() + 7200))])
+        meter = self.ok(self.go("--to", "pers", "--dry-run", pers=(99, 99, 60)))
+        self.assertIn("near its limit", meter)
+        self.assertNotIn("may be out of quota TOO", meter)
+        evidence = self.ok(self.go("--to", "pers", "--dry-run"))
+        self.assertIn("may out of quota TOO".replace("may out", "may be out"), evidence)
+        self.assertIn("Theirs", evidence)
+
+    def test_a_target_whose_limit_already_expired_is_not_warned_about(self):
+        cwd = str(self.w.work)
+        self.w.session(self.personal, SID_B, lines=[
+            user("x", cwd, SID_B),
+            assistant("limit", cwd, SID_B, error="usage_limit_reached",
+                      resets=int(time.time() - 7200))])
+        self.assertNotIn("out of quota TOO", self.ok(self.go("--to", "pers", "--dry-run")))
+
+    def test_a_mid_turn_source_says_the_copy_stops_short_of_its_answer(self):
+        """The other half of the same question: is the SOURCE fit to be copied now?
+
+        A session mid-turn has not written its current answer yet, so the copy ends just
+        before it. Said and not refused, because "move my running session" is the ask
+        the tool exists for — but said, because otherwise the newest answer is quietly
+        missing from the window that comes up.
+        """
+        self.w.live(self.work, SID_A, self.w.spawn().pid, status="busy")
+        out = self.ok(self.go("--to", "pers", "--dry-run"))
+        self.assertIn("the source is mid-turn", out)
+        self.assertIn("not on disk yet", out)
+
+    def test_an_idle_source_is_not_called_mid_turn(self):
+        self.w.live(self.work, SID_A, self.w.spawn().pid, status="idle")
+        self.assertNotIn("mid-turn", self.ok(self.go("--to", "pers", "--dry-run")))
+
+
+# ------------------------------------------------------------------------- the move note
+
+class MoveNoteText(InProc):
+    """What the resumed session is TOLD. Pure text, so every clause can be pinned."""
+
+    def setUp(self):
+        super().setUp()
+        self.mod.MACHINE = "here"
+        self.tgt = self.account("personal", email="you@home.example")
+
+    def note(self, **kw):
+        """A note over a fresh source session, with `kw` set on it first.
+
+        ⚠️ No `mirror=` here on purpose: `Session` is a plain dataclass, so a stray
+        keyword would be `setattr`'d onto it and silently ignored by `move_note`, and the
+        test that passed it would assert nothing. The mirror clause's test calls
+        `move_note` directly, with the plan it means.
+        """
+        src = kw.pop("account", None) or self.account("work", email="me@work.example")
+        s = self.session(src)
+        for k, v in kw.items():
+            assert hasattr(s, k), k        # a typo is not a silently skipped clause
+            setattr(s, k, v)
+        return self.mod.move_note(s, self.tgt, when="Thu 11:00")
+
+    def test_an_account_move_says_so_and_names_no_machine_to_reach(self):
+        n = self.note()
+        self.assertIn("on the machine `here`", n)
+        self.assertIn("from the account me@work.example to you@home.example", n)
+        self.assertIn("This is a COPY", n)
+        self.assertIn("are stale", n)
+        self.assertNotIn("ssh ", n)
+        self.assertTrue(n.startswith("<system-reminder>")
+                        and n.endswith("</system-reminder>"))
+
+    def test_the_same_login_on_another_machine_is_not_described_as_an_account_change(self):
+        src = self.account("work", email="you@home.example")
+        s = self.session(src)
+        s.origin = "desktop"
+        n = self.mod.move_note(s, self.tgt, when="Thu 11:00")
+        self.assertIn("on the same account", n)
+        self.assertNotIn("are stale", n)
+        self.assertIn("from the machine `desktop` to the machine `here`", n)
+
+    def test_a_store_is_named_and_no_store_says_nothing_about_memory(self):
+        store = self.root / "shared-memory"
+        store.mkdir()
+        quiet = self.mod.move_note(self.session(self.account("work")), self.tgt,
+                                   when="Thu 11:00")
+        self.assertNotIn("Auto memory", quiet)
+        tgt = self.account("personal2", email="you@home.example",
+                           settings={"env": {self.mod.MEMORY_DIR_ENV: str(store)}})
+        loud = self.mod.move_note(self.session(self.account("work")), tgt, when="Thu 11:00")
+        self.assertIn("Auto memory for this project is read from %s" % store, loud)
+        self.assertIn("Do not write a memory under", loud)
+
+    def test_a_machine_move_names_what_stayed_and_how_to_reach_it(self):
+        s = self.session(self.account("work", email="me@work.example"))
+        s.origin = "desktop"
+        s.desktop = {"effort": "xhigh"}
+        s.detail = {"left": [{"pid": 7, "etime": "01:00", "cmd": "python campaign.py"}],
+                    "app_tools": 3, "origin_cwd": "/elsewhere/work"}
+        mirror = {"files": ["a"], "skipped": [], "bytes": 10,
+                  "all_bytes": 10 + 20 * 2 ** 30, "head": "822eede", "branch": "main",
+                  "dirty": 16, "top": s.cwd}
+        n = self.mod.move_note(s, self.tgt, mirror=mirror, when="Thu 11:00")
+        for want in ("from the machine `desktop` to the machine `here`", "ssh desktop",
+                     "CODE-ONLY MIRROR", "822eede", "20.0 GB",
+                     "pid 7 `python campaign.py`", "didn't finish", "mcp__ccd_",
+                     "say which machine it belongs on", "On `desktop` this folder is",
+                     "desktop-app session"):
+            self.assertIn(want, n)
+
+    def test_a_synced_folder_and_a_separate_tree_are_told_apart(self):
+        s = self.session(self.account("work"))
+        s.origin = "desktop"
+        self.assertIn("own copy of that folder",
+                      self.mod.move_note(s, self.tgt, when="Thu 11:00"))
+        self.mod.SYNC_DIRS = ("work",)
+        self.mod.HOME = self.root
+        self.assertIn("inside a synced directory",
+                      self.mod.move_note(s, self.tgt, when="Thu 11:00"))
+
+    def test_the_note_is_a_hidden_line_chained_to_the_last_main_message(self):
+        t = self.root / (SID_A + ".jsonl")
+        t.write_text(jl(
+            {"type": "user", "uuid": "u1", "parentUuid": None, "isSidechain": False,
+             "version": "2.1.295", "gitBranch": "main"},
+            {"type": "assistant", "uuid": "a1", "parentUuid": "u1", "isSidechain": False,
+             "version": "2.1.295", "gitBranch": "main"},
+            {"type": "assistant", "uuid": "side", "parentUuid": "x", "isSidechain": True},
+            {"type": "custom-title", "customTitle": "t"}))
+        s = self.session(self.account("work"))
+        new = self.mod.append_move_note(t, s, "<system-reminder>hi</system-reminder>")
+        last = json.loads(t.read_text().splitlines()[-1])
+        self.assertEqual(last["uuid"], new)
+        self.assertEqual(last["parentUuid"], "a1", "a sidechain line is not a parent")
+        self.assertIs(last["isMeta"], True)
+        self.assertEqual(last["type"], "user")
+        self.assertEqual(last["sessionId"], SID_A)
+        self.assertEqual(last["version"], "2.1.295")
+        self.assertEqual(last["gitBranch"], "main")
+        self.assertEqual(last["message"],
+                         {"role": "user", "content": "<system-reminder>hi</system-reminder>"})
+
+    def test_a_copy_with_no_conversation_gets_no_note_and_is_not_touched(self):
+        t = self.root / "empty.jsonl"
+        t.write_text('{"type":"custom-title","customTitle":"t"}\n')
+        s = self.session(self.account("work"))
+        self.assertEqual(self.mod.append_move_note(t, s, "x"), "")
+        self.assertEqual(len(t.read_text().splitlines()), 1)
+
+    def test_a_line_with_no_uuid_is_never_the_parent(self):
+        t = self.root / "nouuid.jsonl"
+        t.write_text(jl({"type": "user", "isSidechain": False},
+                        {"type": "user", "uuid": "u9", "isSidechain": False}))
+        s = self.session(self.account("work"))
+        self.mod.append_move_note(t, s, "x")
+        self.assertEqual(json.loads(t.read_text().splitlines()[-1])["parentUuid"], "u9")
+
+
+class MoveNoteInPlan(Base):
+    """The note reaches the plan, and the COPY — and a dry run writes nothing."""
+
+    def setUp(self):
+        super().setUp()
+        cwd = str(self.w.work)
+        self.src = self.w.session(self.work, SID_A, lines=[
+            user("refactor the parser", cwd, SID_A, uuid="u1"),
+            assistant("ok", cwd, SID_A, uuid="a1", parent="u1")])
+
+    def test_the_dry_run_prints_the_note_and_writes_nothing(self):
+        before = self.src.read_text()
+        out = self.ok(self.w.run("move", SID_A, "--to", "personal", "--dry-run"))
+        self.assertIn("the move note:", out)
+        self.assertIn("move record, written by the tool", out)
+        self.assertIn("append the MOVE NOTE to the copy", out)
+        self.assertEqual(self.src.read_text(), before)
+        self.assertEqual(list((self.personal / "projects").rglob("*.jsonl")), [])
+
+    def test_a_real_move_appends_it_to_the_copy_and_not_to_the_source(self):
+        before = self.src.read_text()
+        out = self.ok(self.w.run("move", SID_A, "--to", "personal"))
+        self.assertIn("move note", out)
+        self.assertEqual(self.src.read_text(), before, "the source is never written to")
+        dest = next((self.personal / "projects").rglob(SID_A + ".jsonl"))
+        rows = [json.loads(x) for x in dest.read_text().splitlines() if x.strip()]
+        notes = [r for r in rows if r.get("isMeta")]
+        self.assertEqual(len(notes), 1, "exactly one note, never two")
+        self.assertEqual(notes[0]["type"], "user")
+        self.assertIn("move record", notes[0]["message"]["content"])
+        self.assertIn("from the account me@work.example", notes[0]["message"]["content"])
+        # 🛑 It is the newest line of the CONVERSATION as copied: the resumed session's
+        # own lines come after it, which is what makes it the last thing read before the
+        # next prompt rather than a line buried in the middle of the history.
+        copied = len([x for x in before.splitlines() if x.strip()])
+        self.assertEqual(rows.index(notes[0]), copied)
+
+    def test_a_transcript_with_no_chain_says_the_note_was_not_written(self):
+        # 🛑 The step line above promises the note. A transcript whose conversation lines
+        # carry no `uuid` has nothing to chain one to, and nothing is written — so the
+        # move has to SAY so, or the promise is quietly broken.
+        cwd = str(self.w.work)
+        self.w.session(self.work, SID_C, lines=[user("no chain here", cwd, SID_C)])
+        out = self.ok(self.w.run("move", SID_C, "--to", "personal"))
+        self.assertIn("move note    NOT written", out)
+        dest = next((self.personal / "projects").rglob(SID_C + ".jsonl"))
+        self.assertEqual([r for r in (json.loads(x) for x in
+                                      dest.read_text().splitlines() if x.strip())
+                          if r.get("isMeta")], [])
+
+
+# --------------------------------------------------------------------------- the room note
+
+class RoomNote(InProc):
+    """Whether the TARGET account already has a way into this folder here.
+
+    🛑 The guard under test is the one that costs nothing to get wrong and everything to
+    get wrong quietly: a probe that FAILED prints an empty table, and reading that as "no
+    way in" states something nobody measured.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.mod.MACHINE = "here"
+        self.cwd = str(self.root / "work")
+        os.makedirs(self.cwd, exist_ok=True)
+        self.tgt = self.account("personal", email="you@home.example")
+        self.tgt.handle = "pers"
+
+    def probe(self, body, fix=""):
+        d = self.root / "bin"
+        d.mkdir(exist_ok=True)
+        f = d / "rooms"
+        f.write_text(body)
+        f.chmod(0o755)
+        self.mod.ROOM_CMD = str(f) + " --account {handle}"
+        self.mod.ROOM_FIX = fix
+        return f
+
+    def note(self):
+        s = self.session(self.account("work"), cwd=self.cwd)
+        return self.mod.room_note(s, self.tgt)
+
+    def test_with_no_probe_configured_there_is_no_note_at_all(self):
+        self.mod.ROOM_CMD = ""
+        self.assertEqual(self.note(), "")
+
+    def test_a_probe_that_failed_says_nothing_about_rooms(self):
+        self.probe("#!/bin/sh\necho 'no server reachable' >&2\nexit 2\n")
+        self.assertEqual(self.note(), "")
+
+    def test_a_probe_that_answered_an_empty_table_does_report_the_gap(self):
+        # The positive control for the guard above: the same empty stdout, exit 0.
+        self.probe("#!/bin/sh\necho header\necho ----\nexit 0\n")
+        n = self.note()
+        self.assertIn("has no way into this folder on here", n)
+        self.assertIn("pers", n)
+
+    def test_a_row_naming_this_folder_is_nothing_to_report(self):
+        self.probe("#!/bin/sh\necho header\necho ----\necho \'a b c %s\'\n" % self.cwd)
+        self.assertEqual(self.note(), "")
+
+    def test_the_handle_reaches_the_probe_and_the_cure_is_the_knob(self):
+        f = self.probe("#!/bin/sh\necho \"$2\" > %s/seen\necho h\necho -\n"
+                       % self.root, fix="run: rooms add {name} for {handle} in {cwd}")
+        n = self.note()
+        self.assertEqual((self.root / "seen").read_text().strip(), "pers")
+        self.assertIn("run: rooms add work for pers in " + self.cwd, n)
+        self.assertTrue(f.exists())
+
+    def test_a_probe_that_cannot_be_run_is_not_a_crash(self):
+        self.mod.ROOM_CMD = str(self.root / "nope") + " {handle}"
+        self.mod.ROOM_FIX = ""
+        self.assertEqual(self.note(), "")
+
+    def test_an_unparseable_probe_command_is_not_a_crash(self):
+        self.mod.ROOM_CMD = "rooms --account '{handle}"
+        self.assertEqual(self.note(), "")
+
+    def test_a_session_with_no_folder_has_no_room_question(self):
+        self.probe("#!/bin/sh\necho h\necho -\n")
+        s = self.session(self.account("work"), cwd=self.cwd)
+        s.cwd = ""
+        self.assertEqual(self.mod.room_note(s, self.tgt), "")
+
+
+# ------------------------------------------------------------- what the plan may claim
+
+class ConnectorNote(Base):
+    """A name is not a call: `has used` and `mentions` are two different claims."""
+
+    def plan(self, lines):
+        cwd = str(self.w.work)
+        self.w.session(self.work, SID_A, lines=lines)
+        return self.ok(self.w.run("move", SID_A, "--to", "personal", "--dry-run"))
+
+    def test_a_called_connector_is_reported_as_used(self):
+        cwd = str(self.w.work)
+        out = self.plan([user("go", cwd, SID_A),
+                         assistant("ok", cwd, SID_A,
+                                   tools=["mcp__claude_ai_Gmail__search"])])
+        self.assertIn("this conversation has used: Gmail", out)
+        self.assertNotIn("mentions the connector", out)
+
+    def test_a_connector_only_named_in_a_tool_definition_is_a_mention(self):
+        """🛑 The measured false positive, in the two shapes it really takes.
+
+        A transcript carries `"name": "mcp__…"` in places that are not calls: a system
+        line listing deferred tools, and — the one that matters, because it is INSIDE
+        `message.content` where the calls are — a content block that names a tool without
+        being a `tool_use`. Both must read as a mention; only the second one can be got
+        wrong by the narrow scan, so both are in this fixture.
+        """
+        cwd = str(self.w.work)
+        out = self.plan([
+            user("go", cwd, SID_A),
+            {"type": "system", "cwd": cwd, "sessionId": SID_A,
+             "surfacedDefinitions": [{"name": "mcp__claude_ai_Gmail__search",
+                                      "description": "search mail"}]},
+            {"type": "assistant", "cwd": cwd, "sessionId": SID_A, "isSidechain": False,
+             "message": {"role": "assistant", "model": "claude-sonnet-4-5", "content": [
+                 {"type": "tool_search_result", "name": "mcp__claude_ai_Gmail__search",
+                  "description": "search mail"},
+                 {"type": "text", "text": "I could use mcp__claude_ai_Gmail__search"}]}},
+            assistant("ok", cwd, SID_A)])
+        self.assertIn("mentions the connector(s) Gmail, without calling one", out)
+        self.assertNotIn("has used", out)
+
+    def test_an_mcp_server_that_was_called_names_the_sign_in_gesture(self):
+        cwd = str(self.w.work)
+        out = self.plan([user("go", cwd, SID_A),
+                         assistant("ok", cwd, SID_A, tools=["mcp__linear__issues"])])
+        self.assertIn("has also used the MCP server(s) linear", out)
+        self.assertIn("claude mcp login", out)
+
+    def test_the_connector_sentence_is_in_the_plan_even_with_no_mcp_at_all(self):
+        cwd = str(self.w.work)
+        out = self.plan([user("go", cwd, SID_A), assistant("ok", cwd, SID_A)])
+        self.assertIn("connectors belong to the ACCOUNT", out)
+        self.assertNotIn("has used", out)
+        self.assertNotIn("mentions the connector", out)
+
+
+class RetentionNote(Base):
+    """`cleanupPeriodDays`: the target home may sweep the copy away before it is opened."""
+
+    def session_aged(self, days):
+        cwd = str(self.w.work)
+        t = self.w.session(self.work, SID_A, lines=[user("go", cwd, SID_A),
+                                                    assistant("ok", cwd, SID_A)])
+        when = time.time() - days * 86400
+        os.utime(str(t), (when, when))
+        return t
+
+    def plan(self, days_old, settings=None):
+        self.session_aged(days_old)
+        if settings is not None:
+            (self.personal / "settings.json").write_text(json.dumps(settings))
+        return self.ok(self.w.run("move", SID_A, "--to", "personal", "--dry-run"))
+
+    def test_a_fresh_session_is_never_warned_about(self):
+        self.assertNotIn("keeps transcripts for", self.plan(1))
+
+    def test_past_the_clis_own_default_it_is_warned_about(self):
+        out = self.plan(40)
+        self.assertIn("keeps transcripts for 30 day(s)", out)
+        self.assertIn("neither settings file names the key", out)
+
+    def test_the_homes_own_period_is_what_counts(self):
+        out = self.plan(10, {"cleanupPeriodDays": 7})
+        self.assertIn("keeps transcripts for 7 day(s)", out)
+        self.assertIn("settings.json / settings.local.json in that home", out)
+
+    def test_a_long_period_in_that_home_means_no_warning(self):
+        self.assertNotIn("keeps transcripts for", self.plan(40, {"cleanupPeriodDays": 99999}))
+
+    def test_zero_switches_the_sweep_off_and_so_the_warning_too(self):
+        self.assertNotIn("keeps transcripts for", self.plan(400, {"cleanupPeriodDays": 0}))
+
+
+# ----------------------------------------------------------- a session somebody else owns
+
+class OwnedSession(Base):
+    """A session that is a front door is handed to its supervisor, never moved by hand."""
+
+    def setUp(self):
+        super().setUp()
+        cwd = str(self.w.work)
+        self.w.session(self.work, SID_A, lines=[user("go", cwd, SID_A, uuid="u1"),
+                                                assistant("ok", cwd, SID_A, uuid="a1",
+                                                          parent="u1")])
+        self.owners = self.w.root / "owners"
+        self.owners.mkdir()
+
+    def own(self, name, sid):
+        (self.owners / (name + ".json")).write_text(json.dumps({"session_id": sid}))
+
+    def env(self, **extra):
+        e = {"CSM_BOTS_DIR": str(self.owners)}
+        e.update(extra)
+        return e
+
+    def test_with_no_owner_directory_nothing_is_owned(self):
+        self.ok(self.w.run("move", SID_A, "--to", "personal", "--dry-run",
+                           CSM_BOTS_DIR=str(self.w.root / "nowhere")))
+
+    def test_a_plain_move_of_an_owned_session_is_refused_and_names_the_way(self):
+        self.own("front-door", SID_A)
+        self.refused(self.w.run("move", SID_A, "--to", "personal", "--dry-run",
+                                **self.env()),
+                     "is front-door's own session", "SECOND copy", "--copy-only")
+
+    def test_the_cure_sentence_is_a_knob(self):
+        self.own("front-door", SID_A)
+        self.refused(self.w.run("move", SID_A, "--to", "personal", "--dry-run",
+                                **self.env(CSM_BOT_FIX="say: owners switch {owner} {to}")),
+                     "say: owners switch front-door personal")
+
+    def test_another_sessions_owner_does_not_claim_this_one(self):
+        self.own("front-door", SID_B)
+        self.ok(self.w.run("move", SID_A, "--to", "personal", "--dry-run", **self.env()))
+
+    def test_one_unreadable_state_file_is_skipped_not_a_claim(self):
+        (self.owners / "broken.json").write_text("{not json")
+        self.ok(self.w.run("move", SID_A, "--to", "personal", "--dry-run", **self.env()))
+
+    def test_a_directory_that_cannot_be_READ_is_a_refusal_and_not_a_no(self):
+        """🛑 The quietest path to the worst outcome.
+
+        `Path.glob` swallows a PermissionError from its own scan and yields nothing, so an
+        unreadable owner directory would read as "nobody owns this" — and the guard would
+        open silently on exactly the session it exists to protect. `os.listdir` raises,
+        and the refusal says what could not be read.
+        """
+        self.own("front-door", SID_A)
+        os.chmod(str(self.owners), 0o000)
+        try:
+            self.refused(self.w.run("move", SID_A, "--to", "personal", "--dry-run",
+                                    **self.env()),
+                         "could not read", "owns this session", "CSM_BOTS_DIR")
+        finally:
+            # before tearDown, which has to be able to remove the tree
+            os.chmod(str(self.owners), 0o755)
+
+    def test_a_file_where_the_directory_should_be_says_so(self):
+        f = self.w.root / "not-a-dir"
+        f.write_text("x")
+        self.refused(self.w.run("move", SID_A, "--to", "personal", "--dry-run",
+                                CSM_BOTS_DIR=str(f)), "not a directory")
+
+    def test_copy_only_does_the_whole_copy_and_starts_nothing(self):
+        self.own("front-door", SID_A)
+        out = self.ok(self.w.run("move", SID_A, "--to", "personal", "--copy-only",
+                                 **self.env()))
+        self.assertIn("start NOTHING (--copy-only)", out)
+        self.assertIn("Nothing was started", out)
+        # 🛑 the way back in is a plain resume, never a `--remote-control=` name: a copy
+        # the caller starts is not a window csm opened, and `csm stop` would refuse it
+        self.assertIn("--resume " + SID_A, out)
+        self.assertNotIn("--remote-control", out)
+        # 🛑 AND IT IS RUNNABLE AS PRINTED. The line is read by somebody about to paste
+        # it, so the home is absolute (no `~`, which an env assignment in front of a
+        # command does not expand on every shell) and there is no prose in the middle.
+        line = [x for x in out.splitlines() if "--resume " + SID_A in x][0]
+        gesture = line.split(": ", 1)[1]
+        self.assertTrue(gesture.startswith("CLAUDE_CONFIG_DIR=" + str(self.personal)),
+                        gesture)
+        self.assertNotIn("~", gesture)
+        self.assertNotIn(",", gesture)
+        dest = next((self.personal / "projects").rglob(SID_A + ".jsonl"))
+        rows = [json.loads(x) for x in dest.read_text().splitlines() if x.strip()]
+        self.assertEqual(len([r for r in rows if r.get("isMeta")]), 1,
+                         "the move note is part of a copy-only move")
+        self.assertEqual(self.w.claude_calls(wait=0.5), [], "claude is never started")
+        st = json.loads(self.w.tmux_state.read_text()) if self.w.tmux_state.exists() else {}
+        self.assertEqual({s: w for s, w in (st.get("sessions") or {}).items() if w}, {},
+                         "and no window is opened")
+
+    def test_copy_only_still_does_every_refusal(self):
+        self.refused(self.w.run("move", SID_A, "--to", "work", "--copy-only",
+                                **self.env()), "already in work")
+
+    def test_copy_only_refuses_the_flags_that_mean_a_window(self):
+        self.refused(self.w.run("move", SID_A, "--to", "personal", "--copy-only",
+                                "--stop-source", **self.env()), "stops nothing either")
+        self.refused(self.w.run("move", SID_A, "--to", "personal", "--copy-only",
+                                "--foreground", **self.env()), "no terminal to choose")
+
+    def test_an_old_moved_window_is_no_obstacle_to_a_copy_only_move(self):
+        self.ok(self.w.run("move", SID_A, "--to", "personal"))
+        # --from-account picks the source copy out of the two the first move left
+        self.refused(self.w.run("move", SID_A, "--to", "personal",
+                                "--from-account", "work"), "already exists")
+        # the window is still there, and copy-only neither needs nor minds it
+        out = self.ok(self.w.run("move", SID_A, "--to", "personal", "--copy-only",
+                                 "--from-account", "work"))
+        self.assertIn("Nothing was started", out)
+
+
+class FullIdPin(Base):
+    """A session named by its WHOLE id is found however old its file is.
+
+    🛑 `move` looks at the newest `max(CSM_LIMIT, 60)` transcripts per home, which is a
+    fortnight or less on a busy machine — and the session somebody names by its full id is
+    typically one that has been idle for longer than that. So a whole id is PINNED into
+    the candidate list. A prefix is not: only a whole id names one file for certain.
+    """
+
+    #: One more than the floor `move` uses, so the ancient row really is out of the window.
+    NEWER = 62
+
+    def setUp(self):
+        super().setUp()
+        cwd = str(self.w.work)
+        self.w.session(self.work, SID_A, lines=[user("ancient", cwd, SID_A)],
+                       mtime=time.time() - 60 * 86400)
+        for n in range(self.NEWER):
+            sid = "%08d-dddd-4ddd-8ddd-dddddddddddd" % n
+            self.w.session(self.work, sid, lines=[user("newer %d" % n, cwd, sid)])
+
+    def test_a_whole_id_past_the_window_is_still_moved(self):
+        out = self.ok(self.w.run("move", SID_A, "--to", "personal", "--dry-run"))
+        self.assertIn(SID_A, out)
+        self.assertIn("ancient", out)
+
+    def test_a_prefix_of_that_id_is_deliberately_not_pinned(self):
+        # ⚠️ not `SID_A[:8]`: an all-digit spec is a ROW NUMBER, a different refusal.
+        self.refused(self.w.run("move", SID_A[:13], "--to", "personal", "--dry-run"),
+                     "11111111-aaaa")
+
+    def test_the_explicit_limit_still_outranks_a_pin_in_a_listing(self):
+        rows = json.loads(self.ok(self.w.run("list", "--json", "--limit", "2")))
+        self.assertEqual(len(rows), 2)
+
+
+class PinUnit(InProc):
+    def test_a_pin_joins_the_live_rows_and_a_cap_still_wins(self):
+        a = self.account("work")
+        cwd = str(self.root / "work")
+        os.makedirs(cwd, exist_ok=True)
+        old = "aaaaaaaa-0000-4000-8000-000000000000"
+        self.session(a, sid=old, cwd=cwd)
+        t = a.home / "projects" / "-work" / (old + ".jsonl")
+        os.utime(str(t), (time.time() - 90 * 86400,) * 2)
+        for n in range(5):
+            sid = "%08d-bbbb-4bbb-8bbb-bbbbbbbbbbbb" % n
+            self.session(a, sid=sid, cwd=cwd)
+        self.assertNotIn(old, [x.local_id for x in self.mod.all_sessions([a], 2)])
+        self.assertIn(old, [x.local_id for x in self.mod.all_sessions([a], 2, pin=old)])
+        # the hard cap is the number that was typed, pin or no pin
+        self.assertEqual(len(self.mod.all_sessions([a], 2, hard=True, pin=old)), 2)
+
+
+class DefaultHomeFirst(InProc):
+    """🛑 The twin check asks the DEFAULT home first.
+
+    It is the home no accounts file has to name, and the one a desktop app or a bare
+    `claude` registers its sessions in — so a session the app is holding open looks quiet
+    from every account that IS named. Asked last, the refusal would name whichever other
+    home it reached first and send somebody to stop the wrong process.
+    """
+
+    def test_the_default_home_is_the_first_home_asked(self):
+        d = self.root / "home" / ".claude"
+        (d / "projects").mkdir(parents=True)
+        a, b = self.account("work"), self.account("personal", email="me@home.example")
+        c = self.account("third", email="me@third.example")
+        s = self.session(a)
+        names = [x.name for x in self.mod.other_homes(s, b, [c, a])]
+        self.assertEqual(names[0], "default")
+        self.assertIn("third", names)
+        self.assertNotIn("work", names, "the source is not a third home")
+        self.assertNotIn("personal", names, "nor is the target")
+
+    def test_when_the_accounts_file_names_that_home_its_own_row_goes_first(self):
+        # The refusal has to call the home what the reader calls it, so a named row wins
+        # over the unnamed stand-in — while still being asked first.
+        d = self.root / "home" / ".claude"
+        (d / "projects").mkdir(parents=True)
+        app = self.mod.Account("app", d, default=True)
+        a, b = self.account("work"), self.account("personal", email="me@home.example")
+        s = self.session(a)
+        names = [x.name for x in self.mod.other_homes(s, b, [a, app])]
+        self.assertEqual(names, ["app"])
+        self.assertNotIn("default", names)
+
+    def test_a_home_that_is_not_there_is_not_a_home(self):
+        a, b = self.account("work"), self.account("personal", email="me@home.example")
+        s = self.session(a)
+        # no ~/.claude on this fixture machine at all
+        self.assertEqual(self.mod.other_homes(s, b, [a, b]), [])
+
+
+class AmbiguousIdGuard(Base):
+    """The same id in two project folders of one home makes `--resume <id>` ambiguous."""
+
+    def setUp(self):
+        super().setUp()
+        cwd = str(self.w.work)
+        self.w.session(self.work, SID_A, folder="-launch-spelling",
+                       lines=[user("go", cwd, SID_A)])
+
+    def test_a_second_copy_in_another_folder_of_the_target_is_refused(self):
+        self.w.session(self.personal, SID_A, folder="-somewhere-else",
+                       lines=[user("older", str(self.w.work), SID_A)])
+        self.refused(self.w.run("move", SID_A, "--to", "personal", "--from-account",
+                                "work"),
+                     "another project folder", "exactly ONE file")
+
+    def test_one_file_reached_by_two_spellings_is_not_two_copies(self):
+        """🛑 The guard asks `same_path`, not a string comparison.
+
+        With one shared `projects/` tree the destination is reachable under several
+        spellings, and comparing normalised strings calls one file two files —
+        manufacturing a refusal about the very file the move is allowed to write.
+        """
+        central = self.w.root / "central" / "projects"
+        link_into(central, self.work)
+        link_into(central, self.personal)
+        # a second path to the same folder, which a string comparison would read as a twin
+        os.symlink(str(central / "-launch-spelling"), str(central / "-same-by-link"))
+        # an idle shared row is filed under the first home in account order (personal),
+        # so `--to work` is the direction that has somewhere to go
+        out = self.ok(self.w.run("move", SID_A, "--to", "work", "--dry-run"))
+        self.assertNotIn("another project folder", out)
+        self.assertIn("copy NOTHING", out)
+
+
+class MemoryIsNeverCopied(Base):
+    """🛑 §4.16: the project's `memory/` is not copied in ANY store configuration.
+
+    The one case that looks harmless — neither home has a store and the target has no
+    notes yet — is the case that CREATES the second store, and nothing afterwards reports
+    the fork. The plan says where the moved session will read instead, so the choice is
+    the user's and explicit.
+    """
+
+    def setUp(self):
+        super().setUp()
+        cwd = str(self.w.work)
+        self.src = self.w.session(self.work, SID_A, lines=[
+            user("go", cwd, SID_A, uuid="u1")])
+        mem = self.src.parent / "memory"
+        mem.mkdir()
+        (mem / "MEMORY.md").write_text("- a note\n")
+
+    def moved_memory(self):
+        dest = next((self.personal / "projects").rglob(SID_A + ".jsonl"))
+        return sorted(p.name for p in (dest.parent / "memory").glob("*")) \
+            if (dest.parent / "memory").is_dir() else None
+
+    def test_no_store_anywhere_and_a_target_with_no_notes(self):
+        out = self.ok(self.w.run("move", SID_A, "--to", "personal"))
+        self.assertIn("copy NO memory/", out)
+        self.assertIsNone(self.moved_memory())
+
+    def test_a_target_that_has_its_own_notes_keeps_exactly_those(self):
+        folder = self.src.parent.name
+        tm = self.personal / "projects" / folder / "memory"
+        tm.mkdir(parents=True)
+        (tm / "THEIRS.md").write_text("- theirs\n")
+        self.ok(self.w.run("move", SID_A, "--to", "personal"))
+        self.assertEqual(self.moved_memory(), ["THEIRS.md"])
+
+    def test_with_a_store_configured_in_the_target_nothing_is_copied_either(self):
+        store = self.w.root / "store"
+        store.mkdir()
+        (self.personal / "settings.json").write_text(json.dumps(
+            {"env": {"CLAUDE_CODE_REMOTE_MEMORY_DIR": str(store)}}))
+        out = self.ok(self.w.run("move", SID_A, "--to", "personal"))
+        self.assertIn("reads auto-memory from", out)
+        self.assertIsNone(self.moved_memory())
+        self.assertEqual(list(store.rglob("MEMORY.md")), [])
+
+    def test_the_source_keeps_its_own_notes_whatever_happens(self):
+        self.ok(self.w.run("move", SID_A, "--to", "personal"))
+        self.assertEqual((self.src.parent / "memory" / "MEMORY.md").read_text(),
+                         "- a note\n")
+
+
+class MillisecondTimes(InProc):
+    """`epoch_s` normalises milliseconds, so a limit waited out stays waited out."""
+
+    def test_a_millisecond_resets_at_in_the_past_does_not_flag_a_quota(self):
+        cwd = str(self.root / "work")
+        os.makedirs(cwd, exist_ok=True)
+        past_ms = int((time.time() - 30 * 86400) * 1000)
+        t = self.root / "u1.jsonl"
+        t.write_text(jl(user("p", cwd, SID_A),
+                        assistant("limit", cwd, SID_A, error="usage_limit_reached",
+                                  resets=past_ms),
+                        # a clean assistant line AFTER it: only `resets_at` could flag it
+                        assistant("and on we go", cwd, SID_A)))
+        self.assertEqual(self.mod.scan_transcript(t)["quota"], {})
+
+    def test_the_same_reset_in_the_future_does_flag_it(self):
+        cwd = str(self.root / "work")
+        os.makedirs(cwd, exist_ok=True)
+        soon_ms = int((time.time() + 3600) * 1000)
+        t = self.root / "u2.jsonl"
+        t.write_text(jl(user("p", cwd, SID_A),
+                        assistant("limit", cwd, SID_A, error="usage_limit_reached",
+                                  resets=soon_ms),
+                        assistant("and on we go", cwd, SID_A)))
+        q = self.mod.scan_transcript(t)["quota"]
+        self.assertAlmostEqual(q["resets_at"], soon_ms / 1000.0, places=0)
 
 
 if __name__ == "__main__":

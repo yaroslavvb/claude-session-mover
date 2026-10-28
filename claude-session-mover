@@ -9,6 +9,7 @@
     csm move "refactor" --to personal --dry-run
     csm move "refactor" --to auto          # ...to whichever account has the most room left
     csm move https://claude.ai/code/session_01Ab... --to work
+    csm revive https://claude.ai/code/session_01Ab... --dry-run   # it stopped: why, and what now
     csm stop 3                             # end a session csm moved, and free its window
     csm find "refactor"                    # find a session by id, link or title, in EVERY home
     csm find 7f3a --on desktop             # ...on another machine, the desktop app's own titles too
@@ -103,6 +104,7 @@ the tests in tests/ pin every shape the tool depends on.
 from __future__ import annotations
 
 import argparse
+import calendar
 import errno
 import hashlib
 import json
@@ -258,6 +260,17 @@ BOTS_DIR = _env_path("CSM_BOTS_DIR", STATE_DIR / "owners")
 #: The cure in that refusal, as a template carrying `{owner}`, `{to}` and `{id}`. Unset,
 #: the refusal names `--copy-only` and leaves the gesture to the reader.
 BOT_FIX = os.environ.get("CSM_BOT_FIX") or ""
+#: Where a SCHEDULED-PASS supervisor records the session each of its passes runs as: one
+#: `<job>.session` file per job, of `key=value` lines, whose `uuid=` is the LOCAL session
+#: id (the last `uuid=` line wins — the file is appended to, not rewritten). The fleet this
+#: was written against keeps them in `~/drive.unsynced/rc-jobs` and has a `--revive` of its
+#: own that puts the pass back on the SAME claude.ai link, so a session named here is
+#: revived by its owner and not by this tool: `revive` refuses it and says whose command it
+#: is. Same two readings as `CSM_BOTS_DIR` — absent means no such supervisor, unreadable is
+#: a refusal — and UNSET means nothing is owned this way at all, because the default
+#: installation has no such program.
+RC_JOBS_DIR = _env_path("CSM_RC_JOBS_DIR", Path("")) if os.environ.get(
+    "CSM_RC_JOBS_DIR") else None
 
 #: How long a config home keeps a transcript the CLI has not touched. Absent from the
 #: settings means the CLI's own default; `0` switches the sweep off. Read only to WARN, in
@@ -268,6 +281,15 @@ RETENTION_DEFAULT_DAYS = 30
 #: transcript is normal and a home holds hundreds, so a listing row costs two seeks.
 HEAD_BYTES = _env_num("CSM_HEAD_BYTES", 96 * 1024)
 TAIL_BYTES = _env_num("CSM_TAIL_BYTES", 384 * 1024)
+#: 🛑 HOW MUCH `revive` READS TO SAY WHY A SESSION STOPPED — and it is NOT `TAIL_BYTES`.
+#: A listing row wants a cheap verdict; a revive is about to act on that verdict, so it
+#: reads further back. Measured on the incident this was written for (CLI 2.1.312, Wed 28
+#: Oct 2026): `usage_limit_reached` and `quotaLimits` appear in the last 512 KiB of that
+#: 2.6 MB transcript and NOT in the last 384 KiB, so the listing window misses the stop by
+#: ~120 KiB and reads the file as a clean finish. One agentic turn writes megabytes of tool
+#: results after its own prompt, which is why the window is this wide for a file of any
+#: size.
+REVIVE_TAIL_BYTES = _env_num("CSM_REVIVE_TAIL", 1024 * 1024)
 #: How many sessions `list` shows when nothing was asked for, and the ceiling `--all` has.
 #: An EXPLICIT `--limit N` is a hard cap instead, and obeys neither (see `all_sessions`).
 DEFAULT_LIMIT = _env_num("CSM_LIMIT", 20)
@@ -318,6 +340,11 @@ SSH_CMD = os.environ.get("CSM_SSH_CMD") or "ssh -o BatchMode=yes -o ConnectTimeo
 #: see `_remote_word`, and `REMOTE_FALLBACK` just below, which is the same idea.
 REMOTE_CMD = os.environ.get("CSM_REMOTE_CMD") or ""
 REMOTE_FALLBACK = "$HOME/git/claude-session-mover/" + PROG
+#: How `lsof` is invoked. Only `revive` asks it, and only to answer one question — which
+#: folder a running Remote Control SERVER is serving, which is nowhere in its argv. TEST
+#: USE TOO: a fixture world has no real servers in it, so the suite points this at a
+#: stand-in rather than at the machine's own process table.
+LSOF_BIN = os.environ.get("CSM_LSOF") or "lsof"
 #: The interpreter the remote HELPER is piped to (`find`, `--from-machine`, `--mirror-cwd`).
 #: The system python, not this process's: the helper is standard-library-only on purpose so
 #: a machine with no toolchain installed still answers. Nothing of this file goes over.
@@ -331,6 +358,25 @@ QUOTA_ERRORS = ("usage_limit_reached", "rate_limit_error", "rate_limit_exceeded"
 #: A `system` line carrying this marker means the session was ended or archived from the
 #: app. Such a row is shown as "closed", not "ended": resuming it is rarely what you want.
 ENDED_REMOTELY = "code 4090"
+#: 🛑 WHICH LIMIT IT IS, BECAUSE WAITING ONLY CLEARS SOME OF THEM. `(class, matcher, does
+#: waiting clear it)`, read off the stop line's own text — the only place the distinction
+#: appears, since `rateLimitType` says which WINDOW (`five_hour` / `seven_day`) and not
+#: which kind of wall. A session or weekly limit lifts at its reset; a monthly spend cap, a
+#: credit balance and a per-model limit do not, and telling someone to wait for one of
+#: those spends the wait and then another failed turn.
+#: ⚠️ THE ORDER IS LOAD-BEARING: the monthly-spend text also contains the words "your
+#: session limit resets", so monthly has to be tested before session.
+#: Lifted from the fleet's own parked-session classifier, which was written from a measured
+#: table of 21 real parks (`claude_parked`, Wed 7 Oct 2026: 10 monthly spend, 3 usage
+#: credits, 2 model limit, the rest session/weekly).
+LIMIT_CLASSES = (
+    ("monthly-spend", re.compile(r"hit your monthly spend limit", re.I), False),
+    ("weekly", re.compile(r"hit your weekly limit", re.I), True),
+    ("session", re.compile(r"hit your session limit", re.I), True),
+    ("credits", re.compile(r"out of usage credits", re.I), False),
+    ("model", re.compile(r"reached your .{0,20}limit\b.{0,40}Switch to another model",
+                         re.I | re.S), False),
+)
 #: 🛑 What may be passed to `--model`. An assistant line that carries an apiError names its
 #: model `<synthetic>`, and the out-of-quota line, the LAST line of exactly the session you
 #: want to move, is one. `claude --model '<synthetic>'` refuses to start, so a model is
@@ -1821,23 +1867,39 @@ def sessions_for(acct: Account, limit: int, only=None, pin: str = "") -> list:
             chosen.append((m, p))
     out = []
     for m, p in chosen:
-        info = scan_transcript(p)
-        if info["sidechain_only"]:
-            continue                             # a subagent's own transcript
-        r = live.get(p.stem) or {}
-        out.append(Session(
-            account=acct, local_id=p.stem, transcript=p, mtime=m,
-            cwd=info["cwd"] or str(r.get("cwd") or ""), title=info["title"],
-            bridge_id=info["bridge_id"]
-            or re.sub(r"^(cse_|session_)", "", str(r.get("bridgeSessionId") or "")),
-            perm=info["perm"], model=info["model"], pid=int(r.get("pid") or 0),
-            proc_start=str(r.get("procStart") or ""),
-            tmux=str(r.get("tmux") or ""), status=str(r.get("status") or ""),
-            entrypoint=str(r.get("entrypoint") or ""), rc_name=str(r.get("name") or ""),
-            quota=info["quota"], ended_remotely=info["ended_remotely"],
-            mcp_servers=info["mcp_servers"],
-            mcp_used=info["mcp_used"]))
+        row = session_of(acct, p, m, live.get(p.stem))
+        if row is not None:
+            out.append(row)
     return out
+
+
+def session_of(acct: Account, path: Path, mtime: float, live_row: dict = None,
+               subagent_rule: bool = True):
+    """ONE ROW, from one transcript and its registry row (if it has one) — or `None`.
+
+    `None` is the SUBAGENT RULE: a transcript whose every line is a sidechain is a
+    subagent's own file and is not a session anybody means, so `list`, `move` and `stop`
+    never see one. `subagent_rule=False` turns that off, for the one caller that has to
+    answer ABOUT such a file rather than skip it (`revive`: "there is nothing to continue"
+    is an answer about a 0-byte pre-created session, and "no transcript for that link here"
+    would be false about a file that is on disk).
+    """
+    info = scan_transcript(path)
+    if subagent_rule and info["sidechain_only"]:
+        return None
+    r = live_row or {}
+    return Session(
+        account=acct, local_id=path.stem, transcript=path, mtime=mtime,
+        cwd=info["cwd"] or str(r.get("cwd") or ""), title=info["title"],
+        bridge_id=info["bridge_id"]
+        or re.sub(r"^(cse_|session_)", "", str(r.get("bridgeSessionId") or "")),
+        perm=info["perm"], model=info["model"], pid=int(r.get("pid") or 0),
+        proc_start=str(r.get("procStart") or ""),
+        tmux=str(r.get("tmux") or ""), status=str(r.get("status") or ""),
+        entrypoint=str(r.get("entrypoint") or ""), rc_name=str(r.get("name") or ""),
+        quota=info["quota"], ended_remotely=info["ended_remotely"],
+        mcp_servers=info["mcp_servers"],
+        mcp_used=info["mcp_used"])
 
 
 #: One entry per transcript the last `dedupe_shared` collapsed: how many EXTRA homes saw it.
@@ -4328,7 +4390,12 @@ def room_note(s: Session, tgt: Account) -> str:
 
 # ------------------------------------------------------------------------------ the move
 
-def auto_target(source: Session, accts: list) -> Account:
+#: What the last `auto_target` chose, in one sentence — a one-value cache in the shape of
+#: `SHARED` and `CUT`. See the 🛑 at the end of `auto_target`.
+AUTO_NOTE: list = []
+
+
+def auto_target(source: Session, accts: list, quiet: bool = False) -> Account:
     """`--to auto`: the account here with the most weekly room. Printed, never silent.
 
     Among the accounts this machine has, those with a FRESH meter reading under both
@@ -4377,23 +4444,38 @@ def auto_target(source: Session, accts: list) -> Account:
             % (machine(), AUTO_FIVE_HOUR_MAX, AUTO_SEVEN_DAY_MAX))
     cands.sort(key=lambda c: c[:3])
     chosen = cands[0][3]
-    print("--to auto: %s, the most weekly room on %s (%s)"
-          % (chosen.label, machine(), meter_text(meter_of(ms, chosen))))
+    line = ("--to auto: %s, the most weekly room on %s (%s)"
+            % (chosen.label, machine(), meter_text(meter_of(ms, chosen))))
+    # 🛑 THE CHOICE IS ALWAYS SAID, and `quiet` only moves WHERE. `AUTO_NOTE` is the
+    # one-value cache (the shape of `SHARED` and `CUT`), so a caller whose one stream is a
+    # contract — `revive --json`, whose stdout must parse as JSON — can print this line
+    # itself, in the right place, instead of finding it in the middle of its own output. A
+    # pick this tool made for you is never silent.
+    del AUTO_NOTE[:]
+    AUTO_NOTE.append(line)
+    if not quiet:
+        print(line)
     return chosen
 
 
-def check_target(s: Session, tgt: Account, accts: list) -> str:
-    """Every reason this target is the wrong one. Returns a warning to print, or `""`."""
-    others = ", ".join(a.label for a in accts if a.name != s.account.name) or "none"
-    # 🛑 ACROSS MACHINES, THE SAME ACCOUNT IS A REAL MOVE, and so is the same home
-    # spelling: it changes the MACHINE, not the quota, which is the whole point of
-    # `--from-machine`. Two machines often spell one home identically, so comparing paths
-    # would refuse exactly the move that was asked for. `do_move` says so in the plan
-    # instead.
-    if not s.origin and os.path.realpath(str(tgt.home)) == os.path.realpath(
-            str(s.account.home)) and tgt.default == s.account.default:
-        die(f"that session is already in {tgt.label}: a move needs two accounts "
-            f"(the others: {others})")
+def check_home_usable(tgt: Account, accts: list, others: str = "",
+                      before_login=None) -> str:
+    """Can a session RUN in this config home at all? Returns a warning to print, or `""`.
+
+    🛑 EVERY REFUSAL HERE IS ABOUT ONE HOME, and none of them is about a move. That is the
+    whole reason this is its own function (added Wed 28 Oct 2026): `revive` starts a session
+    in the home it is ALREADY in for three of its actions, so `check_target`'s two
+    two-account refusals — source == target, and the same login in another home — are
+    exactly wrong for it, while these five are exactly right. Splitting them is what lets
+    `revive` ask "is this home usable" without asking "is this a legal move".
+
+    ⚠️ ORDER IS PART OF THE CONTRACT, and `before_login` is how `check_target` keeps its
+    own: it passes the same-login refusal, which belongs AFTER the expected-login check and
+    BEFORE `login_usable`. A home holding the wrong login must be reported as the wrong
+    login, not as the same login, and a reader who gets the other sentence goes and fixes
+    the wrong thing.
+    """
+    others = others or (", ".join(a.label for a in accts if a.name != tgt.name) or "none")
     # 🛑 An account the accounts file puts on NO machine is not a move target. Whatever the
     # row is for — a subscription not bought yet, a home retired, a placeholder kept so the
     # name stays reserved — nothing is there to resume into, and the refusal has to name the
@@ -4416,16 +4498,36 @@ def check_target(s: Session, tgt: Account, accts: list) -> str:
         die(f"{tgt.label} holds {held}, not {tgt.expect} as {tilde(ACCOUNTS_FILE)} says: that "
             f"is the WRONG login, and the move would spend the wrong quota. Sign it in again: "
             f"{signin}, then /login")
-    src = s.account
-    if not s.origin and src.email and held.lower() == src.email.lower() and (
-            not tgt.org or not src.org or tgt.org == src.org):
-        die(f"{tgt.label} is signed in as the same login as {src.label} ({held}): the move "
-            "would spend the same quota. Pick a home signed in to another account")
+    if before_login is not None:
+        before_login(held)
     # 🛑 LAST, and before anything is written: the state file is not the credential.
     ok, sentence = login_usable(tgt)
     if not ok:
         die(sentence)
     return sentence
+
+
+def check_target(s: Session, tgt: Account, accts: list) -> str:
+    """Every reason this target is the wrong one. Returns a warning to print, or `""`."""
+    others = ", ".join(a.label for a in accts if a.name != s.account.name) or "none"
+    # 🛑 ACROSS MACHINES, THE SAME ACCOUNT IS A REAL MOVE, and so is the same home
+    # spelling: it changes the MACHINE, not the quota, which is the whole point of
+    # `--from-machine`. Two machines often spell one home identically, so comparing paths
+    # would refuse exactly the move that was asked for. `do_move` says so in the plan
+    # instead.
+    if not s.origin and os.path.realpath(str(tgt.home)) == os.path.realpath(
+            str(s.account.home)) and tgt.default == s.account.default:
+        die(f"that session is already in {tgt.label}: a move needs two accounts "
+            f"(the others: {others})")
+    src = s.account
+
+    def same_login(held: str) -> None:
+        if not s.origin and src.email and held.lower() == src.email.lower() and (
+                not tgt.org or not src.org or tgt.org == src.org):
+            die(f"{tgt.label} is signed in as the same login as {src.label} ({held}): the "
+                "move would spend the same quota. Pick a home signed in to another account")
+
+    return check_home_usable(tgt, accts, others=others, before_login=same_login)
 
 
 def window_name(s: Session) -> str:
@@ -6305,6 +6407,1110 @@ def run_window(plan_path: str) -> int:
         return rc
 
 
+# ------------------------------------------------------------------------ the diagnosis
+
+def bridge_spawn_bare(local_id: str) -> str:
+    """The bare bridge id of an orphan bridge-spawn directory that derives to `local_id`.
+
+    🛑 A PID-FREE DEATH INDEX. When a Remote Control server spawns a child it makes
+    `<shared home>/bridge-spawn/cse_<bare>-<6 chars>/` and deletes it again only on a
+    HANDLED exit — so a child that was killed leaves the directory behind, naming the
+    claude.ai session of a transcript that names none itself. The root is `~/.claude` for
+    every account, whatever home the child runs in (measured on CLI 2.1.312, Wed 28 Oct
+    2026: 40/40 such directories derived to exactly one transcript on disk).
+
+    ⚠️ It is corroboration, never a liveness signal: 39 of the 40 belonged to sessions that
+    were live or had been respawned.
+    """
+    d = SHARED_HOME / "bridge-spawn"
+    try:
+        names = sorted(os.listdir(str(d)))
+    except OSError:
+        return ""                            # absent, or not ours to read: no evidence
+    for n in names:
+        if not n.startswith("cse_"):
+            continue
+        bare = n[len("cse_"):].rsplit("-", 1)[0]
+        if bare and derive_local_id("cse_" + bare) == local_id:
+            return bare
+    return ""
+
+
+def revive_kind(s: Session, bare: str = "") -> dict:
+    """WHAT KIND of session this is, which decides what reviving it can even mean.
+
+    `{"kind", "why", "bridge_id", "from"}`, where `kind` is one of:
+      * `server-child` — a worker a Remote Control SERVER spawned. Proved, not guessed: its
+        local id IS `uuid5` of its bridge session's api url, so a bare bridge id from any
+        source (the spec, its live registry row, an orphan bridge-spawn directory) that
+        derives to this transcript's name is proof. Such a session cannot be resumed onto
+        its own link — `--resume <uuid>` registers a new one — so same-account revive forks.
+      * `self-hosted` — a session that asked for Remote Control itself (`--remote-control=`)
+        and wrote a `bridge-session` line or a `bridge_status` url INTO its transcript.
+        Resuming one re-attaches the same claude.ai session.
+      * `desktop` — the desktop app's own session, which the app's index knows.
+      * `terminal` — neither: a plain `claude` in a terminal, with a random v4 id.
+
+    🛑 NEVER `entrypoint`. The registry's `entrypoint` looks like the answer and is not:
+    measured on CLI 2.1.312, Wed 28 Oct 2026, it is a property of HOW the process was
+    started (`sdk-cli` means `--print`), and a fork or a resume rewrites it — so a revived
+    server child would stop being one in csm's eyes exactly when it matters.
+    """
+    out = {"kind": "terminal", "why": "", "bridge_id": "", "from": ""}
+    in_file = ""
+    if s.transcript.exists():
+        in_file = scan_transcript(s.transcript)["bridge_id"]
+    # Every source of a bare bridge id, cheapest first; the spec's is the one the caller
+    # typed, so it is believed before anything read off disk.
+    for src, val in (("the link", bare), ("its registry row", s.bridge_id),
+                     ("its transcript", in_file),
+                     ("an orphan bridge-spawn dir", bridge_spawn_bare(s.local_id))):
+        if val and derive_local_id("cse_" + val) == s.local_id:
+            out["kind"], out["bridge_id"], out["from"] = "server-child", val, src
+            out["why"] = ("%s is uuid5 of session_%s's own api url, which only a Remote "
+                          "Control server child's id ever is (%s)"
+                          % (s.short, val, src))
+            return out
+    if in_file:
+        out["kind"], out["bridge_id"], out["from"] = ("self-hosted", in_file,
+                                                      "its transcript")
+        out["why"] = ("its transcript names claude.ai session_%s itself, so it asked for "
+                      "Remote Control and a resume re-attaches that link" % in_file)
+        return out
+    if s.desktop:
+        out["kind"], out["from"] = "desktop", "the desktop app's index"
+        out["bridge_id"] = s.bridge_id or bare
+        out["why"] = "the desktop app's own session index knows this session"
+        return out
+    out["bridge_id"] = s.bridge_id or bare
+    out["why"] = ("nothing ties %s to a claude.ai session: no derivation, no bridge line, "
+                  "no desktop record" % s.short)
+    return out
+
+
+def revive_state(s: Session, bare: str = "") -> dict:
+    """IS IT RUNNING? `{"state", "why", "status", "pid", "proved", "ps", "ps_asked"}`.
+
+    `state` is `live-busy`, `live-idle` or `dead`. A registry row is not enough: pids are
+    reused and registry files outlive their processes, so the row counts only once
+    `still_the_same_process` has compared the pid's start time with the one the CLI wrote
+    down. An unprovable row reads as DEAD here, and the reason is kept — the worst outcome
+    for a revive is believing a session is alive when its work has stopped.
+
+    🛑 AND A MISSING ROW IS NOT PROOF EITHER, which is why the machine-wide `ps` sweep is
+    taken as well: measured on CLI 2.1.312, Wed 28 Oct 2026, a registry file SURVIVES the
+    SIGKILL of its own process until some live session sweeps the directory, and the
+    reverse happens too — a server child's argv carries `cse_<bare>` and never the local
+    uuid, so one `ps` over the whole machine is the only place a child whose home csm is
+    not looking in shows up at all. `ps_asked` False means `ps` could not be ASKED, which
+    is never "nothing is running".
+    """
+    out = {"state": "dead", "why": "", "status": s.status, "pid": s.pid, "proved": None,
+           "ps": [], "ps_asked": False}
+    rows = ps_table()
+    out["ps_asked"] = rows is not None
+    own = re.compile(r"--(?:resume|session-id)[= ]" + re.escape(s.local_id) + r"\b")
+    # ⚠️ `bare` is the PROVED bridge id (`revive_kind`), which for a dead server child comes
+    # from the link and is in no file csm read — so taking it from `s.bridge_id` alone would
+    # sweep for a name nothing carries, in exactly the case this sweep exists for.
+    cse = "cse_" + (bare or s.bridge_id) if (bare or s.bridge_id) else ""
+    for pid, cmd in sorted((rows or {}).items()):
+        if not is_claude_exe(cmd):
+            continue
+        if own.search(cmd) or (cse and cse in cmd):
+            out["ps"].append({"pid": pid, "cmd": cmd[:160]})
+    if not s.pid:
+        out["why"] = "no config home here has a registry row for it"
+    else:
+        ok, why = still_the_same_process(s)
+        out["proved"], out["why"] = ok, why
+        if ok:
+            out["state"] = "live-busy" if s.status == "busy" else "live-idle"
+    if out["state"] == "dead" and out["ps"]:
+        out["why"] += ("; but %d process(es) on this machine name it: %s"
+                       % (len(out["ps"]), ", ".join("pid %d" % p["pid"]
+                                                    for p in out["ps"])))
+    return out
+
+
+def _blocks(d: dict) -> list:
+    m = d.get("message")
+    c = m.get("content") if isinstance(m, dict) else None
+    return [b for b in (c or ()) if isinstance(b, dict)] if isinstance(c, list) else []
+
+
+def _tool_results(d: dict) -> list:
+    return [str(b.get("tool_use_id") or "") for b in _blocks(d)
+            if b.get("type") == "tool_result"]
+
+
+def _tool_uses(d: dict) -> list:
+    return [(str(b.get("id") or ""), str(b.get("name") or "")) for b in _blocks(d)
+            if b.get("type") == "tool_use"]
+
+
+def _stamp(d: dict) -> float:
+    """A transcript line's own `timestamp` as an epoch, or 0.0. ISO 8601, always UTC (`Z`)."""
+    t = d.get("timestamp")
+    if not isinstance(t, str) or not t:
+        return 0.0
+    m = re.match(r"(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d):(\d\d)", t)
+    if not m:
+        return 0.0
+    try:
+        # `timegm`, not `mktime`: the CLI writes UTC and this process's zone is not it.
+        return float(calendar.timegm(tuple(int(x) for x in m.groups()) + (0, 1, -1)))
+    except (ValueError, OverflowError):
+        return 0.0
+
+
+def limit_class(text: str):
+    """`(class, does waiting clear it)` for a limit's own words, or `("", None)`.
+
+    See `LIMIT_CLASSES`: the window (`five_hour` / `seven_day`) says when it resets, this
+    says whether a reset is the cure at all.
+    """
+    for name, rx, clears in LIMIT_CLASSES:
+        if rx.search(text or ""):
+            return name, clears
+    return "", None
+
+
+def revive_stop(path: Path, tail: int = 0) -> dict:
+    """WHY IT STOPPED, read from the transcript as JSON lines — never as a text grep.
+
+    `stop` is one of, in this precedence:
+      1. `empty` — 0 bytes, or no main-chain line at all: there is nothing to continue.
+      2. `usage-limit` — the last assistant line of the conversation is a limit, or a limit
+         still in force is the last thing that happened. Carries `class` (what kind of wall,
+         from its own text), `window` (`rateLimitType`), `resets_at` and `in_force`.
+      3. `api-error` — an error that is not a limit (`kind` names it).
+      4. `mid-turn` — the last main-chain assistant line holds a `tool_use` that no later
+         `tool_result` answers: the turn was cut off while a tool was running, and what that
+         tool did is UNKNOWN.
+      5. `archived` — a `code 4090` system line after the last `bridge_status`, i.e. the
+         session was archived or ended from the app (`archived` is also its own flag, so a
+         caller can see it whichever class won).
+      6. `finished` — a clean assistant line last: it answered and stopped.
+      7. `unknown` — nothing in the window says.
+
+    🛑 PARSED, AND FROM THE LAST REAL PROMPT FORWARD. A text match on the tail answers
+    "does this conversation mention a rate limit", which is true of any session that
+    discussed one — measured Wed 28 Oct 2026: of 321 transcripts written in the last week
+    here, one of the two hits was a session that merely contained the words. And the window
+    starts at the last non-`isMeta`, non-`tool_result` USER line because that is where this
+    attempt began: a limit from a turn two prompts ago was waited out and is not why the
+    session is sitting still now.
+    """
+    out = {"stop": "unknown", "why": "", "at": 0.0, "age": "", "read_bytes": 0,
+           "lines": 0, "from_prompt": False, "archived": False,
+           "class": "", "clears_with_time": None, "window": "", "resets_at": 0.0,
+           "in_force": False, "message": "", "kind": "", "tool": "", "tool_at": 0.0}
+    want = int(tail or REVIVE_TAIL_BYTES)
+    size = file_size(path)
+    if size is None:
+        out["why"] = "%s could not be read" % tilde(path)
+        return out
+    if size == 0:
+        out["stop"], out["why"] = "empty", "the transcript is 0 bytes: it never ran a turn"
+        return out
+    try:
+        with path.open("rb") as f:
+            f.seek(max(0, size - want))
+            blob = f.read()
+    except OSError:
+        out["why"] = "%s could not be read" % tilde(path)
+        return out
+    out["read_bytes"] = len(blob)
+    rows = list(_iter_json_lines(blob, drop_first=size > want))
+    out["lines"] = len(rows)
+    start = 0
+    for i, d in enumerate(rows):
+        if (d.get("type") == "user" and not d.get("isSidechain") and not d.get("isMeta")
+                and not _tool_results(d)):
+            start, out["from_prompt"] = i, True
+    window = rows[start:]
+    quota, api_err, last_asst = {}, {}, {}
+    bridge_i = ended_i = clean_i = -1
+    results, mtime = set(), 0.0
+    main = False
+    for i, d in enumerate(window):
+        t = d.get("type")
+        if d.get("isSidechain"):
+            continue                         # a subagent's turn is not the session's
+        if t in MAIN_TYPES:
+            main = True
+        if t == "system":
+            txt = _text_of(d.get("message")) or str(d.get("content") or "")
+            if d.get("subtype") == "bridge_status":
+                bridge_i = i
+            if ENDED_REMOTELY in txt:
+                ended_i = i
+                mtime = _stamp(d) or mtime
+        if t == "user":
+            results |= set(x for x in _tool_results(d) if x)
+        if t != "assistant" or not isinstance(d.get("message"), dict):
+            continue
+        last_asst = d
+        m = d["message"]
+        err = d.get("apiError") or m.get("apiError")
+        is_quota = err in QUOTA_ERRORS or (d.get("isApiErrorMessage")
+                                           and d.get("error") == "rate_limit")
+        if is_quota:
+            p = d.get("apiErrorParams") or m.get("apiErrorParams") or {}
+            rl = p.get("rate_limit_info") if isinstance(p, dict) else None
+            rl = rl if isinstance(rl, dict) else {}
+            resets, kind = epoch_s(rl.get("resetsAt")), rl.get("rateLimitType") or ""
+            if not resets or not kind:
+                for holder in (p, d, m):
+                    q = holder.get("quotaLimits") if isinstance(holder, dict) else None
+                    if not isinstance(q, dict):
+                        continue
+                    if not resets:
+                        resets = epoch_s(q.get("resetsAt"))
+                    if not kind and isinstance(q.get("rateLimitType"), str):
+                        kind = q["rateLimitType"]
+                    if resets and kind:
+                        break
+            txt = _text_of(m)
+            klass, clears = limit_class(txt)
+            quota = {"i": i, "window": kind, "resets_at": resets, "class": klass,
+                     "clears_with_time": clears, "message": tidy(txt, 120),
+                     "error": err or str(d.get("error") or ""), "at": _stamp(d)}
+        elif err or d.get("isApiErrorMessage"):
+            api_err = {"i": i, "kind": str(err or d.get("error") or "an error"),
+                       "message": tidy(_text_of(m), 120), "at": _stamp(d)}
+        else:
+            # 🛑 A CLEAN LINE AFTER THE ERROR MEANS IT RECOVERED. One prompt's turn can hit
+            # a limit, wait, and answer anyway (2.1.312 auto-continues at a usage limit when
+            # the session is interactive), so the error being IN the window is not the
+            # session stopping there. `scan_transcript` keeps the same rule for the same
+            # reason, and an error line is never a clean line: it names its model
+            # `<synthetic>`.
+            clean_i = i
+    if not main:
+        out["stop"] = "empty"
+        out["why"] = ("nothing in the last %s of %s is a line of the main conversation: "
+                      "there is nothing to continue"
+                      % (human_bytes(out["read_bytes"]), path.name))
+        return out
+    pending = [(tid, name) for tid, name in _tool_uses(last_asst) if tid not in results]
+    archived = ended_i >= 0 and ended_i > bridge_i
+    out["archived"] = archived
+    now = time.time()
+    if quota and (quota["resets_at"] > now or quota["i"] > clean_i):
+        out.update({k: quota[k] for k in ("window", "resets_at", "class", "message",
+                                          "clears_with_time")})
+        out["kind"] = quota["error"]
+        out["in_force"] = quota["resets_at"] > now
+        out["stop"] = "usage-limit"
+        out["at"] = quota["at"]
+        out["why"] = ("it hit a %s limit%s%s"
+                      % (quota["class"] or quota["window"] or "usage",
+                         (", which resets %s" % clock(quota["resets_at"]))
+                         if quota["resets_at"] else "",
+                         "" if out["in_force"] else " — that reset has passed"))
+    elif api_err and api_err["i"] > clean_i:
+        out.update(stop="api-error", kind=api_err["kind"], message=api_err["message"],
+                   at=api_err["at"])
+        out["why"] = "its last turn ended on %s, which is not a limit" % api_err["kind"]
+    elif pending:
+        out.update(stop="mid-turn", tool=pending[0][1] or "a tool",
+                   tool_at=_stamp(last_asst), at=_stamp(last_asst))
+        out["why"] = ("it was cut off mid-turn: its last tool call (%s) has no recorded "
+                      "result, so what that call did is UNKNOWN" % out["tool"])
+    elif archived:
+        out.update(stop="archived", at=mtime)
+        out["why"] = ("it was archived or ended from the app (%s after the last "
+                      "/remote-control report)" % ENDED_REMOTELY)
+    elif last_asst:
+        out.update(stop="finished", at=_stamp(last_asst))
+        out["why"] = "it answered and stopped: the last line is a clean assistant turn"
+    if not out["at"]:
+        # The file's own mtime is the fallback: a line with no `timestamp` is normal in
+        # older builds, and a coarse instant is better than an invented one. `file_age_s`
+        # rather than a bare `stat`, so a file that moved between the two reads is an
+        # unknown instant and not a traceback.
+        age = file_age_s(path)
+        out["at"] = (time.time() - age) if age is not None else 0.0
+    out["age"] = human_age(out["at"]) if out["at"] else ""
+    return out
+
+
+def revive_lost_work(s: Session) -> dict:
+    """The agents a frozen workflow file says DIED. `{"errors", "labels", "files"}`.
+
+    🛑 NEVER THE FILE'S OWN `status`. Measured on the incident this was written for
+    (`wf_d4fd7f6a-04f.json`, 753,955 B, Wed 28 Oct 2026): five agents in
+    `workflowProgress` carry `state: "error"` with "You've hit your session limit", and the
+    file's top-level `status` reads `completed`. A caller that believed the top level would
+    report the run as finished at exactly the moment it should report the opposite — so
+    only the per-agent `state` is read here, and nobody should reinstate the other.
+    """
+    out = {"errors": 0, "labels": [], "files": [], "unread": []}
+    d = s.sibling / "workflows"
+    try:
+        names = sorted(n for n in os.listdir(str(d))
+                       if n.startswith("wf_") and n.endswith(".json"))
+    except OSError:
+        return out                           # no sibling directory: nothing froze here
+    for n in names:
+        rec = read_json(d / n)
+        if not isinstance(rec, dict):
+            out["unread"].append(n)          # a half-written file is not a claim
+            continue
+        rows = rec.get("workflowProgress")
+        if not isinstance(rows, list):
+            continue
+        bad = [r for r in rows if isinstance(r, dict) and r.get("state") == "error"]
+        if not bad:
+            continue
+        out["files"].append(n)
+        out["errors"] += len(bad)
+        for r in bad:
+            out["labels"].append(str(r.get("label") or r.get("phaseTitle")
+                                     or "agent %s" % r.get("index")))
+    return out
+
+
+def revive_account(s: Session, accts: list) -> dict:
+    """Can the session's OWN home still run it, and how much quota does that account have?
+
+    `usable` is `check_home_usable`'s verdict, caught rather than raised: a diagnosis says
+    what is wrong, and the refusal belongs to whatever decides to act.
+
+    🛑 THE 5-HOUR INSTANT NEVER COMES FROM THE METER. A meter reading carries percentages
+    and a `resets_at` that is the SEVEN-DAY window's, so using it as "when the limit lifts"
+    answers a different question by hours. The 5-hour instant is the transcript's own
+    `quotaLimits.resetsAt` (see `revive_stop`), and the reading here is reported as
+    `fresh` / `stale` / `unread` — unread is never room.
+    """
+    a = s.account
+    out = {"label": a.label, "email": a.email, "home": tilde(a.home), "usable": None,
+           "why": "", "meter": "unread", "meter_text": meter_text(None),
+           "five_hour": None, "seven_day": None, "seven_day_resets_at": ""}
+    try:
+        out["usable"], out["why"] = True, check_home_usable(a, accts)
+    except Refusal as e:
+        out["usable"], out["why"] = False, str(e)
+    m = meter_of(meters(), a)
+    if m:
+        out["meter"] = "stale" if m["age_s"] > METER_MAX_AGE_S else "fresh"
+        out["meter_text"] = meter_text(m)
+        out["five_hour"], out["seven_day"] = m["five_hour"], m["seven_day"]
+        out["seven_day_resets_at"] = m["resets_at"]
+    return out
+
+
+#: The `--name` a Remote Control server was started with: the label he reads in the app's
+#: session list, and the one word that makes "a server is up in this folder" mean something
+#: to him. (Which processes are SERVERS is `RC_SERVER_RE`, already defined for the
+#: permission sweep: the bare `remote-control` SUBCOMMAND, never a session's own
+#: `--remote-control=<name>` flag.)
+RC_NAME_RE = re.compile(r"--name[= ](\S+)")
+
+
+def lsof_cwds(pids: list):
+    """`{pid: its working directory}`, or `None` when `lsof` COULD NOT BE ASKED.
+
+    🛑 ONE CALL FOR EVERY PID, because `lsof` takes a comma list and this machine runs
+    dozens of Remote Control servers: one `lsof` per candidate is dozens of processes
+    spawned inside a command that has to answer in seconds. `-F pn` is the machine-readable
+    form — a `p<pid>` record, then an `n<path>` record per descriptor — and a pid that
+    answers nothing is simply absent from the map, which is not the same as `None` for the
+    whole question (the rule `_ps` and `ps_table` keep).
+    """
+    if not pids:
+        return {}
+    env = scrubbed_env(dict(os.environ))
+    env["LC_ALL"] = "C"
+    try:
+        r = subprocess.run([LSOF_BIN, "-a", "-d", "cwd", "-F", "pn",
+                            "-p", ",".join(str(p) for p in pids)],
+                           capture_output=True, text=True, timeout=20, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode not in (0, 1):           # 1 is lsof's own "nothing matched"
+        return None
+    out, cur = {}, 0
+    for ln in (r.stdout or "").splitlines():
+        if ln[:1] == "p" and ln[1:].isdigit():
+            cur = int(ln[1:])
+        elif ln[:1] == "n" and cur:
+            out.setdefault(cur, ln[1:])
+    return out
+
+
+def server_in_folder(cwd: str) -> dict:
+    """Is a Remote Control SERVER running in this folder? `{"up", "why", "pids", "names"}`.
+
+    `up` is `True`, `False` or `None`, and `None` is "could not look" — never a no. It
+    matters for exactly one answer: a dead server child comes back by itself when its
+    server is up and somebody opens the link (the server respawns it lazily), and does not
+    when the server is down.
+
+    Best effort by construction: the folder a process is in is not in its argv, so it takes
+    an `lsof` per candidate, and an `lsof` that will not answer leaves the question open.
+    """
+    out = {"up": None, "why": "", "pids": [], "names": []}
+    if not cwd:
+        out["why"] = "the session records no folder, so there is nothing to ask about"
+        return out
+    rows = ps_table()
+    if rows is None:
+        out["why"] = "ps could not be asked, so nothing here says whether a server is up"
+        return out
+    cands = [(pid, cmd) for pid, cmd in sorted(rows.items())
+             if is_claude_exe(cmd) and RC_SERVER_RE.search(cmd)]
+    if not cands:
+        out["up"] = False
+        out["why"] = "no `claude remote-control` server is running on %s at all" % machine()
+        return out
+    want = os.path.realpath(cwd)
+    cwds = lsof_cwds([pid for pid, _c in cands])
+    if cwds is None:
+        out["why"] = ("lsof could not be asked where the %d `claude remote-control` "
+                      "process(es) here are running, so whether one serves this folder is "
+                      "unread" % len(cands))
+        return out
+    blind = len(cands) - len(cwds)
+    for pid, cmd in cands:
+        got = cwds.get(pid)
+        if got and os.path.realpath(got) == want:
+            out["pids"].append(pid)
+            m = RC_NAME_RE.search(cmd)
+            if m:
+                out["names"].append(m.group(1))
+    if out["pids"]:
+        out["up"] = True
+        out["why"] = ("a server is up in this folder: pid%s %s%s"
+                      % ("" if len(out["pids"]) == 1 else "s",
+                         ", ".join(str(p) for p in out["pids"]),
+                         (" (%s)" % ", ".join(sorted(set(out["names"]))))
+                         if out["names"] else ""))
+    elif blind:
+        # Some candidate named no folder — it exited between the `ps` and the `lsof`, or
+        # this process may not look into it. Either way the question is open, not answered.
+        out["why"] = ("%d of the %d `claude remote-control` process(es) here named no "
+                      "folder, so whether one serves this folder is unread"
+                      % (blind, len(cands)))
+    else:
+        out["up"] = False
+        out["why"] = ("%d `claude remote-control` server(s) are up here, none of them in "
+                      "this folder" % len(cands))
+    return out
+
+
+def rc_job_owner(local_id: str) -> str:
+    """The scheduled pass that owns this session, or `""`. See `CSM_RC_JOBS_DIR`.
+
+    🛑 THE SAME DOCTRINE AS `owner_of`, and for the same reason: a directory that cannot be
+    READ is a refusal, not a "no". If this answered `""` there, revive would start a second
+    copy of a pass whose supervisor is still putting the first one back on the same link.
+    `os.listdir`, never `Path.glob`, because glob swallows the PermissionError.
+    """
+    if RC_JOBS_DIR is None:
+        return ""                            # the knob is unset: no such supervisor here
+    try:
+        names = sorted(os.listdir(str(RC_JOBS_DIR)))
+    except FileNotFoundError:
+        return ""
+    except NotADirectoryError:
+        die("CSM_RC_JOBS_DIR is %s, which is not a directory: point it at the directory a "
+            "scheduled-pass supervisor keeps its state in, or unset it" % tilde(RC_JOBS_DIR))
+    except OSError as e:
+        die("could not read %s (%s), so this tool cannot tell whether a scheduled pass "
+            "owns this session — and reviving one that is owned starts a second copy "
+            "beside the one its own supervisor is putting back. Fix the permissions, or "
+            "unset CSM_RC_JOBS_DIR to say there is no such program"
+            % (tilde(RC_JOBS_DIR), e))
+    for n in names:
+        if not n.endswith(".session"):
+            continue
+        try:
+            text = (RC_JOBS_DIR / n).read_text()
+        except OSError:
+            continue                         # one unreadable file is not a claim
+        got = ""
+        for ln in text.splitlines():
+            if ln.startswith("uuid="):
+                got = ln[len("uuid="):].strip()    # appended file: the LAST uuid wins
+        if got and got.lower() == local_id.lower():
+            return n[: -len(".session")]
+    return ""
+
+
+def revive_owner(local_id: str) -> dict:
+    """Who else is in charge of this session. `{"owner", "kind", "fix"}`.
+
+    A supervisor's session is revived by its supervisor, which knows what the session is
+    FOR; csm starting a second copy gives you one nobody is talking to while the first keeps
+    answering. Two kinds are asked about: a bot (`CSM_BOTS_DIR`) and a scheduled pass
+    (`CSM_RC_JOBS_DIR`).
+    """
+    out = {"owner": "", "kind": "", "fix": ""}
+    bot = owner_of(local_id)
+    if bot:
+        # ⚠️ NOT `CSM_BOT_FIX`: that template is move-shaped (it carries `{to}`), and a
+        # revive has no second account in it. A command with an empty `--to` is worse than
+        # naming the owner and stopping.
+        out.update(owner=bot, kind="bot")
+        out["fix"] = ("tell %s to bring its own session back: it owns the channel, and a "
+                      "second copy answers nobody" % bot)
+        return out
+    job = rc_job_owner(local_id)
+    if job:
+        out.update(owner=job, kind="rc_job")
+        out["fix"] = ("it is the scheduled pass `%s`: its own supervisor revives it onto "
+                      "the SAME link (`rc_job %s --revive`), and a copy started here would "
+                      "run the pass twice" % (job, job))
+    return out
+
+
+def diagnose(s: Session, accts: list, sp: Spec = None) -> dict:
+    """ONE RECORD about one session: what it is, whether it runs, why it stopped, what it
+    would cost to continue it, and who else is in charge of it.
+
+    Read-only and offline: it starts nothing, signals nothing and writes nothing. Every
+    field that could not be measured says so rather than guessing, because the decide table
+    above `revive` keys on these words.
+    """
+    bare = (sp.bare if sp else "") or ""
+    kind = revive_kind(s, bare)
+    rec = {
+        "at": time.time(), "machine": machine(), "version": __version__,
+        "session": {
+            "local_id": s.local_id, "short": s.short, "account": s.account.name,
+            "handle": s.handle, "email": s.account.email, "title": s.label,
+            "cwd": s.cwd, "transcript": str(s.transcript),
+            "bytes": file_size(s.transcript), "mtime": s.mtime,
+            "age": human_age(s.mtime), "is_self": s.is_self,
+            "bridge_id": kind["bridge_id"],
+            "url": ("https://claude.ai/code/session_%s" % kind["bridge_id"]
+                    if kind["bridge_id"] else ""),
+            "perm": s.perm, "model": s.model,
+        },
+        "kind": kind,
+        "state": revive_state(s, kind["bridge_id"]),
+        "stop": revive_stop(s.transcript),
+        "lost_work": revive_lost_work(s),
+        "account": revive_account(s, accts),
+        "server": server_in_folder(s.cwd),
+        "owner": revive_owner(s.local_id),
+        "spec": spec_notes(sp) if sp else [],
+    }
+    return rec
+
+
+# ------------------------------------------------------------------------- the revive note
+
+def boot_time() -> float:
+    """When this machine last booted, or `0.0` when nothing here can say.
+
+    Used for ONE sentence in the revive note: a session whose stop is older than the boot
+    was killed by the restart, not by anything it did, and that is the difference between
+    "pick up where you left off" and "work out what happened".
+    """
+    try:
+        r = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True,
+                           text=True, timeout=10)
+        m = re.search(r"sec\s*=\s*(\d+)", r.stdout or "") if r.returncode == 0 else None
+        if m:
+            return float(m.group(1))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:                                     # Linux has no kern.boottime
+        with open("/proc/uptime") as f:
+            return time.time() - float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+#: 🛑 WHAT THE REVIVED SESSION IS SENT, AND HOW LONG IT MAY BE. It arrives as that session's
+#: next USER turn, so it is read as a message and not as a file: long is worse than terse,
+#: and the facts that matter are at the top. The bound is a budget, not a truncation —
+#: optional clauses are dropped to meet it, in `REVIVE_NOTE_OPTIONAL` order.
+REVIVE_NOTE_MAX = _env_num("CSM_REVIVE_NOTE_MAX", 1500)
+#: And what `--say` may carry. A quotation this tool passes on verbatim cannot be shortened
+#: — that would put words in his mouth — so a longer one is REFUSED and the number said.
+REVIVE_SAY_MAX = _env_num("CSM_REVIVE_SAY_MAX", 400)
+#: The clauses dropped, in this order, when the note is over budget — and the REVERSE of
+#: this is the order they are written in, so the first to go is the last to be read. Never
+#: the stamp, the stop, the mid-turn warning, the request or the closing sentence.
+REVIVE_NOTE_OPTIONAL = ("memory", "lost_work", "account", "since")
+
+
+def no_command_prefix(text: str, what: str) -> None:
+    """🛑 A MESSAGE MAY NOT BEGIN `!` OR `/`. The CLI reads the first character of a
+    delivered prompt and runs it as a bash command or a slash command (2.1.312's own
+    `prompt_undelivered` says so: "a prompt starting with ! or / would run as a command
+    there"). So a revive note that began with one would either execute something nobody
+    asked for or vanish, and both are worse than a refusal.
+    """
+    first = (text or "").lstrip()[:1]
+    if first in ("!", "/"):
+        die("%s starts with `%s`, and a message delivered to a session runs a leading `!` "
+            "as a shell command and a leading `/` as a slash command: reword it (a leading "
+            "space is not enough — the CLI strips it)" % (what, first))
+
+
+def revive_note(s: Session, rec: dict, action: str, tgt: Account = None, say: str = "",
+                new_id: str = "", when: str = "", boot: float = None) -> str:
+    """THE REVIVE NOTE: what a revived session is told, as its next user turn.
+
+    🛑 FACTS, STAMPED, AND NOT A WORD THE USER DID NOT SAY. It opens with the stamp because
+    it IS a user turn — it renders in the app as a message, and a message in his
+    conversation that he did not type must say so in its first line. It then says when and
+    why the session stopped, what changed while it was stopped, how it was brought back, and
+    what work was lost; then one request, ATTRIBUTED (`--say` quoted verbatim, otherwise the
+    plain fact that csm was asked to revive it); then one closing sentence about re-checking.
+    `move_note`'s rule holds here too: no advice, no invented instruction, nothing it cannot
+    show.
+
+    ⚠️ THE MID-TURN SENTENCE IS ONLY FOR A MID-TURN STOP. "Do not repeat work that is
+    already done" is right after a limit — the turn demonstrably did not run — and is the
+    most dangerous thing to say after a SIGKILL mid-`Edit`, where the tool call's outcome is
+    unknown. So the unknown is stated instead, and only for that class.
+    """
+    tgt = tgt or s.account
+    when = when or _local_clock()
+    stop = rec.get("stop") or {}
+    lost = rec.get("lost_work") or {}
+    say = (say or "").strip()
+    if say:
+        if len(say) > REVIVE_SAY_MAX:
+            die("--say is %d characters and the limit is %d: this text is quoted verbatim "
+                "into the session's own next turn, so it is refused rather than shortened"
+                % (len(say), REVIVE_SAY_MAX))
+        no_command_prefix(say, "--say")
+    head = ("[claude-session-mover — written by the tool; the user did not type this] "
+            "Revived at %s on `%s`." % (when, machine()))
+    reason = {
+        "usage-limit": "it stopped on a %s limit%s" % (
+            stop.get("class") or stop.get("window") or "usage",
+            (", which %s at %s" % ("lifts" if stop.get("in_force") else "reset",
+                                   clock(stop["resets_at"])))
+            if stop.get("resets_at") else ""),
+        "api-error": "its last turn ended on %s" % (stop.get("kind") or "an error"),
+        "mid-turn": "it was cut off in the middle of a turn",
+        "archived": "it was archived or ended from the app",
+        "finished": "it had answered and was sitting idle",
+        "empty": "it had run no turn at all",
+    }.get(stop.get("stop"), "nothing on disk says why it stopped")
+    body = ["This session stopped at %s (%s ago): %s."
+            % (time.strftime("%a %d %b %H:%M", time.localtime(stop["at"]))
+               if stop.get("at") else "an unrecorded time", stop.get("age") or "?", reason)]
+    opt = {}
+    since = []
+    if stop.get("resets_at") and stop["resets_at"] < time.time():
+        since.append("that limit's reset passed at %s" % clock(stop["resets_at"]))
+    b = boot_time() if boot is None else boot
+    if b and stop.get("at") and b > stop["at"]:
+        since.append("this machine restarted at %s, after the stop — so the process was "
+                     "killed by the restart and not by anything it did"
+                     % time.strftime("%a %H:%M", time.localtime(b)))
+    if since:
+        opt["since"] = "Since then: %s." % "; ".join(since)
+    how = {
+        "wake": "It was still running and idle, so csm sent it this message; nothing was "
+                "restarted and the claude.ai link is unchanged.",
+        "resume": "csm resumed it in place, in the same account, on the same claude.ai "
+                  "session: the link you had still opens this conversation.",
+        "new-link": "csm resumed it in place; it was not a Remote Control session before, "
+                    "so it has a NEW claude.ai link and nothing opens the old one.",
+        "fork": "csm FORKED it: this copy is %s, forked from %s. The old link still opens "
+                "the OLD copy, which is a second conversation with the same past — do not "
+                "type there, and archive it." % (new_id[:8] or "a new session", s.short),
+        "move": "csm moved it from %s to %s, so every turn from here is spent on that "
+                "account's quota." % (s.account.email or s.account.label,
+                                      tgt.email or tgt.label),
+    }.get(action, "")
+    if how:
+        body.append(how)
+    acct = []
+    if tgt.email and s.account.email and tgt.email.lower() != s.account.email.lower():
+        acct.append("You now run as %s (config home %s); references above to %s are stale, "
+                    "and the account change dropped the preserved thinking from the earlier "
+                    "turns." % (tgt.email, tgt.home, s.account.email))
+    else:
+        acct.append("You are still %s on `%s`, in %s."
+                    % (tgt.email or tgt.label, machine(), s.cwd or "the same folder"))
+    opt["account"] = " ".join(acct)
+    store, hw, _keyed = memory_store(tgt)
+    if store:
+        opt["memory"] = ("Auto memory for this project is read from %s (%s)."
+                         % (memory_dir(tgt, s.transcript.parent.name, s.cwd)[0], hw))
+    if lost.get("errors"):
+        labels = ", ".join(lost["labels"][:6])
+        opt["lost_work"] = ("%d agent(s) of a workflow run died with it%s: that work is not "
+                            "done, whatever the run's own status file says."
+                            % (lost["errors"], (" (%s)" % labels) if labels else ""))
+    for key in reversed(REVIVE_NOTE_OPTIONAL):
+        if key in opt:
+            body.append(opt[key])
+    if stop.get("stop") == "mid-turn":
+        body.append("Its last tool call (%s, %s) has no recorded result: check whether it "
+                    "took effect before repeating it."
+                    % (stop.get("tool") or "a tool",
+                       time.strftime("%H:%M", time.localtime(stop["tool_at"]))
+                       if stop.get("tool_at") else "time unrecorded"))
+    # ⚠️ VERBATIM, inside the quotes, and the full stop is OUTSIDE them: the sentence has
+    # to close, and nothing may be added to or taken from what he typed.
+    ask = ('He said: "%s".' % say if say else
+           "He asked csm to revive this session and continue where it stopped.")
+    close = ("Re-check anything time-sensitive (running jobs, locks, claims, hardware "
+             "state) before acting on it; do not repeat work that is already done.")
+    def joined(keep: list) -> str:
+        return " ".join([head] + keep + [ask, close])
+
+    keep = list(body)
+    note = joined(keep)
+    # The budget, met by dropping the optional clauses in their documented order — never by
+    # cutting a sentence in half, and never the ones the reader needs to act safely.
+    for key in REVIVE_NOTE_OPTIONAL:
+        if len(note) <= REVIVE_NOTE_MAX:
+            break
+        if key in opt and opt[key] in keep:
+            keep.remove(opt[key])
+            note = joined(keep)
+    if len(note) > REVIVE_NOTE_MAX:
+        log("revive note is %d characters, over the %d budget with nothing left to drop"
+            % (len(note), REVIVE_NOTE_MAX))
+    no_command_prefix(note, "the revive note")
+    return note
+
+
+# ---------------------------------------------------------------------------- the revive
+
+#: 🛑 THE DECIDE TABLE, AS DATA: `(row, action, exit code)`. `revive_decide` walks the
+#: conditions in this order and the FIRST match wins, which is the whole contract — a
+#: session that is both out of quota and dead is answered about the quota, because starting
+#: it would spend the next turn hitting the same wall.
+REVIVE_ROWS = {
+    1: ("refuse", 2), 2: ("refuse", 2), 3: ("nothing", 0), 4: ("refuse", 2),
+    5: ("wake", 0), 6: ("move", 0), 7: ("resume", 0), 8: ("new-link", 0),
+    9: ("keep-link", 0), 10: ("fork", 0),
+}
+#: Which rows deliver the revive note. Rows 1, 2 and 4 refuse, row 3 has nothing to say to
+#: a session that is working, and row 9 starts nothing — the one sentence to type is printed
+#: for the reader instead, because only he can open the link that makes the server respawn.
+REVIVE_ROWS_WITH_NOTE = (5, 6, 7, 8, 10)
+
+
+def revive_decide(rec: dict, args, tgt: Account = None) -> dict:
+    """WHICH ROW this session takes, what that row would do, and the one risk in doing it.
+
+    Pure: it reads the diagnosis and the flags and touches nothing. Returns
+    `{"row", "action", "exit", "what", "risk", "cures", "refusal", "note"}`, where `what`
+    and `risk` are the second and third lines of the three-line answer.
+    """
+    st = (rec.get("state") or {}).get("state") or "dead"
+    stop = rec.get("stop") or {}
+    kind = (rec.get("kind") or {}).get("kind") or "terminal"
+    sess = rec.get("session") or {}
+    own = rec.get("owner") or {}
+    srv = rec.get("server") or {}
+    to = (getattr(args, "to", "") or "").strip()
+    out = {"row": 0, "action": "refuse", "exit": 2, "what": "", "risk": "",
+           "cures": [], "refusal": "", "note": False}
+
+    def take(row, what, risk="", refusal="", cures=()):
+        out["row"], out["what"], out["risk"] = row, what, risk
+        out["action"], out["exit"] = REVIVE_ROWS[row]
+        out["refusal"], out["cures"] = refusal, list(cures)
+        out["note"] = row in REVIVE_ROWS_WITH_NOTE
+        return out
+
+    if own.get("owner"):
+        return take(1, "nothing to do: %s owns this session" % own["owner"],
+                    "a copy started here answers nobody while %s keeps answering"
+                    % own["owner"],
+                    "session %s is %s's own session: %s"
+                    % (sess.get("short"), own["owner"], own.get("fix") or
+                       "its supervisor is what has to be told"))
+    if stop.get("stop") == "empty":
+        return take(2, "nothing to do: there is no conversation to continue",
+                    "reviving it would start a fresh agent with only this note for context",
+                    "session %s has no main-chain line in its transcript (%s): there is "
+                    "nothing to continue. A server pre-creates such a session and it holds "
+                    "no turn of its own"
+                    % (sess.get("short"), stop.get("why") or "0 bytes"))
+    if st == "live-busy":
+        return take(3, "nothing to do: it is working right now",
+                    "a message sent now would join the turn it is in the middle of")
+    if stop.get("stop") == "usage-limit" and stop.get("in_force") and not to:
+        waiting = stop.get("clears_with_time")
+        cures = []
+        if waiting is False:
+            cures.append("waiting does NOT clear a %s limit: move it to an account with "
+                         "room (`--to auto`), or lift the cap itself"
+                         % (stop.get("class") or "spend/credit/model"))
+        else:
+            cures.append("wait until %s and run this again" % clock(stop["resets_at"]))
+            cures.append("or `--to auto` now, onto the account with the most room — which "
+                         "costs a re-read of the conversation across organizations")
+        return take(4, "nothing to do yet: the limit it stopped on is still in force",
+                    "starting it now spends its first turn hitting the same wall",
+                    "session %s is still inside the %s limit it stopped on: it resets %s"
+                    % (sess.get("short"), stop.get("class") or stop.get("window")
+                       or "usage", clock(stop.get("resets_at") or 0)), cures)
+    if st == "live-idle":
+        # ⚠️ A `--to` typed at a session that is STILL RUNNING is not carried out, because
+        # this row matches first: a move copies a transcript, and this one has a live
+        # writer. Say so, rather than leave the flag looking honoured.
+        return take(5, "wake it — relay this note to the session that is already running"
+                    + (", and NOT move it to %s: a move copies a transcript and this one "
+                       "has a live writer, so stop it first" % to if to else ""),
+                    "the note arrives as a PEER message, which cannot authorise anything "
+                    "— it is read, not obeyed")
+    if to:
+        return take(6, "move it to %s, then relay the note there"
+                    % (tgt.label if tgt else to),
+                    "across organizations the first turn RE-READS the whole conversation, "
+                    "on the new account's quota")
+    if kind == "self-hosted":
+        if stop.get("archived") and not getattr(args, "unarchive", False):
+            out = take(7, "nothing to do: it was archived or ended from the app",
+                       "resuming it would UNARCHIVE it, which is rarely what anybody meant",
+                       "session %s was archived or ended from the app (%s). Pass "
+                       "--unarchive to resume it anyway, which unarchives it"
+                       % (sess.get("short"), ENDED_REMOTELY))
+            out["action"], out["exit"], out["note"] = "refuse", 2, False
+            return out
+        return take(7, "resume it in place, on the same claude.ai link",
+                    "nothing else may be writing that transcript: two CLIs appending to "
+                    "one file cannot be untangled")
+    if kind == "terminal":
+        return take(8, "resume it in place — it gets a NEW claude.ai link",
+                    "it was never a Remote Control session, so publishing it is a change "
+                    "of exposure, not a restoration")
+    if kind == "server-child" and not getattr(args, "new_link", False):
+        up = srv.get("up")
+        return take(9, "nothing is started: open %s and say continue — its server respawns "
+                    "it on open%s" % (sess.get("url") or "its link",
+                                      "" if up else " (and its server is %s)"
+                                      % ("down" if up is False else "unread")),
+                    "a server child cannot be resumed onto its own link; the cure that "
+                    "does not need you is `--new-link`, which forks")
+    if kind == "server-child":
+        return take(10, "FORK it: a new session id, a new link, the same past",
+                    "the OLD link still opens the OLD copy — two conversations with one "
+                    "history, so archive the old one and do not type there")
+    out["refusal"] = ("revive has no action for a %s session in the same account: say where "
+                      "to put it with `--to <account>`" % kind)
+    out["what"] = ("nothing to do: no row of the decide table matches a %s session "
+                   "here" % kind)
+    out["risk"] = "nothing was read about how to bring this kind back"
+    return out
+
+
+def revive_risk(rec: dict, dec: dict) -> str:
+    """THE ONE RISK, worst first. Three facts outrank the row's own: an unanswered tool
+    call (what it did is unknown), an archive somebody made on purpose, and work a frozen
+    workflow run lost. Each of them changes what the reader should do next; the row's risk
+    is about the mechanism.
+    """
+    stop = rec.get("stop") or {}
+    lost = rec.get("lost_work") or {}
+    if stop.get("stop") == "mid-turn":
+        return ("its last tool call (%s) has no recorded result — it may have fully "
+                "applied, partly applied or not run, and neither assumption is safe"
+                % (stop.get("tool") or "a tool"))
+    if stop.get("archived") and dec.get("row") != 7:
+        return ("it was archived or ended from the app (%s): somebody or the fleet's "
+                "7-day sweep closed it" % ENDED_REMOTELY)
+    if lost.get("errors"):
+        return ("%d agent(s) of a workflow run died with it%s — that work is outstanding "
+                "whatever the run's own status file says"
+                % (lost["errors"], (": " + ", ".join(lost["labels"][:3]))
+                   if lost.get("labels") else ""))
+    return dec.get("risk") or "none that this tool can see"
+
+
+def render_revive(rec: dict, dec: dict, note: str, perm: str = "", why_perm: str = "",
+                  rc_name: str = "") -> str:
+    """The three-line answer, then the detail, then the note. In that order on purpose.
+
+    🛑 THE FIRST THREE LINES ARE THE WHOLE ANSWER, because they are what gets read out on a
+    phone: what stopped it and when, what revive would do, and the one risk. Everything
+    below them is for whoever wants to check the reasoning.
+    """
+    sess, stop = rec.get("session") or {}, rec.get("stop") or {}
+    kind, st = rec.get("kind") or {}, rec.get("state") or {}
+    acct, lost = rec.get("account") or {}, rec.get("lost_work") or {}
+    srv, own = rec.get("server") or {}, rec.get("owner") or {}
+    when = (time.strftime("%a %d %b %H:%M", time.localtime(stop["at"]))
+            if stop.get("at") else "an unrecorded time")
+    out = ["REVIVE  %s   (%s, %s)" % (sess.get("title") or sess.get("short"),
+                                      sess.get("handle"), sess.get("short")),
+           "  1 stopped %s (%s ago): %s" % (when, stop.get("age") or "?",
+                                            stop.get("why") or "nothing says why"),
+           "  2 %s" % dec.get("what"),
+           "  3 risk: %s" % (dec.get("risk_line") or revive_risk(rec, dec)),
+           ""]
+    rows = [("what it is", "%s — %s" % (kind.get("kind"), kind.get("why"))),
+            ("state", "%s — %s" % (st.get("state"), st.get("why") or "")),
+            ("stop", " · ".join([x for x in (
+                stop.get("stop"), stop.get("class"), stop.get("window"),
+                ("resets %s%s" % (clock(stop["resets_at"]),
+                                  "" if stop.get("in_force") else ", passed"))
+                if stop.get("resets_at") else "",
+                "ARCHIVED" if stop.get("archived") else "",
+                "read %s of %s" % (human_bytes(stop.get("read_bytes") or 0),
+                                   human_bytes(sess.get("bytes") or 0))) if x]))]
+    if lost.get("errors"):
+        rows.append(("lost work", "%d errored agent(s) in %s: %s"
+                     % (lost["errors"], ", ".join(lost.get("files") or []) or "a run",
+                        ", ".join(lost.get("labels", [])[:6]))))
+    if lost.get("unread"):
+        rows.append(("lost work", "⚠ %d workflow file(s) would not parse: %s"
+                     % (len(lost["unread"]), ", ".join(lost["unread"][:3]))))
+    rows.append(("account", "%s (%s) · %s%s"
+                 % (acct.get("label"), acct.get("email") or "no login",
+                    acct.get("meter_text"),
+                    "" if acct.get("usable") else
+                    "\n               🛑 this home cannot run it: %s" % acct.get("why"))))
+    rows.append(("server", srv.get("why") or
+                 ("up" if srv.get("up") else "down")))
+    rows.append(("owner", "%s (%s)" % (own["owner"], own["kind"]) if own.get("owner")
+                 else "none"))
+    if sess.get("url"):
+        rows.append(("link", sess["url"]))
+    rows.append(("folder", sess.get("cwd") or "(none recorded)"))
+    if perm:
+        rows.append(("mode", "%s (%s)" % (perm, why_perm)))
+    if rc_name:
+        rows.append(("--name", rc_name))
+    rows.append(("decide", "row %d — %s (exit %d if it ran)"
+                 % (dec.get("row"), dec.get("action"), dec.get("exit"))))
+    for name, text in rows:
+        out.append("  %-12s %s" % (name, text))
+    for n in rec.get("spec") or []:
+        out.append("  %-12s %s" % ("resolved", n))
+    if dec.get("refusal"):
+        out += ["", "🛑 a real revive would be REFUSED: " + dec["refusal"]]
+        for c in dec.get("cures") or []:
+            out.append("   - " + c)
+    if note:
+        out += ["", "the revive note (delivered as its next user turn):"]
+        out += ["    " + x for x in dwrap(note, 86)]
+    return "\n".join(out)
+
+
+def revive_row(sp: Spec, accts: list):
+    """The row for a transcript EVERY LISTING DROPS, when the spec named one exactly.
+
+    🛑 "NOTHING TO CONTINUE" IS AN ANSWER; "no transcript for that link here" IS A LIE.
+    `sessions_for` drops a transcript with no main-thread line (`session_of`'s subagent
+    rule), which is right for `list` and wrong for `revive`: a Remote Control server
+    pre-creates sessions, and a pre-created one has a 0-byte transcript with a derivable
+    name, a registry row and a claude.ai link — measured Wed 28 Oct 2026, 132 of them in
+    the config homes on this machine. Asked about one of those, revive has to say that it
+    holds no conversation, not that the file is not there.
+
+    Only ever reached for a spec that named ONE whole id (typed or derived), never for a
+    title or a prefix: this is not another rung of the ladder.
+    """
+    if not sp.pin:
+        return None
+    for a in accts:
+        if not a.home.is_dir():
+            continue
+        try:
+            hits = [p for p in a.projects.glob("*/" + sp.pin + ".jsonl") if p.is_file()]
+        except OSError:
+            continue
+        if not hits:
+            continue
+        p = sorted(hits, key=lambda x: -x.stat().st_mtime)[0]
+        return session_of(a, p, p.stat().st_mtime, live_rows(a).get(sp.pin),
+                          subagent_rule=False)
+    return None
+
+
+def do_revive(args, accts: list) -> int:
+    """`csm revive SESSION` — bring back a session that stopped.
+
+    🛑 THIS MILESTONE PLANS AND DOES NOT ACT. `--dry-run` is the only thing that answers:
+    it resolves the session, diagnoses it, says which row of the decide table it would take
+    and prints the note it would send. Without it, the command refuses — a subcommand that
+    printed a plan and exited 0 while doing nothing would read as work done.
+    """
+    if getattr(args, "from_machine", None):
+        die("--from-machine is not built yet for revive: the diagnosis has to be made on "
+            "the machine the transcript is on. Run `csm find <spec> --on M` to see it "
+            "there, or `csm --machine M revive <spec> --dry-run` to plan it there")
+    if not args.dry_run:
+        die("revive can plan but not yet act: pass --dry-run. The actions (wake an idle "
+            "session, resume it in place, fork it onto a new link, move it to another "
+            "account) are the next milestone, and nothing here has started, woken or "
+            "moved anything")
+    sp = resolve_spec(args.session, accts)
+    rows = all_sessions(accts, max(DEFAULT_LIMIT, 60), pin=sp.pin)
+    # The soft pass first, then the file no listing carries, then the hard pass — whose
+    # refusal text is the only one a reader ever sees, so the two cannot drift apart.
+    s = pick_resolved(sp, rows, soft=True) or revive_row(sp, accts) or pick_resolved(sp, rows)
+    rec = diagnose(s, accts, sp)
+    to = (args.to or "").strip()
+    tgt = None
+    gate = ""
+    if to:
+        tgt = (auto_target(s, accts, quiet=bool(args.as_json)) if to.lower() == "auto"
+               else resolve(to, accts))
+        # 🛑 THE GATES ARE PART OF THE PLAN, not something the real run discovers. A `--to`
+        # revive IS a move, so it is `check_target` that says whether that target is legal
+        # — including "already in <account>", which is the easiest one to type by accident.
+        try:
+            check_target(s, tgt, accts)
+        except Refusal as e:
+            gate = str(e)
+    dec = revive_decide(rec, args, tgt)
+    if gate and dec["row"] == 6:
+        dec.update(action="refuse", exit=2, note=False, refusal=gate,
+                   what="nothing to do: it cannot be moved to %s" % tgt.label)
+    # 🛑 AND THE HOME IT WOULD START IN HAS TO BE USABLE. Rows 5, 7, 8 and 10 all start or
+    # message a session in the session's OWN home (row 6's target is gated above, row 9
+    # starts nothing), and a home whose credential is gone takes the session up and then
+    # fails at its first token refresh — which looks exactly like a successful revive.
+    if dec["row"] in (5, 7, 8, 10) and (rec["account"] or {}).get("usable") is False:
+        dec.update(action="refuse", exit=2, note=False,
+                   refusal=(rec["account"] or {}).get("why") or "that home cannot run it",
+                   what="nothing to do: %s cannot run it" % (rec["account"] or {}).get(
+                       "label"))
+    # The line that is really SHOWN as the one risk, kept in the decision so `--json` and
+    # the three-line answer cannot disagree about it.
+    dec["risk_line"] = revive_risk(rec, dec)
+    note = perm = why_perm = rc_name = ""
+    if dec["note"]:
+        # ⚠️ The mode and the label are resolved for the rows that would START something,
+        # so a typo in `--permission-mode` or a title that sanitises away is a refusal in
+        # the dry run rather than a surprise in the real one.
+        perm, why_perm = resolve_mode(s, tgt or s.account, args.permission_mode)
+        if dec["action"] != "wake":
+            rc_name = rc_label(args.name or s.label,
+                               "" if args.name else "revived by csm")
+        note = revive_note(s, rec, dec["action"], tgt=tgt, say=args.say or "")
+    log("revive --dry-run %s %s: row %d (%s), stop=%s state=%s kind=%s"
+        % (s.local_id, s.account.name, dec["row"], dec["action"],
+           (rec["stop"] or {}).get("stop"), (rec["state"] or {}).get("state"),
+           (rec["kind"] or {}).get("kind")))
+    if args.as_json:
+        print(json.dumps({"dry_run": True, "record": rec, "decision": dec, "note": note,
+                          "auto": AUTO_NOTE[0] if AUTO_NOTE else "",
+                          "mode": {"mode": perm, "why": why_perm} if perm else None},
+                         indent=1, default=str))
+        return 0
+    print(render_revive(rec, dec, note, perm, why_perm, rc_name))
+    if dec["action"] == "move" and tgt is not None:
+        # A revive to another account IS a move, so it costs what a move costs — the
+        # cross-organization re-read above all, which is worth reading before it happens
+        # rather than in the success block afterwards.
+        print("")
+        print("\n".join(cost_lines(s, tgt)))
+    print("\n(dry run: nothing was started, woken, moved, signalled or written)")
+    return 0
+
+
 # --------------------------------------------------------------------------- the matrix
 
 #: 🛑 The verdicts of the fungibility matrix (README.md, docs/fungibility-matrix.md). A
@@ -7496,6 +8702,55 @@ def main(argv: list) -> int:
                     help="take the copy in THIS account's home, when an earlier move left "
                          "the same session id in more than one")
 
+    pr = sub.add_parser("revive", help="bring back a session that stopped — a limit, a "
+                                       "restart, a disconnect",
+                        description="Diagnose a session that is no longer answering and "
+                                    "bring it back with as little of your attention as "
+                                    "possible. It reads WHY it stopped from the "
+                                    "transcript, whether anything is still running it, "
+                                    "how much quota its account has and whether anything "
+                                    "else owns it, then takes the first row of its decide "
+                                    "table that matches: refuse, do nothing, wake it, "
+                                    "resume it in place, fork it onto a new link, or move "
+                                    "it to another account. Paste the claude.ai link: it "
+                                    "names the transcript by arithmetic, so a dead "
+                                    "session with nothing running still resolves.",
+                        epilog="In this release only --dry-run answers: it prints the "
+                               "three-line brief, the detail, the row it would take and "
+                               "the note it would send, and starts nothing.")
+    pr.add_argument("session", help="claude.ai link, session id or prefix, row number from "
+                    "`csm list`, or part of the title. A LINK is the one spec that always "
+                    "works for a session that is no longer running")
+    pr.add_argument("--dry-run", action="store_true",
+                    help="print the plan and change nothing (the only mode that answers "
+                         "today)")
+    pr.add_argument("--json", action="store_true", dest="as_json",
+                    help="the diagnosis record, the decision and the note, as JSON")
+    pr.add_argument("--to", metavar="ACCOUNT",
+                    help="move it to this account instead of reviving it where it is — a "
+                         "name, handle or email from `csm accounts`, or `auto` for the one "
+                         "with the most weekly room. It is also the cure for a limit that "
+                         "is still in force")
+    pr.add_argument("--new-link", action="store_true", dest="new_link",
+                    help="for a Remote Control server child, which cannot be resumed onto "
+                         "its own link: FORK it to a new session id and a new link. The "
+                         "old link still opens the old copy")
+    pr.add_argument("--from-machine", metavar="M", dest="from_machine",
+                    help="the session is on that machine (not built yet: run `csm "
+                         "--machine M revive … --dry-run` to plan it there)")
+    pr.add_argument("--say", metavar="TEXT",
+                    help="one thing to pass on to the revived session, quoted verbatim and "
+                         "attributed to you. It may not start with `!` or `/`, which the "
+                         "CLI would run as a command")
+    pr.add_argument("--permission-mode", metavar="MODE",
+                    help="the permission mode to come back in: " + ", ".join(MODE_ORDER)
+                         + ". Without it the mode the session recorded is used, by the "
+                           "same rule as `move`")
+    pr.add_argument("--unarchive", action="store_true",
+                    help="resume a session that was archived or ended from the app, which "
+                         "unarchives it. Refused without this flag")
+    pr.add_argument("--name", help="the --remote-control name the revived session gets")
+
     pf = sub.add_parser("find", help="sessions matching an id, a link or title text, on "
                                      "this machine or another",
                         description="Find a session by id, claude.ai link or title text, "
@@ -7650,6 +8905,8 @@ def main(argv: list) -> int:
             return cmd_find(args)
         if args.cmd == "move":
             return do_move(args, accts)
+        if args.cmd == "revive":
+            return do_revive(args, accts)
         if args.cmd == "stop":
             return do_stop(args, accts)
         if args.cmd == "modes":

@@ -76,6 +76,28 @@ sys.stdout.write(os.environ.get("FAKE_SSH_STDOUT") or "")
 sys.exit(int(os.environ.get("FAKE_SSH_RC") or 0))
 '''
 
+#: An `lsof -a -d cwd -F pn -p <comma list>` stand-in, in the machine-readable form csm
+#: asks for: it answers from a JSON map of `{"<pid>": "<cwd>"}` and exits with whatever is
+#: asked for. 🛑 A fixture world has no `claude remote-control` SERVER in it — the question
+#: "is a server up in this folder" is about the machine's own process table — so the suite
+#: answers it here rather than letting a test read the machine, where the answer changes
+#: between runs and between machines.
+FAKE_LSOF = r'''#!@PY@
+import json, os, sys
+rc = int(os.environ.get("FAKE_LSOF_RC") or 0)
+path = os.environ.get("FAKE_LSOF_MAP") or ""
+m = {}
+if path and os.path.exists(path):
+    m = json.load(open(path))
+want = sys.argv[sys.argv.index("-p") + 1].split(",") if "-p" in sys.argv else []
+for pid in want:
+    if pid in m:
+        print("p%s" % pid)
+        print("fcwd")
+        print("n%s" % m[pid])
+sys.exit(rc)
+'''
+
 FAKE_TMUX = r'''#!@PY@
 """A tmux stand-in: sessions and windows live in a JSON file; a new window's command REALLY
 runs (in the background, output to a pane file); capture-pane prints that file, or the next
@@ -293,8 +315,9 @@ class World:
         self.tmux_state = root / "tmux-state.json"
         self.tmux_env = root / "tmux-env.jsonl"
         self.ssh_log = root / "ssh-calls.jsonl"
+        self.lsof_map = root / "lsof-map.json"
         for name, body in (("claude", FAKE_CLAUDE), ("tmux", FAKE_TMUX),
-                           ("fake-ssh", FAKE_SSH)):
+                           ("fake-ssh", FAKE_SSH), ("fake-lsof", FAKE_LSOF)):
             p = self.bin / name
             p.write_text(body.replace("@PY@", PY).replace("@LINK@", LINK))
             p.chmod(0o755)
@@ -387,6 +410,27 @@ class World:
         self.procs.append(p)
         return p
 
+    def server(self, name="aifoundry"):
+        """A real process whose `ps` line reads `…/claude remote-control --name <name>` —
+        the shape `RC_SERVER_RE` recognises as a Remote Control SERVER.
+
+        🛑 `spawn(argv_tail=…)` cannot make this one: its `claude -c 'sleep …' <tail>` puts
+        the shell's own flag between argv[0] and the subcommand, and the real server's argv
+        has the word right after the binary. So the subcommand here is a real script file
+        of that name, run with the directory as the cwd. ⚠️ `sleep 120` + `exit 0` for the
+        same reason as `spawn`: a shell handed one simple command execs it and loses its
+        argv.
+        """
+        d = self.root / ("srvbin%d" % len(self.procs))
+        d.mkdir(exist_ok=True)
+        shutil.copy("/bin/sh", str(d / "claude"))
+        (d / "remote-control").write_text("sleep 120\nexit 0\n")
+        p = subprocess.Popen([str(d / "claude"), "remote-control", "--name", name],
+                             cwd=str(d), stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        self.procs.append(p)
+        return p
+
     def live(self, home, sid, pid, cwd=None, bridge=None, status="idle", tmux="",
              proc_start=None, entrypoint="sdk-cli"):
         (home / "sessions").mkdir(exist_ok=True)
@@ -412,6 +456,9 @@ class World:
              # 🛑 No test ever asks a real credential store: the probe is forced, and the
              # tool says so on stderr every time it is.
              "CSM_LOGIN_PROBE": "true",
+             # 🛑 And no test asks the real `lsof` either: a fixture world holds no Remote
+             # Control server, so the folder question is answered by the stand-in.
+             "CSM_LSOF": str(self.bin / "fake-lsof"), "FAKE_LSOF_MAP": str(self.lsof_map),
              "FAKE_CLAUDE_LOG": str(self.claude_log), "FAKE_TMUX_CALLS": str(self.tmux_calls),
              "FAKE_TMUX_STATE": str(self.tmux_state), "LC_ALL": "C.UTF-8"}
         e.update({k: str(v) for k, v in extra.items()})
@@ -4033,6 +4080,1150 @@ class QuotaShapes(InProc):
         line = self.stop("rate_limit", resets=time.time() + 60)
         line["isSidechain"] = True
         self.assertEqual(self.quota_of(self.go(), self.clean(), line)["quota"], {})
+
+
+# -------------------------------------------------------------- what revive reads and says
+
+#: The measured shape of a `/remote-control is active` line and of the disconnect the CLI
+#: writes when a session is archived or ended from the app. ⚠️ The ORDER of the two in the
+#: file is the whole test: `code 4090` BEFORE the last status line is an older disconnect
+#: the session recovered from, and only one after it means the session is closed now.
+STATUS_LINE = {"type": "system", "subtype": "bridge_status", "isSidechain": False,
+               "content": "/remote-control is active · Continue here, on your phone",
+               "url": "https://claude.ai/code/session_01StatusLink0001"}
+ENDED_LINE = {"type": "system", "subtype": "informational", "isSidechain": False,
+              "content": "Remote Control disconnected (code 4090)"}
+BRIDGE_LINE = {"type": "bridge-session", "bridgeSessionId": "cse_01SelfHosted00001"}
+
+
+def tool_call(cwd, sid, name="Edit", tid="tu_1", uuid="a9", parent="u1", stamp=None):
+    """An assistant line whose one content block is a `tool_use`: a turn in flight."""
+    d = assistant("let me edit that", cwd, sid, uuid=uuid, parent=parent)
+    d["message"]["content"] = [{"type": "tool_use", "name": name, "id": tid, "input": {}}]
+    if stamp:
+        d["timestamp"] = stamp
+    return d
+
+
+def tool_answer(cwd, sid, tid="tu_1", uuid="u9", parent="a9"):
+    """The `user` line that answers it. No answer for a `tool_use` id = killed mid-turn."""
+    d = user("", cwd, sid, uuid=uuid, parent=parent)
+    d["message"]["content"] = [{"type": "tool_result", "tool_use_id": tid,
+                                "content": "ok"}]
+    return d
+
+
+class ReviveDiagnose(InProc):
+    """🛑 WHY IT STOPPED, WHAT IT IS, AND WHETHER IT RUNS — the three answers every revive
+    action is chosen from, so every one of them is pinned here rather than inferred.
+
+    The stop is read as JSON lines from the last real prompt forward, which is the measured
+    fix for two ways of being wrong: a text match on the tail says "out of quota" about any
+    session that merely discussed one, and a byte window of a listing's size misses the
+    limit lines of the incident this was written for by ~120 KiB.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.mod.MACHINE = "here"
+        self.mod.SHARED_HOME = self.root / "home" / ".claude"
+        self.mod.RC_JOBS_DIR = None
+        # 🛑 Never the machine's own `lsof`: a fixture world holds no Remote Control server,
+        # and the question is about the process table this test does not own.
+        self.mod.LSOF_BIN = str(self.root / "no-such-lsof")
+        self.a = self.account("work")
+        self.cwd = str(self.root / "work")
+        os.makedirs(self.cwd, exist_ok=True)
+
+    # --- fixtures ---------------------------------------------------------
+    def sess(self, *lines, **kw):
+        return self.session(self.a, lines=list(lines) or None, **kw)
+
+    def go(self, text="run the campaign"):
+        return user(text, self.cwd, SID_A, uuid="u1")
+
+    def clean(self, text="done", uuid="a1", parent="u1"):
+        return assistant(text, self.cwd, SID_A, uuid=uuid, parent=parent)
+
+    def limit(self, resets=None, shape="apiError", kind="five_hour",
+              text="You've hit your session limit · resets 6:30pm (America/Los_Angeles)"):
+        return assistant(text, self.cwd, SID_A, error="usage_limit_reached", resets=resets,
+                         kind=kind, shape=shape, uuid="a2", parent="a1")
+
+    def stop_of(self, *lines, **kw):
+        return self.mod.revive_stop(self.sess(*lines, **kw).transcript)
+
+    def claude_with(self, *tail):
+        """A real process whose argv[0] basename is `claude` and whose argv carries `tail`.
+
+        ⚠️ `sleep N; exit 0`, not `sleep N`: a shell handed ONE simple command execs it and
+        loses its own argv, so the flags this exists for would vanish from `ps`.
+        """
+        d = self.root / ("shbin%d" % len(self.procs))
+        d.mkdir(exist_ok=True)
+        exe = d / "claude"
+        shutil.copy("/bin/sh", str(exe))
+        p = subprocess.Popen([str(exe), "-c", "sleep 120; exit 0"] + list(tail),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.procs.append(p)
+        return p
+
+    def fake_lsof(self, mapping, rc=0):
+        p = self.root / "lsof"
+        p.write_text(FAKE_LSOF.replace("@PY@", PY))
+        p.chmod(0o755)
+        mp = self.root / "lsof-map.json"
+        mp.write_text(json.dumps({str(k): v for k, v in mapping.items()}))
+        os.environ["FAKE_LSOF_MAP"], os.environ["FAKE_LSOF_RC"] = str(mp), str(rc)
+        self.addCleanup(os.environ.pop, "FAKE_LSOF_MAP", None)
+        self.addCleanup(os.environ.pop, "FAKE_LSOF_RC", None)
+        self.mod.LSOF_BIN = str(p)
+
+    # --- the stop ---------------------------------------------------------
+    def test_a_usage_limit_in_force_names_its_class_its_window_and_its_reset(self):
+        future = time.time() + 3600
+        st = self.stop_of(self.go(), self.clean(), self.limit(resets=future))
+        self.assertEqual(st["stop"], "usage-limit")
+        self.assertEqual((st["class"], st["window"]), ("session", "five_hour"))
+        self.assertTrue(st["in_force"])
+        self.assertIs(st["clears_with_time"], True)
+        self.assertAlmostEqual(st["resets_at"], future, delta=1)
+        self.assertIn("session limit", st["why"])
+
+    def test_the_same_stop_with_the_reset_passed_is_no_longer_in_force(self):
+        st = self.stop_of(self.go(), self.limit(resets=time.time() - 7200))
+        self.assertEqual(st["stop"], "usage-limit")
+        self.assertFalse(st["in_force"])
+        self.assertIn("that reset has passed", st["why"])
+
+    def test_the_no_apiError_shape_is_read_as_the_same_stop(self):
+        """M2's second shape, and a quarter of the real stops on this machine."""
+        st = self.stop_of(self.go(), self.limit(resets=time.time() + 60, shape="rate_limit",
+                                                kind="seven_day",
+                                                text="You've hit your weekly limit"))
+        self.assertEqual((st["stop"], st["kind"]), ("usage-limit", "rate_limit"))
+        self.assertEqual((st["class"], st["window"]), ("weekly", "seven_day"))
+
+    def test_the_class_says_whether_waiting_is_the_cure_at_all(self):
+        """🛑 The whole reason the class is read: a session or weekly limit lifts at its
+        reset, and a spend cap, a credit balance or a model limit does not — so "wait until
+        6:30" is advice that costs the wait and then another failed turn."""
+        cases = {"You've hit your monthly spend limit · raise it at claude.ai":
+                 ("monthly-spend", False),
+                 "You've hit your weekly limit · resets 10pm": ("weekly", True),
+                 "You've hit your session limit · resets 6:30pm": ("session", True),
+                 "You're out of usage credits. Run /usage-credits": ("credits", False),
+                 "You've reached your Fable limit. Switch to another model":
+                 ("model", False)}
+        for text, (klass, clears) in cases.items():
+            self.assertEqual(self.mod.limit_class(text), (klass, clears), text)
+            st = self.stop_of(self.go(), self.limit(resets=time.time() - 60, text=text))
+            self.assertEqual((st["class"], st["clears_with_time"]), (klass, clears), text)
+
+    def test_a_limit_the_turn_recovered_from_is_not_why_it_stopped(self):
+        """2.1.312 auto-continues at a usage limit when the session is interactive, so a
+        limit with a clean answer after it is history, not the stop."""
+        st = self.stop_of(self.go(), self.limit(resets=time.time() - 7200),
+                          self.clean("answering again", uuid="a3", parent="a2"))
+        self.assertEqual(st["stop"], "finished")
+
+    def test_an_error_that_is_not_a_limit_is_its_own_class(self):
+        line = assistant("overloaded", self.cwd, SID_A, uuid="a2", parent="a1")
+        line["apiError"] = "overloaded_error"
+        st = self.stop_of(self.go(), line)
+        self.assertEqual((st["stop"], st["kind"]), ("api-error", "overloaded_error"))
+        self.assertIn("not a limit", st["why"])
+
+    def test_a_mid_turn_kill_names_the_tool_whose_result_never_came(self):
+        """🛑 The one stop where "do not repeat work that is already done" is dangerous
+        advice: the tool call may have fully applied, partly applied or not run."""
+        st = self.stop_of(self.go(), tool_call(self.cwd, SID_A, name="Edit",
+                                               stamp="2026-10-28T09:33:07.000Z"))
+        self.assertEqual((st["stop"], st["tool"]), ("mid-turn", "Edit"))
+        self.assertIn("UNKNOWN", st["why"])
+        self.assertTrue(st["tool_at"] > 0)
+
+    def test_an_answered_tool_call_is_not_mid_turn(self):
+        st = self.stop_of(self.go(), tool_call(self.cwd, SID_A),
+                          tool_answer(self.cwd, SID_A),
+                          self.clean("and here is the answer", uuid="a8", parent="u9"))
+        self.assertEqual(st["stop"], "finished")
+
+    def test_archived_is_a_4090_AFTER_the_last_remote_control_report(self):
+        st = self.stop_of(self.go(), self.clean(), STATUS_LINE, ENDED_LINE)
+        self.assertEqual(st["stop"], "archived")
+        self.assertIs(st["archived"], True)
+        # the other order is a disconnect it recovered from, and says nothing
+        st = self.stop_of(self.go(), self.clean(), ENDED_LINE, STATUS_LINE)
+        self.assertEqual(st["stop"], "finished")
+        self.assertIs(st["archived"], False)
+
+    def test_a_clean_last_line_is_a_finish(self):
+        st = self.stop_of(self.go(), self.clean())
+        self.assertEqual(st["stop"], "finished")
+        self.assertIn("answered and stopped", st["why"])
+
+    def test_a_zero_byte_and_a_title_only_transcript_are_both_empty(self):
+        t = self.sess(self.go()).transcript
+        t.write_text("")
+        self.assertEqual(self.mod.revive_stop(t)["stop"], "empty")
+        t.write_text(jl({"type": "custom-title", "customTitle": "t"}))
+        st = self.mod.revive_stop(t)
+        self.assertEqual(st["stop"], "empty")
+        self.assertIn("nothing to continue", st["why"])
+
+    def test_a_prompt_nothing_answered_is_unknown_not_a_finish(self):
+        st = self.stop_of(self.go())
+        self.assertEqual(st["stop"], "unknown")
+
+    def test_the_window_opens_at_the_last_REAL_prompt(self):
+        """A `tool_result` and an `isMeta` line are both `type: "user"` and neither is a
+        prompt: a window that started at one of them would begin in the middle of the turn
+        it is trying to explain, and a limit from the turn BEFORE the last prompt was
+        waited out."""
+        meta = user("<system-reminder>a note</system-reminder>", self.cwd, SID_A,
+                    uuid="um", parent="a2")
+        meta["isMeta"] = True
+        st = self.stop_of(self.go(), self.limit(resets=time.time() - 7200), meta,
+                          tool_answer(self.cwd, SID_A, uuid="ur", parent="um"))
+        self.assertTrue(st["from_prompt"])
+        self.assertEqual(st["stop"], "usage-limit", "neither line opened a new window")
+        later = user("now do the next thing", self.cwd, SID_A, uuid="u2", parent="a2")
+        st = self.stop_of(self.go(), self.limit(resets=time.time() - 7200), later,
+                          self.clean("on it", uuid="a4", parent="u2"))
+        self.assertEqual(st["stop"], "finished", "the limit is before the last prompt")
+
+    def test_revive_reads_further_back_than_a_listing_row_does(self):
+        """🛑 THE MEASURED FACT this window exists for. On the incident transcript
+        (CLI 2.1.312, Wed 28 Oct 2026) `usage_limit_reached` and `quotaLimits` are in the
+        last 512 KiB and NOT in the last 384 KiB, so `scan_transcript`'s window reports a
+        clean finish for a session that is sitting on a wall.
+        """
+        pad = dict(assistant("x" * 2000, self.cwd, SID_A))
+        pad["isSidechain"] = True            # a subagent's own lines: not the conversation
+        lines = [self.go(), self.limit(resets=time.time() + 3600)] + [pad] * 260
+        s = self.sess(*lines)
+        self.assertGreater(s.transcript.stat().st_size, 512 * 1024)
+        self.mod.TAIL_BYTES = 384 * 1024
+        self.assertEqual(self.mod.scan_transcript(s.transcript)["quota"], {},
+                         "the listing window is too narrow to see it, which is the bug")
+        st = self.mod.revive_stop(s.transcript)
+        self.assertEqual(st["stop"], "usage-limit")
+        self.assertGreater(st["read_bytes"], 512 * 1024)
+
+    def test_the_window_is_a_knob_and_the_record_says_what_it_read(self):
+        """`--json` carries `read_bytes`, so a diagnosis made here and one made over ssh
+        (whose helper reads its own window) can be told apart rather than compared."""
+        s = self.sess(self.go(), self.clean())
+        st = self.mod.revive_stop(s.transcript, tail=64)
+        self.assertLessEqual(st["read_bytes"], 64)
+        self.assertEqual(self.mod.revive_stop(s.transcript)["read_bytes"],
+                         s.transcript.stat().st_size)
+
+    # --- what kind of session -------------------------------------------
+    def test_a_server_child_is_proved_by_the_derivation_and_never_by_entrypoint(self):
+        """🛑 `entrypoint` looks like the answer and is not: it says HOW the process was
+        started (`sdk-cli` is `--print`) and a fork or a resume rewrites it. The local id
+        being uuid5 of the bridge session's api url cannot be rewritten."""
+        s = self.session(self.a, sid=LINK_SID, lines=[user("go", self.cwd, LINK_SID)])
+        k = self.mod.revive_kind(s, LINK_BARE)
+        self.assertEqual((k["kind"], k["bridge_id"], k["from"]),
+                         ("server-child", LINK_BARE, "the link"))
+        self.assertIn("uuid5", k["why"])
+        s.entrypoint = "cli"                 # the registry disagreeing changes nothing
+        self.assertEqual(self.mod.revive_kind(s, LINK_BARE)["kind"], "server-child")
+        # and a v4 session whose registry row says `sdk-cli` is NOT one
+        t = self.session(self.a, sid=SID_A)
+        t.entrypoint = "sdk-cli"
+        self.assertEqual(self.mod.revive_kind(t)["kind"], "terminal")
+
+    def test_a_server_childs_own_registry_row_proves_it_too(self):
+        s = self.session(self.a, sid=LINK_SID, lines=[user("go", self.cwd, LINK_SID)])
+        s.bridge_id = LINK_BARE
+        self.assertEqual(self.mod.revive_kind(s)["from"], "its registry row")
+
+    def test_an_orphan_bridge_spawn_directory_proves_it_with_nothing_running(self):
+        """The pid-free death index: the bridge deletes that directory only on a handled
+        exit, so a killed child leaves one naming the claude.ai session of a transcript
+        that names none itself."""
+        d = self.mod.SHARED_HOME / "bridge-spawn" / ("cse_" + LINK_BARE + "-mZBVxD")
+        d.mkdir(parents=True)
+        (d / "append-system-prompt.txt").write_text("x")
+        s = self.session(self.a, sid=LINK_SID, lines=[user("go", self.cwd, LINK_SID)])
+        k = self.mod.revive_kind(s)
+        self.assertEqual((k["kind"], k["from"]),
+                         ("server-child", "an orphan bridge-spawn dir"))
+        self.assertEqual(self.mod.bridge_spawn_bare(SID_A), "", "another id, no claim")
+
+    def test_a_session_that_asked_for_remote_control_itself_is_self_hosted(self):
+        s = self.session(self.a, lines=[self.go(), BRIDGE_LINE])
+        k = self.mod.revive_kind(s)
+        self.assertEqual((k["kind"], k["bridge_id"]),
+                         ("self-hosted", "01SelfHosted00001"))
+        self.assertIn("re-attaches", k["why"])
+        s2 = self.session(self.a, sid=SID_B, lines=[user("go", self.cwd, SID_B),
+                                                    STATUS_LINE])
+        self.assertEqual(self.mod.revive_kind(s2)["kind"], "self-hosted")
+
+    def test_with_no_claude_ai_session_anywhere_it_is_a_terminal_session(self):
+        k = self.mod.revive_kind(self.session(self.a))
+        self.assertEqual((k["kind"], k["bridge_id"]), ("terminal", ""))
+
+    def test_the_desktop_apps_own_session_is_told_apart(self):
+        s = self.session(self.a)
+        s.desktop = {"sessionId": "local_1", "title": "from the app"}
+        self.assertEqual(self.mod.revive_kind(s)["kind"], "desktop")
+
+    # --- is it running --------------------------------------------------
+    def test_no_registry_row_reads_as_dead_and_says_why(self):
+        st = self.mod.revive_state(self.session(self.a))
+        self.assertEqual(st["state"], "dead")
+        self.assertIn("no config home here has a registry row", st["why"])
+        self.assertTrue(st["ps_asked"], "ps was asked, and answered")
+
+    def test_a_proved_pid_is_live_and_busy_or_idle_by_its_own_row(self):
+        p = self.claude_proc()
+        s = self.session(self.a)
+        s.pid, s.proc_start = p.pid, ps_start(p.pid)
+        s.status = "idle"
+        self.assertEqual(self.mod.revive_state(s)["state"], "live-idle")
+        s.status = "busy"
+        got = self.mod.revive_state(s)
+        self.assertEqual(got["state"], "live-busy")
+        self.assertIs(got["proved"], True)
+
+    def test_an_unprovable_row_reads_as_DEAD_and_keeps_the_reason(self):
+        """🛑 The dangerous direction is the other one. A registry file outlives its
+        process and pids are reused, so an unproved row must never read as alive — a revive
+        that believes a dead session is working does nothing at all."""
+        p = self.claude_proc()
+        s = self.session(self.a)
+        s.pid, s.status = p.pid, "idle"
+        s.proc_start = "Thu Jan  1 00:00:00 2026"
+        st = self.mod.revive_state(s)
+        self.assertEqual(st["state"], "dead")
+        self.assertIs(st["proved"], False)
+        self.assertIn("has been reused", st["why"])
+
+    def test_the_machine_wide_sweep_finds_a_child_by_its_cse_id(self):
+        """A server child's argv carries `cse_<bare>` and never the local uuid, and its
+        registry file can be missing or stale — measured: a row survives a SIGKILL until
+        some live session sweeps the directory."""
+        p = self.claude_with("--session-id", "cse_" + LINK_BARE)
+        s = self.session(self.a, sid=LINK_SID, lines=[user("go", self.cwd, LINK_SID)])
+        s.bridge_id = LINK_BARE
+        st = self.mod.revive_state(s)
+        self.assertEqual(st["state"], "dead", "no registry row: nothing proves it")
+        self.assertIn(p.pid, [r["pid"] for r in st["ps"]])
+        self.assertIn("name it", st["why"])
+
+    def test_the_sweep_uses_the_bridge_id_the_LINK_proved(self):
+        """⚠️ For a dead server child the bare id is in no file csm read — it comes from
+        the link. Sweeping for `s.bridge_id` alone would look for a name nothing carries,
+        in exactly the case the sweep exists for."""
+        p = self.claude_with("--session-id", "cse_" + LINK_BARE)
+        s = self.session(self.a, sid=LINK_SID, lines=[user("go", self.cwd, LINK_SID)])
+        self.assertEqual(s.bridge_id, "")
+        self.assertEqual(self.mod.revive_state(s)["ps"], [])
+        self.assertIn(p.pid, [r["pid"]
+                              for r in self.mod.revive_state(s, LINK_BARE)["ps"]])
+        sp = self.mod.resolve_spec(link_of(LINK_BARE), [self.a])
+        rec = self.mod.diagnose(s, [self.a], sp)
+        self.assertIn(p.pid, [r["pid"] for r in rec["state"]["ps"]])
+
+    def test_the_sweep_also_matches_a_resume_of_the_local_id(self):
+        p = self.claude_with("--resume=" + SID_A)
+        st = self.mod.revive_state(self.session(self.a))
+        self.assertIn(p.pid, [r["pid"] for r in st["ps"]])
+
+    # --- the work it lost ------------------------------------------------
+    def wf(self, s, name="wf_d4fd7f6a-04f.json", body=None):
+        d = s.sibling / "workflows"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / name).write_text(body if isinstance(body, str) else json.dumps(body))
+        return d / name
+
+    def test_the_errored_agents_are_counted_and_the_top_level_status_is_not_read(self):
+        """🛑 Measured on the incident (753,955 B, Wed 28 Oct 2026): five agents carry
+        `state: "error"` with "You've hit your session limit", and the file's own
+        `status` reads `completed`. Whoever reinstates the top level reports the run as
+        finished at exactly the moment it should report the opposite."""
+        s = self.session(self.a)
+        self.wf(s, body={"status": "completed", "workflowProgress": [
+            {"index": 0, "title": "phase 1", "type": "phase"},
+            {"state": "error", "label": "a2-e73-camera"},
+            {"state": "error", "label": "verify:a3-e71-leak"},
+            {"state": "completed", "label": "a1-fine"}]})
+        got = self.mod.revive_lost_work(s)
+        self.assertEqual(got["errors"], 2)
+        self.assertEqual(got["labels"], ["a2-e73-camera", "verify:a3-e71-leak"])
+        self.assertEqual(got["files"], ["wf_d4fd7f6a-04f.json"])
+
+    def test_no_sibling_directory_is_no_lost_work_and_no_crash(self):
+        self.assertEqual(self.mod.revive_lost_work(self.session(self.a))["errors"], 0)
+
+    def test_a_workflow_file_that_will_not_parse_is_unread_and_not_a_zero(self):
+        s = self.session(self.a)
+        self.wf(s, name="wf_half.json", body="{ not json")
+        got = self.mod.revive_lost_work(s)
+        self.assertEqual((got["errors"], got["unread"]), (0, ["wf_half.json"]))
+
+    # --- the account, the server, the owner ------------------------------
+    def test_the_account_verdict_is_check_home_usable_caught_not_raised(self):
+        s = self.session(self.a)
+        got = self.mod.revive_account(s, [self.a])
+        self.assertIs(got["usable"], True)
+        self.assertEqual(got["meter"], "unread")
+        self.assertIn("unread", got["meter_text"])
+        gone = self.account("signedout", email=None)
+        s2 = self.session(gone, sid=SID_B)
+        got = self.mod.revive_account(s2, [gone])
+        self.assertIs(got["usable"], False)
+        self.assertIn("holds no login", got["why"])
+
+    def test_a_stale_reading_is_stale_and_the_seven_day_reset_is_kept_apart(self):
+        """🛑 The 5-hour instant NEVER comes from the meter: the `resets_at` a reading
+        carries is the SEVEN-DAY window's, and reading it as "when the limit lifts" is
+        wrong by hours. The transcript's own `quotaLimits.resetsAt` is the 5-hour one."""
+        self.mod.METERS_FILE.write_text(json.dumps(
+            {"work": {"at": time.time() - 9 * 3600, "five_hour": 3.0, "seven_day": 44.0,
+                      "resets_at": "2026-11-01T00:00:00Z", "error": ""}}))
+        got = self.mod.revive_account(self.session(self.a), [self.a])
+        self.assertEqual(got["meter"], "stale")
+        self.assertEqual(got["seven_day_resets_at"], "2026-11-01T00:00:00Z")
+        self.assertEqual((got["five_hour"], got["seven_day"]), (3.0, 44.0))
+
+    def fake_ps(self, table):
+        """🛑 The server question is about the MACHINE's process table, which no fixture
+        owns: this box runs 28 real `claude remote-control` servers right now, so a test
+        reading the real one asserts about whatever happens to be up. The table is faked
+        here and nowhere else — the argv sweep in `revive_state` is tested against the real
+        `ps` and real processes, which is where that matters."""
+        self.mod.ps_table = lambda: table
+
+    def test_a_server_in_this_folder_is_found_and_one_elsewhere_is_not(self):
+        exe = str(self.root / "procbin" / "claude")
+        self.fake_ps({4242: exe + " remote-control --name aifoundry --spawn=same-dir"})
+        self.fake_lsof({4242: self.cwd})
+        got = self.mod.server_in_folder(self.cwd)
+        self.assertIs(got["up"], True)
+        self.assertEqual(got["pids"], [4242])
+        self.assertIn("aifoundry", got["names"])
+        self.fake_lsof({4242: str(self.root / "elsewhere")})
+        got = self.mod.server_in_folder(self.cwd)
+        self.assertIs(got["up"], False)
+        self.assertIn("none of them in this folder", got["why"])
+
+    def test_a_session_that_merely_carries_the_FLAG_is_not_a_server(self):
+        """`--remote-control=<name>` is a SESSION asking for Remote Control; the server is
+        the bare subcommand. Counting the flag would report a server in every folder a
+        moved window is open in."""
+        exe = str(self.root / "procbin" / "claude")
+        self.fake_ps({4242: exe + " --remote-control=Sleep --permission-mode bypass"})
+        self.fake_lsof({4242: self.cwd})
+        got = self.mod.server_in_folder(self.cwd)
+        self.assertIs(got["up"], False)
+        self.assertIn("at all", got["why"])
+
+    def test_nothing_but_the_claude_cli_counts(self):
+        """`RC_SERVER_RE` finds the words anywhere on the line, so argv[0] is checked on
+        top of it: otherwise `vim /x/claude remote-control` is a server."""
+        self.fake_ps({4242: "vim /x/claude remote-control --name room"})
+        self.fake_lsof({4242: self.cwd})
+        self.assertTrue(self.mod.RC_SERVER_RE.search("vim /x/claude remote-control"))
+        self.assertIs(self.mod.server_in_folder(self.cwd)["up"], False)
+
+    def test_an_lsof_that_cannot_be_asked_is_unread_and_never_a_no(self):
+        """The doctrine of the whole file: "could not look" is not a verdict. Here it
+        decides whether anybody is told that opening the link brings the session back."""
+        exe = str(self.root / "procbin" / "claude")
+        self.fake_ps({4242: exe + " remote-control --name aifoundry"})
+        self.fake_lsof({}, rc=9)
+        got = self.mod.server_in_folder(self.cwd)
+        self.assertIsNone(got["up"])
+        self.assertIn("could not be asked", got["why"])
+        # and a candidate that named no folder leaves the question open too
+        self.fake_lsof({})
+        got = self.mod.server_in_folder(self.cwd)
+        self.assertIsNone(got["up"])
+        self.assertIn("named no folder", got["why"])
+
+    def test_a_ps_that_cannot_be_asked_is_unread_too(self):
+        self.mod.ps_table = lambda: None
+        got = self.mod.server_in_folder(self.cwd)
+        self.assertIsNone(got["up"])
+        self.assertIn("ps could not be asked", got["why"])
+
+    def test_a_session_with_no_folder_is_not_a_server_question(self):
+        self.assertIn("records no folder", self.mod.server_in_folder("")["why"])
+
+    def test_a_scheduled_pass_owns_its_own_session_and_says_whose_command_it_is(self):
+        d = self.root / "rc-jobs"
+        d.mkdir()
+        (d / "daily-maintenance.session").write_text(
+            "uuid=%s\nstarted=1793194502\nname=Daily maintenance\n" % SID_A)
+        (d / "other.session").write_text("uuid=%s\n" % SID_B)
+        self.mod.RC_JOBS_DIR = d
+        got = self.mod.revive_owner(SID_A)
+        self.assertEqual((got["owner"], got["kind"]), ("daily-maintenance", "rc_job"))
+        self.assertIn("--revive", got["fix"])
+        self.assertEqual(self.mod.revive_owner(SID_C)["owner"], "")
+
+    def test_the_last_uuid_line_wins_because_that_file_is_appended_to(self):
+        d = self.root / "rc-jobs"
+        d.mkdir()
+        (d / "pass.session").write_text("uuid=%s\nuuid=%s\n" % (SID_B, SID_A))
+        self.mod.RC_JOBS_DIR = d
+        self.assertEqual(self.mod.rc_job_owner(SID_A), "pass")
+        self.assertEqual(self.mod.rc_job_owner(SID_B), "",
+                         "the earlier run's id is not what the pass is on now")
+
+    def test_an_rc_jobs_directory_that_cannot_be_READ_is_a_refusal_not_a_no(self):
+        d = self.root / "rc-jobs"
+        d.mkdir()
+        (d / "pass.session").write_text("uuid=%s\n" % SID_A)
+        d.chmod(0o000)
+        self.addCleanup(d.chmod, 0o700)
+        self.mod.RC_JOBS_DIR = d
+        if os.geteuid() == 0:
+            self.skipTest("root reads an unreadable directory")
+        with self.assertRaises(self.mod.Refusal) as e:
+            self.mod.rc_job_owner(SID_A)
+        self.assertIn("could not read", str(e.exception))
+
+    def test_the_knob_unset_means_no_such_supervisor_at_all(self):
+        self.mod.RC_JOBS_DIR = None
+        self.assertEqual(self.mod.rc_job_owner(SID_A), "")
+
+    # --- the whole record ------------------------------------------------
+    def test_one_record_carries_every_answer_the_decide_table_reads(self):
+        s = self.session(self.a, sid=LINK_SID,
+                         lines=[user("go", self.cwd, LINK_SID, uuid="u1"),
+                                assistant("ok", self.cwd, LINK_SID, uuid="a1",
+                                          parent="u1")])
+        sp = self.mod.resolve_spec(link_of(LINK_BARE), [self.a])
+        rec = self.mod.diagnose(s, [self.a], sp)
+        for key in ("session", "kind", "state", "stop", "lost_work", "account", "server",
+                    "owner", "spec"):
+            self.assertIn(key, rec, key)
+        self.assertEqual(rec["session"]["url"], link_of(LINK_BARE))
+        self.assertEqual(rec["kind"]["kind"], "server-child")
+        self.assertEqual(rec["state"]["state"], "dead")
+        self.assertEqual(rec["stop"]["stop"], "finished")
+        self.assertEqual(rec["machine"], "here")
+        json.dumps(rec, default=str)         # the --json path must not choke on it
+
+
+class ReviveNoteText(InProc):
+    """WHAT THE REVIVED SESSION IS TOLD. Pure text, so every clause can be pinned.
+
+    🛑 It arrives as that session's next USER turn — it renders in the app as a message —
+    so the stamp is not decoration: a message in his conversation that he did not type has
+    to say so in its first line, and `--say` is the only sentence that may be attributed to
+    him. `move_note`'s rule holds here too: facts, no advice, nothing it cannot show.
+
+    ⚠️ It builds its own fixtures rather than inheriting `ReviveDiagnose`'s: a test class
+    that subclasses another one silently RE-RUNS all of its tests, which makes every count
+    read here and in CI a lie about how much was checked.
+    """
+
+    STOP = {"stop": "usage-limit", "class": "session", "window": "five_hour",
+            "resets_at": 0.0, "in_force": False, "age": "17h", "at": 0.0,
+            "clears_with_time": True, "tool": "", "tool_at": 0.0}
+
+    def setUp(self):
+        super().setUp()
+        self.mod.MACHINE = "here"
+        self.a = self.account("work", email="me@work.example")
+        self.tgt = self.account("personal", email="you@home.example", org="org-2")
+        self.s = self.session(self.a)
+
+    def rec(self, **over):
+        stop = dict(self.STOP)
+        stop["at"] = time.time() - 17 * 3600
+        stop.update(over.pop("stop", {}))
+        out = {"session": {"short": self.s.short, "title": "t", "url": ""},
+               "stop": stop, "lost_work": {"errors": 0, "labels": []}}
+        out.update(over)
+        return out
+
+    def note(self, action="resume", **kw):
+        rec = kw.pop("rec", None) or self.rec(**kw.pop("over", {}))
+        kw.setdefault("when", "Wed 28 Oct 2026 13:30 PDT")
+        kw.setdefault("boot", 0.0)
+        return self.mod.revive_note(self.s, rec, action, **kw)
+
+    def test_the_stamp_opens_it_and_the_request_and_the_closing_end_it(self):
+        n = self.note()
+        self.assertTrue(n.startswith("[claude-session-mover — written by the tool; the "
+                                     "user did not type this] "), n[:120])
+        self.assertIn("Revived at Wed 28 Oct 2026 13:30 PDT on `here`", n)
+        self.assertIn("This session stopped at", n)
+        self.assertIn("He asked csm to revive this session and continue where it stopped.",
+                      n)
+        self.assertTrue(n.endswith("Re-check anything time-sensitive (running jobs, locks, "
+                                   "claims, hardware state) before acting on it; do not "
+                                   "repeat work that is already done."), n[-200:])
+
+    def test_a_mid_turn_stop_says_the_tool_result_is_missing_and_nothing_else_does(self):
+        """🛑 The sentence exists for exactly one class. After a limit the turn
+        demonstrably did not run; after a SIGKILL mid-`Edit` the call may have fully
+        applied, partly applied or not run, and "do not repeat work" is the worst possible
+        reading of that."""
+        n = self.note(over={"stop": {"stop": "mid-turn", "tool": "Edit",
+                                     "tool_at": time.time() - 3600}})
+        self.assertIn("Its last tool call (Edit,", n)
+        self.assertIn("has no recorded result: check whether it took effect before "
+                      "repeating it.", n)
+        self.assertNotIn("no recorded result", self.note())
+
+    def test_say_is_quoted_verbatim_and_attributed_to_him(self):
+        n = self.note(say="  drop the camera half and finish the power model  ")
+        self.assertIn('He said: "drop the camera half and finish the power model"', n)
+        self.assertNotIn("He asked csm to revive", n)
+
+    def test_a_say_that_the_cli_would_run_as_a_command_is_refused(self):
+        """2.1.312's own `prompt_undelivered`: "a prompt starting with ! or / would run as
+        a command there"."""
+        for bad in ("/compact", "  /clear", "!rm -rf build", " ! ls"):
+            with self.assertRaises(self.mod.Refusal) as e:
+                self.note(say=bad)
+            self.assertIn("runs a leading", str(e.exception))
+            self.assertIn("--say starts with `%s`" % bad.strip()[0], str(e.exception))
+
+    def test_a_say_over_the_bound_is_refused_and_never_shortened(self):
+        with self.assertRaises(self.mod.Refusal) as e:
+            self.note(say="x" * (self.mod.REVIVE_SAY_MAX + 1))
+        self.assertIn("quoted verbatim", str(e.exception))
+        self.assertIn(str(self.mod.REVIVE_SAY_MAX), str(e.exception))
+
+    def test_a_fork_says_loudly_that_the_old_link_opens_the_old_copy(self):
+        n = self.note("fork", new_id=SID_B)
+        self.assertIn("csm FORKED it: this copy is %s, forked from %s"
+                      % (SID_B[:8], self.s.short), n)
+        self.assertIn("The old link still opens the OLD copy", n)
+        self.assertIn("do not type there, and archive it", n)
+
+    def test_a_wake_says_nothing_was_restarted(self):
+        n = self.note("wake")
+        self.assertIn("still running and idle", n)
+        self.assertIn("the claude.ai link is unchanged", n)
+
+    def test_a_resume_in_place_and_a_new_link_resume_are_told_apart(self):
+        self.assertIn("the link you had still opens this conversation", self.note("resume"))
+        n = self.note("new-link")
+        self.assertIn("NEW claude.ai link", n)
+        self.assertIn("nothing opens the old one", n)
+
+    def test_a_move_names_both_accounts_and_a_same_account_revive_does_not(self):
+        n = self.note("move", tgt=self.tgt)
+        self.assertIn("csm moved it from me@work.example to you@home.example", n)
+        self.assertIn("You now run as you@home.example", n)
+        self.assertIn("are stale", n)
+        same = self.note("resume")
+        self.assertIn("You are still me@work.example on `here`", same)
+        self.assertNotIn("are stale", same)
+
+    def test_a_restart_after_the_stop_is_said_and_one_before_it_is_not(self):
+        """The difference between "pick up where you left off" and "work out what
+        happened": a session whose stop is older than the boot was killed by the restart."""
+        stopped = time.time() - 17 * 3600
+        n = self.note(over={"stop": {"at": stopped}}, boot=stopped + 600)
+        self.assertIn("this machine restarted at", n)
+        self.assertIn("killed by the restart and not by anything it did", n)
+        self.assertNotIn("this machine restarted",
+                         self.note(over={"stop": {"at": stopped}}, boot=stopped - 600))
+
+    def test_a_reset_that_has_passed_is_said_and_a_future_one_is_not(self):
+        past = time.time() - 600
+        n = self.note(over={"stop": {"resets_at": past}})
+        self.assertIn("Since then:", n)
+        self.assertIn("that limit's reset passed at", n)
+        self.assertIn("which reset at", n)
+        ahead = self.note(over={"stop": {"resets_at": time.time() + 600,
+                                         "in_force": True}})
+        self.assertNotIn("Since then:", ahead)
+        self.assertIn("which lifts at", ahead)
+
+    def test_the_agents_that_died_with_it_are_counted_and_named(self):
+        n = self.note(over={"lost_work": {"errors": 5, "labels": ["a2-e73", "verify:a3"]}})
+        self.assertIn("5 agent(s) of a workflow run died with it (a2-e73, verify:a3)", n)
+        self.assertIn("whatever the run's own status file says", n)
+
+    def test_the_memory_store_is_named_because_a_resume_never_hears_it(self):
+        store = self.root / "shared-memory"
+        store.mkdir()
+        tgt = self.account("personal2", email="you@home.example",
+                           settings={"env": {self.mod.MEMORY_DIR_ENV: str(store)}})
+        n = self.note("move", tgt=tgt)
+        self.assertIn("Auto memory for this project is read from %s" % store, n)
+        self.assertNotIn("Auto memory", self.note("resume"))
+
+    def test_the_budget_is_met_by_dropping_optional_clauses_in_order(self):
+        """🛑 A budget, not a truncation: the stamp, the stop, the mid-turn warning, the
+        request and the closing sentence are never dropped, and no sentence is ever cut in
+        half."""
+        store = self.root / "shared-memory"
+        store.mkdir()
+        tgt = self.account("personal3", email="you@home.example",
+                           settings={"env": {self.mod.MEMORY_DIR_ENV: str(store)}})
+        over = {"lost_work": {"errors": 9, "labels": ["label-%d" % i for i in range(6)]},
+                "stop": {"resets_at": time.time() - 600}}
+        long_say = "please " + "x" * 380
+        n = self.mod.revive_note(self.s, self.rec(**over), "move", tgt=tgt, say=long_say,
+                                 when="Wed 11:00", boot=0.0)
+        self.assertLessEqual(len(n), self.mod.REVIVE_NOTE_MAX)
+        self.assertNotIn("Auto memory", n, "the first clause in the drop order")
+        self.assertIn(long_say, n, "his own words are never shortened")
+        self.assertIn("csm moved it from", n)
+        self.assertIn("Re-check anything time-sensitive", n)
+        self.mod.REVIVE_NOTE_MAX = 10 ** 6   # with room, every clause is there
+        n = self.mod.revive_note(self.s, self.rec(**over), "move", tgt=tgt, say=long_say,
+                                 when="Wed 11:00", boot=0.0)
+        self.assertIn("Auto memory", n)
+        self.assertIn("9 agent(s)", n)
+        self.assertIn("Since then:", n)
+
+
+class ReviveDryRun(Base):
+    """`csm revive <spec> --dry-run`, end to end, once per row of the decide table.
+
+    🛑 EVERY ROW, BECAUSE THE ROW IS THE WHOLE ANSWER. The order is the contract — first
+    match wins — so a session that is both out of quota and dead is answered about the
+    quota, and a session something else owns is answered about its owner before anything
+    is read about quota at all. Each test here is the command a person types.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.cwd = str(self.w.work)
+
+    # --- fixtures ---------------------------------------------------------
+    def go(self, sid=SID_A):
+        return user("run the campaign", self.cwd, sid, uuid="u1")
+
+    def clean(self, sid=SID_A):
+        return assistant("done", self.cwd, sid, uuid="a1", parent="u1")
+
+    def limit(self, resets, sid=SID_A, text="You've hit your session limit · resets 6:30pm"):
+        return assistant(text, self.cwd, sid, error="usage_limit_reached", resets=resets,
+                         shape="rate_limit", uuid="a2", parent="a1")
+
+    def revive(self, spec, *extra, **env):
+        return self.w.run("revive", spec, "--dry-run", *extra, **env)
+
+    def rec(self, spec, *extra, **env):
+        out = self.ok(self.revive(spec, "--json", *extra, **env))
+        return json.loads(out)
+
+    def row_of(self, spec, *extra, **env):
+        return self.rec(spec, *extra, **env)["decision"]
+
+    def dead(self, sid=SID_A, lines=None):
+        return self.w.session(self.work, sid, cwd=self.cwd,
+                              lines=lines if lines is not None
+                              else [self.go(sid), self.clean(sid)])
+
+    def live(self, sid=SID_A, status="idle", lines=None):
+        self.dead(sid, lines)
+        p = self.w.spawn()
+        self.w.live(self.work, sid, p.pid, cwd=self.cwd, status=status)
+        return p
+
+    # --- the gate ---------------------------------------------------------
+    def test_without_dry_run_it_refuses_and_starts_nothing(self):
+        self.dead()
+        r = self.w.run("revive", SID_A)
+        self.refused(r, "revive can plan but not yet act", "--dry-run")
+        self.assertEqual(self.w.claude_calls(wait=0.4), [])
+
+    def test_from_machine_says_where_the_diagnosis_has_to_be_made(self):
+        self.dead()
+        self.refused(self.revive(SID_A, "--from-machine", "desktop"),
+                     "--from-machine is not built yet")
+
+    def test_a_dry_run_writes_nothing_and_starts_nothing(self):
+        t = self.dead()
+        before = t.read_text()
+        self.ok(self.revive(SID_A))
+        self.assertEqual(t.read_text(), before)
+        self.assertEqual(self.w.claude_calls(wait=0.4), [])
+        self.assertEqual(self.w.tmux_log(), [])
+
+    def test_the_answer_opens_with_three_lines_and_then_the_detail(self):
+        self.dead(lines=[self.go(), self.clean(), BRIDGE_LINE])
+        out = self.ok(self.revive(SID_A))
+        lines = out.splitlines()
+        self.assertTrue(lines[0].startswith("REVIVE  run the campaign"), lines[0])
+        self.assertTrue(lines[1].startswith("  1 stopped "), lines[1])
+        self.assertTrue(lines[2].startswith("  2 "), lines[2])
+        self.assertTrue(lines[3].startswith("  3 risk: "), lines[3])
+        self.assertIn("what it is   self-hosted", out)
+        self.assertIn("decide       row 7", out)
+        self.assertIn("the revive note (delivered as its next user turn):", out)
+        self.assertIn("(dry run: nothing was started, woken, moved, signalled or written)",
+                      out)
+
+    # --- row by row -------------------------------------------------------
+    def test_row_1_a_bot_owns_it(self):
+        self.dead()
+        d = self.w.root / "owners"
+        d.mkdir()
+        (d / "chatbot.json").write_text(json.dumps({"session_id": SID_A}))
+        dec = self.row_of(SID_A, CSM_BOTS_DIR=str(d))
+        self.assertEqual((dec["row"], dec["action"], dec["exit"]), (1, "refuse", 2))
+        self.assertIn("chatbot", dec["refusal"])
+        self.assertFalse(dec["note"], "nothing is told anything")
+
+    def test_row_1_a_scheduled_pass_owns_it_and_has_its_own_revive(self):
+        self.dead()
+        d = self.w.root / "rc-jobs"
+        d.mkdir()
+        (d / "daily-maintenance.session").write_text("uuid=%s\nperm=bypassPermissions\n"
+                                                     % SID_A)
+        out = self.ok(self.revive(SID_A, CSM_RC_JOBS_DIR=str(d)))
+        self.assertIn("row 1", out)
+        self.assertIn("rc_job daily-maintenance --revive", out)
+
+    def test_row_2_nothing_to_continue(self):
+        """A server pre-creates sessions: such a transcript has a derivable name, a link
+        and no turn of its own — 132 of them in the config homes here, Wed 28 Oct 2026."""
+        self.dead(lines=[{"type": "custom-title", "customTitle": "pre-created"}])
+        dec = self.row_of(SID_A)
+        self.assertEqual((dec["row"], dec["action"]), (2, "refuse"))
+        self.assertIn("nothing to continue", dec["refusal"])
+
+    def test_row_2_reaches_a_transcript_no_listing_carries(self):
+        """🛑 "there is nothing to continue" is an ANSWER about a 0-byte pre-created
+        session; "no transcript for that link here" would be false about a file on disk."""
+        t = self.w.session(self.work, LINK_SID, cwd=self.cwd, lines=[])
+        t.write_text("")
+        self.assertEqual([r["local_id"] for r in self.listing()], [],
+                         "no listing carries it, which is right for `list`")
+        dec = self.row_of(link_of(LINK_BARE))
+        self.assertEqual(dec["row"], 2)
+        self.assertIn("0 bytes", dec["refusal"])
+
+    def test_row_3_it_is_working(self):
+        self.live(status="busy")
+        dec = self.row_of(SID_A)
+        self.assertEqual((dec["row"], dec["action"], dec["exit"]), (3, "nothing", 0))
+        self.assertIn("working right now", dec["what"])
+        self.assertFalse(dec["note"])
+
+    def test_row_4_the_limit_is_still_in_force(self):
+        self.dead(lines=[self.go(), self.clean(), self.limit(time.time() + 3600)])
+        out = self.ok(self.revive(SID_A))
+        self.assertIn("row 4", out)
+        self.assertIn("still inside the session limit", out)
+        self.assertIn("wait until", out)
+        self.assertIn("--to auto", out)
+        self.assertNotIn("the revive note", out)
+
+    def test_row_4_says_when_waiting_is_not_the_cure(self):
+        self.dead(lines=[self.go(), self.clean(),
+                         self.limit(time.time() + 3600,
+                                    text="You've hit your monthly spend limit · raise it "
+                                         "at claude.ai/settings/usage")])
+        out = self.ok(self.revive(SID_A))
+        self.assertIn("waiting does NOT clear a monthly-spend limit", out)
+        self.assertNotIn("wait until", out)
+
+    def test_row_4_is_outranked_by_an_owner_and_by_an_empty_transcript(self):
+        """The order of the table, proved where two rows both match."""
+        self.dead(lines=[self.go(), self.clean(), self.limit(time.time() + 3600)])
+        d = self.w.root / "owners"
+        d.mkdir()
+        (d / "bot.json").write_text(json.dumps({"session_id": SID_A}))
+        self.assertEqual(self.row_of(SID_A, CSM_BOTS_DIR=str(d))["row"], 1)
+
+    def test_row_5_a_live_idle_session_is_woken(self):
+        self.live(status="idle")
+        dec = self.row_of(SID_A)
+        self.assertEqual((dec["row"], dec["action"], dec["exit"]), (5, "wake", 0))
+        self.assertTrue(dec["note"])
+        self.assertIn("PEER message", dec["risk"])
+
+    def test_row_5_is_outranked_by_a_limit_still_in_force(self):
+        """A wake inside the limit is consumed and lost — measured on the 17:46 heartbeat."""
+        self.live(status="idle",
+                  lines=[self.go(), self.clean(), self.limit(time.time() + 3600)])
+        self.assertEqual(self.row_of(SID_A)["row"], 4)
+
+    def test_row_6_to_another_account(self):
+        self.dead()
+        dec = self.row_of(SID_A, "--to", "personal")
+        self.assertEqual((dec["row"], dec["action"]), (6, "move"))
+        self.assertIn("personal", dec["what"])
+        self.assertIn("RE-READS", dec["risk"])
+        self.assertIn("csm moved it from me@work.example to me@home.example",
+                      self.rec(SID_A, "--to", "personal")["note"])
+        # a revive to another account IS a move, so it costs what a move costs
+        out = self.ok(self.revive(SID_A, "--to", "personal"))
+        self.assertIn("what this move costs", out)
+        self.assertIn("RE-READS the whole", out)
+
+    def test_row_6_is_how_a_limit_in_force_is_cured(self):
+        self.dead(lines=[self.go(), self.clean(), self.limit(time.time() + 3600)])
+        self.assertEqual(self.row_of(SID_A)["row"], 4)
+        self.assertEqual(self.row_of(SID_A, "--to", "personal")["row"], 6)
+
+    def test_row_7_a_self_hosted_session_resumes_in_place(self):
+        self.dead(lines=[self.go(), self.clean(), BRIDGE_LINE])
+        dec = self.row_of(SID_A)
+        self.assertEqual((dec["row"], dec["action"]), (7, "resume"))
+        self.assertIn("same claude.ai link", dec["what"])
+        self.assertIn("the link you had still opens this conversation",
+                      self.rec(SID_A)["note"])
+
+    def test_row_7_refuses_an_archived_session_unless_told_to_unarchive(self):
+        self.dead(lines=[self.go(), self.clean(), BRIDGE_LINE, STATUS_LINE, ENDED_LINE])
+        dec = self.row_of(SID_A)
+        self.assertEqual((dec["row"], dec["action"], dec["exit"]), (7, "refuse", 2))
+        self.assertIn("archived", dec["refusal"])
+        self.assertIn("--unarchive", dec["refusal"])
+        dec = self.row_of(SID_A, "--unarchive")
+        self.assertEqual((dec["row"], dec["action"]), (7, "resume"))
+
+    def test_row_8_a_terminal_session_resumes_and_gets_a_new_link(self):
+        self.dead()
+        dec = self.row_of(SID_A)
+        self.assertEqual((dec["row"], dec["action"]), (8, "new-link"))
+        self.assertIn("NEW claude.ai link", dec["what"])
+        self.assertIn("exposure", dec["risk"])
+
+    def test_row_9_a_server_child_keeps_its_link_and_starts_nothing(self):
+        """🛑 `--resume <uuid>` cannot re-attach a server child's claude.ai session: it
+        registers a NEW link. So the cheap answer is one tap — the server respawns the
+        child when the link is opened — and nothing is started or waited for here."""
+        self.w.session(self.work, LINK_SID, cwd=self.cwd,
+                       lines=[self.go(LINK_SID), self.clean(LINK_SID)])
+        dec = self.row_of(link_of(LINK_BARE))
+        self.assertEqual((dec["row"], dec["action"], dec["exit"]), (9, "keep-link", 0))
+        self.assertIn("say continue", dec["what"])
+        self.assertIn("--new-link", dec["risk"])
+        self.assertFalse(dec["note"], "nothing is started, so nothing is told anything")
+        out = self.ok(self.revive(link_of(LINK_BARE)))
+        self.assertIn(link_of(LINK_BARE), out)
+
+    def test_row_9_says_whether_the_server_that_would_respawn_it_is_up(self):
+        self.w.session(self.work, LINK_SID, cwd=self.cwd,
+                       lines=[self.go(LINK_SID), self.clean(LINK_SID)])
+        p = self.w.server("aifoundry")
+        self.w.lsof_map.write_text(json.dumps({str(p.pid): self.cwd}))
+        out = self.ok(self.revive(link_of(LINK_BARE)))
+        self.assertIn("a server is up in this folder: pid %d (aifoundry)" % p.pid, out)
+        self.assertNotIn("its server is down", out)
+        self.assertNotIn("its server is unread", out)
+
+    def test_row_10_a_server_child_forks_onto_a_new_link(self):
+        self.w.session(self.work, LINK_SID, cwd=self.cwd,
+                       lines=[self.go(LINK_SID), self.clean(LINK_SID)])
+        dec = self.row_of(link_of(LINK_BARE), "--new-link")
+        self.assertEqual((dec["row"], dec["action"]), (10, "fork"))
+        self.assertIn("OLD link still opens the OLD copy", dec["risk"])
+        note = self.rec(link_of(LINK_BARE), "--new-link")["note"]
+        self.assertIn("csm FORKED it", note)
+        self.assertIn("The old link still opens the OLD copy", note)
+        self.assertIn("csm FORKED it", self.ok(self.revive(link_of(LINK_BARE),
+                                                           "--new-link")))
+
+    # --- the flags --------------------------------------------------------
+    def test_the_say_text_is_quoted_into_the_note_and_a_command_is_refused(self):
+        self.dead()
+        got = self.rec(SID_A, "--say", "finish the power model")
+        self.assertIn('He said: "finish the power model".', got["note"])
+        # the printed block wraps at the page width, so it is matched on one unbroken word
+        self.assertIn('He said: "finish',
+                      self.ok(self.revive(SID_A, "--say", "finish the power model")))
+        self.refused(self.revive(SID_A, "--say", "/compact"), "runs a leading")
+
+    def test_an_unknown_permission_mode_is_refused_in_the_dry_run(self):
+        self.dead()
+        self.refused(self.revive(SID_A, "--permission-mode", "sideways"),
+                     "sideways", "not a permission mode")
+        self.assertIn("mode         bypassPermissions",
+                      self.ok(self.revive(SID_A, "--permission-mode",
+                                          "bypassPermissions")))
+
+    def test_the_name_flag_is_the_remote_control_label_it_would_use(self):
+        self.dead()
+        self.assertIn("--name       My revived pass",
+                      self.ok(self.revive(SID_A, "--name", "My revived pass")))
+
+    def test_the_risk_line_is_the_worst_fact_and_not_always_the_rows_own(self):
+        """An unanswered tool call outranks the mechanism: it changes what the reader
+        should DO next, which is what the third line is for."""
+        self.dead(lines=[self.go(), tool_call(self.cwd, SID_A, name="Bash")])
+        out = self.ok(self.revive(SID_A))
+        self.assertIn("3 risk: its last tool call (Bash) has no recorded result", out)
+        self.assertIn("neither assumption is safe", out)
+
+    def test_the_lost_agents_reach_the_three_line_answer(self):
+        t = self.dead()
+        d = t.parent / SID_A / "workflows"
+        d.mkdir(parents=True)
+        (d / "wf_abc.json").write_text(json.dumps({
+            "status": "completed",
+            "workflowProgress": [{"state": "error", "label": "a2-e73-camera"},
+                                 {"state": "error", "label": "verify:a3"}]}))
+        out = self.ok(self.revive(SID_A))
+        self.assertIn("3 risk: 2 agent(s) of a workflow run died with it", out)
+        self.assertIn("lost work    2 errored agent(s) in wf_abc.json", out)
+
+    def test_the_json_carries_the_record_the_decision_and_the_note(self):
+        self.dead()
+        got = self.rec(SID_A)
+        self.assertIs(got["dry_run"], True)
+        self.assertEqual(sorted(got["record"]), [
+            "account", "at", "kind", "lost_work", "machine", "owner", "server", "session",
+            "spec", "state", "stop", "version"])
+        self.assertEqual(got["decision"]["row"], 8)
+        self.assertIn("claude-session-mover —", got["note"])
+        self.assertEqual(got["record"]["session"]["local_id"], SID_A)
+
+    def test_the_auto_choice_is_said_outside_the_json_so_stdout_stays_json(self):
+        """🛑 `--json`'s stdout is a contract. `--to auto` announces its pick — a choice
+        this tool made for you is never silent — so on that path it is carried IN the
+        document instead of printed into the middle of it."""
+        self.dead()
+        meters = self.w.meters(personal=(5.0, 10.0, 60))
+        got = self.rec(SID_A, "--to", "auto", CSM_METERS=str(meters))
+        self.assertEqual(got["decision"]["row"], 6)
+        self.assertIn("--to auto: personal", got["auto"])
+        out = self.ok(self.revive(SID_A, "--to", "auto", CSM_METERS=str(meters)))
+        self.assertIn("--to auto: personal", out)
+
+    def test_a_link_that_names_no_transcript_here_is_refused_not_diagnosed(self):
+        self.dead()
+        self.refused(self.revive(link_of(LINK_BARE2)), "no transcript for that link here",
+                     LINK_SID2)
+
+    def test_the_move_gate_is_in_the_plan_and_not_left_for_the_real_run(self):
+        """`--to` the account it is already in is the easiest flag to type by accident,
+        and `check_target` is what says so — so the dry run says it too."""
+        self.dead()
+        dec = self.row_of(SID_A, "--to", "work")
+        self.assertEqual((dec["row"], dec["action"], dec["exit"]), (6, "refuse", 2))
+        self.assertIn("already in work", dec["refusal"])
+        self.assertFalse(dec["note"])
+
+    def test_a_home_that_cannot_run_it_is_a_refusal_on_every_row_that_starts_something(self):
+        """🛑 A home whose login is gone takes a session up and then fails at its first
+        token refresh, which looks exactly like a successful revive."""
+        spare = self.w.account("spare")              # no login at all
+        self.w.session(spare, SID_B, cwd=self.cwd,
+                       lines=[self.go(SID_B), self.clean(SID_B)])
+        dec = self.row_of(SID_B)
+        self.assertEqual((dec["row"], dec["action"], dec["exit"]), (8, "refuse", 2))
+        self.assertIn("holds no login", dec["refusal"])
+        self.assertFalse(dec["note"], "nothing is started, so nothing is told anything")
+        out = self.ok(self.revive(SID_B))
+        self.assertIn("🛑 this home cannot run it", out)
+
+
+class HomeUsable(InProc):
+    """`check_target` split into "is this a legal move" and "can this home run a session".
+
+    🛑 ZERO BEHAVIOUR CHANGE FOR `move`, which is why this class exists beside
+    `Refusals(Base)` rather than instead of it: the five one-home refusals have to come out
+    of `check_home_usable` word for word, in the same ORDER, with `check_target`'s two
+    two-account ones still in front of them. `revive` resumes a session in the home it is
+    already in for three of its actions, so those two would refuse exactly the thing it is
+    for.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.mod.MACHINE = "here"
+        self.src = self.account("work", email="me@work.example")
+
+    def tgt(self, name="personal", **kw):
+        kw.setdefault("email", "you@home.example")
+        kw.setdefault("org", "org-2")
+        return self.account(name, **kw)
+
+    def home_why(self, tgt, accts=None):
+        with self.assertRaises(self.mod.Refusal) as e:
+            self.mod.check_home_usable(tgt, accts or [self.src, tgt])
+        return str(e.exception)
+
+    def target_why(self, tgt, accts=None):
+        s = self.session(self.src)
+        with self.assertRaises(self.mod.Refusal) as e:
+            self.mod.check_target(s, tgt, accts or [self.src, tgt])
+        return str(e.exception)
+
+    def test_a_usable_home_passes_both_and_returns_the_credential_sentence(self):
+        tgt = self.tgt()
+        s = self.session(self.src)
+        self.assertEqual(self.mod.check_home_usable(tgt, [self.src, tgt]),
+                         self.mod.check_target(s, tgt, [self.src, tgt]))
+
+    def test_the_five_one_home_refusals_are_the_same_sentence_from_either_door(self):
+        for make, needle in (
+                (lambda: self.tgt("gone", email=None), "holds no login"),
+                (lambda: self.tgt("spare", email="someone@else.example"), None)):
+            tgt = make()
+            if needle:
+                self.assertIn(needle, self.home_why(tgt))
+                self.assertEqual(self.home_why(tgt), self.target_why(tgt))
+        # a home that is not there at all
+        tgt = self.tgt("missing")
+        shutil.rmtree(str(tgt.home))
+        self.assertIn("does not exist", self.home_why(tgt))
+        self.assertEqual(self.home_why(tgt), self.target_why(tgt))
+
+    def test_the_expected_login_check_is_the_same_too(self):
+        self.mod.ACCOUNTS_FILE.write_text(
+            "work %s\npersonal %s someone@else.example\n"
+            % (self.src.home, self.root / "home" / ".claude-personal"))
+        accts = self.mod.load_accounts()
+        tgt = [a for a in accts if a.name == "personal"][0]
+        self.tgt()                           # the home holds you@home.example
+        self.assertIn("WRONG login", self.home_why(tgt, accts))
+        self.assertEqual(self.home_why(tgt, accts), self.target_why(tgt, accts))
+
+    def test_an_account_on_no_machine_is_refused_by_the_home_door_too(self):
+        tgt = self.tgt()
+        tgt.machines = frozenset()
+        self.assertIn("is on no machine", self.home_why(tgt))
+
+    def test_only_check_target_refuses_the_two_ACCOUNT_facts(self):
+        """🛑 The point of the split. Revive resumes a session in its own home — the same
+        account, the same login — and both of these would refuse that."""
+        s = self.session(self.src)
+        with self.assertRaises(self.mod.Refusal) as e:
+            self.mod.check_target(s, self.src, [self.src])
+        self.assertIn("already in work", str(e.exception))
+        twin = self.account("twin", email="me@work.example")
+        with self.assertRaises(self.mod.Refusal) as e:
+            self.mod.check_target(s, twin, [self.src, twin])
+        self.assertIn("same login", str(e.exception))
+        # the same two homes, asked the one-home question: both usable
+        self.assertEqual(self.mod.check_home_usable(self.src, [self.src]), "")
+        self.assertEqual(self.mod.check_home_usable(twin, [self.src, twin]), "")
+
+    def test_the_order_of_the_refusals_is_kept_where_two_of_them_both_match(self):
+        """⚠️ A home holding the WRONG login must be reported as the wrong login, not as
+        the same login — a reader given the other sentence goes and fixes the wrong thing.
+        That is what `before_login` in `check_home_usable` is for."""
+        self.mod.ACCOUNTS_FILE.write_text(
+            "work %s\ntwin %s someone@else.example\n"
+            % (self.src.home, self.root / "home" / ".claude-twin"))
+        self.account("twin", email="me@work.example")     # the SOURCE's own login
+        accts = self.mod.load_accounts()
+        twin = [a for a in accts if a.name == "twin"][0]
+        self.assertIn("WRONG login", self.target_why(twin, accts))
+
+    def test_the_credential_probe_is_last_and_says_the_same_thing_either_way(self):
+        """🛑 The state file is not the credential, and this check stays LAST — it is the
+        one that costs a Keychain question, and everything cheaper has already refused."""
+        self.mod.LOGIN_PROBE = "false"
+        tgt = self.tgt()
+        why = self.home_why(tgt)
+        self.assertIn("its credential is GONE", why)
+        self.assertEqual(why, self.target_why(tgt))
 
 
 # -------------------------------------------------------- what the move says it will cost

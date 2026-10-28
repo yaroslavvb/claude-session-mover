@@ -11,13 +11,74 @@ the tool depends on.
 
 ## [Unreleased]
 
-Towards `csm revive`. These are the two milestones it needs before it can decide anything:
-resolution that reaches a session nothing is running, and a stop reason that is right for all
-of them. Both are useful on their own, and both are measured against Claude Code **2.1.312**
-on macOS (Wed 28 Oct 2026) — a newer version than the 2.1.296–2.1.300 the rest of this file
-was written against.
+Towards `csm revive`: resolution that reaches a session nothing is running, a stop reason that
+is right for all of them, and now the diagnosis those two make possible — `csm revive <link>
+--dry-run`, which says why a session stopped, what bringing it back would do, and the one risk
+in doing it. It still **starts nothing**: the actions are the next milestone. Everything here
+is measured against Claude Code **2.1.312** on macOS (Wed 28 Oct 2026) — a newer version than
+the 2.1.296–2.1.300 the rest of this file was written against.
 
 ### Added
+
+- **`csm revive SESSION --dry-run`: the diagnosis, the plan and the note.** One record about
+  one session, printed as a three-line answer (what stopped it and when · what revive would do
+  · the one risk), then the detail, then the row of the decide table it would take and the note
+  it would send. `--json` carries the record, the decision and the note. It is read-only and
+  offline: it starts nothing, signals nothing and writes nothing, and without `--dry-run` it
+  refuses rather than print a plan that could be read as work done.
+  - **What kind of session it is, proved rather than guessed.** A Remote Control *server
+    child*'s local id *is* `uuid5` of its bridge session's api url, so a bare bridge id from
+    the link, from its registry row or from an orphan `~/.claude/bridge-spawn/cse_X-*`
+    directory that derives to this transcript's name is proof — and such a session cannot be
+    resumed onto its own link, which is why reviving it in the same account has to fork. A
+    *self-hosted* session wrote a `bridge-session` line or a `bridge_status` url into its own
+    transcript and does re-attach. 🛑 The registry's `entrypoint` is never used for this: it
+    says how the process was started (`sdk-cli` means `--print`) and a fork or a resume
+    rewrites it.
+  - **Why it stopped, parsed as JSON lines over at least 1 MiB, from the last real prompt
+    forward.** `usage-limit` (with the *class* from the limit's own words — session, weekly,
+    monthly-spend, credits, model — because waiting only clears the first two; the window from
+    `rateLimitType`; the reset; and whether it is still in force), `api-error`, `mid-turn` (the
+    last main-chain assistant line holds a `tool_use` no later `tool_result` answers),
+    `archived` (a `code 4090` system line *after* the last `bridge_status`), `finished`,
+    `empty`, `unknown`. A limit with a clean answer after it is history, not the stop.
+    - The window is `CSM_REVIVE_TAIL`, 1 MiB by default, and **not** the listing's 384 KiB: on
+      the incident this was written for, `usage_limit_reached` and `quotaLimits` are in the
+      last 512 KiB of a 2.6 MB transcript and *not* in the last 384 KiB, so the listing's
+      window reports a clean finish for a session sitting on a wall. And it is parsed, never
+      grepped: a text match on the tail says "out of quota" about any session that merely
+      discussed one.
+  - **What the run lost**, from `workflows/wf_*.json` in the session's sibling directory: the
+    agents whose own `state` is `error`, counted and named. 🛑 Never the file's top-level
+    `status`, which reads `completed` on the incident where five agents died on a limit.
+  - Plus: whether anything is still running it (a registry row proved by `procStart`, and a
+    machine-wide `ps` sweep for a claude process whose argv names `cse_<bare>` or
+    `--resume <id>` — a registry file survives the SIGKILL of its own process), whether the
+    session's own home can still run it, its account's meter, whether a `claude remote-control`
+    **server** is up in that folder (the one thing that decides whether opening the link brings
+    a server child back by itself), and whether anything else owns it.
+- **The revive note**, delivered as the revived session's next user turn. It opens with the
+  stamp — `[claude-session-mover — written by the tool; the user did not type this]` — because
+  it renders in the app as a message, and a message in your conversation that you did not type
+  has to say so in its first line. Then: when and why it stopped, what changed while it was
+  stopped (a reset that passed, a machine that restarted *after* the stop), how it was brought
+  back, the account and the memory store, the agents that died with it — and, only for a
+  `mid-turn` stop, that its last tool call has no recorded result and may have fully applied,
+  partly applied or not run. Then one request, attributed: `--say TEXT` quoted verbatim as
+  `He said: "…"`, or the plain fact that csm was asked to revive it. Bounded at ~1,500
+  characters by *dropping* optional clauses, never by cutting a sentence; a `--say` over 400
+  characters is refused rather than shortened.
+  - 🛑 A `--say` (or a built note) whose first non-space character is `!` or `/` is refused:
+    the CLI runs a delivered prompt starting with either as a command (2.1.312's own
+    `prompt_undelivered` says so), so it would either execute something nobody asked for or
+    vanish.
+- **`CSM_RC_JOBS_DIR`**: where a scheduled-pass supervisor records the session each pass runs
+  as (`<job>.session` files whose last `uuid=` line is the local id). A session named there is
+  revived by its own supervisor, onto the same link, so `revive` refuses it and says whose
+  command it is — the same doctrine as `CSM_BOTS_DIR`, including that a directory which cannot
+  be *read* is a refusal and not a "no". Unset means no such program.
+- **`CSM_LSOF`**: how `lsof` is invoked. Only `revive` asks it, and only for the one question
+  that is nowhere in a process's argv — which folder a Remote Control server is serving.
 
 - **A claude.ai link now finds its transcript with nothing running.** A Remote Control
   session's local id is not random: the CLI derives it from the bridge session's own API url,
@@ -86,6 +147,17 @@ was written against.
 
 ### Changed
 
+- **`check_target` is split**, with zero behaviour change for `move`: the five refusals about
+  one config home (on no machine, no such home, holds no login, holds the wrong login, the
+  credential is gone) are now `check_home_usable`, and `check_target` keeps its two about two
+  *accounts* (source == target, the same login in another home) in front of them. `revive`
+  resumes a session in the home it is already in for three of its actions, so those two would
+  refuse exactly the thing it is for. The refusal **order** is preserved too — a home holding
+  the wrong login is still reported as the wrong login, not as the same login.
+- **`--to auto` always says which account it picked**, and now carries that sentence in
+  `AUTO_NOTE` as well as printing it, so a caller whose one stream is a contract (`revive
+  --json`, whose stdout must parse) can place it itself instead of finding it in the middle of
+  its own output.
 - **`csm find` exits 1 when nothing matched** (it used to exit 0 whatever it found, which
   reads as "asked and answered" to anything checking a status — and the answer it gives most
   often about a session somebody has lost is the empty one). The exit code was verified unused

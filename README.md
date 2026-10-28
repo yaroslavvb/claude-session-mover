@@ -8,7 +8,10 @@ quota to spare; instead of starting the work over and losing the thread, you mov
 session's transcript into the other account's config home, pre-answers that home's first-run dialogs, and resumes
 it there under the other login. The agent remembers everything that was said, every turn from then on is spent on
 the other account, and nothing is deleted from the old one. With `--from-machine` it does the same across two
-machines: the session is found on the other one, copied over ssh, and resumed here.
+machines: the session is found on the other one, copied over ssh, and resumed here. And when a session has
+stopped answering altogether — a usage limit, a restart, a Remote Control disconnect — `csm revive` reads why out
+of its own transcript and brings it back, from nothing but its claude.ai link
+([below](#revive-a-dead-session)).
 
 Behind the tool is one idea: **an account is a payment layer — a login and a quota. Everything that should follow
 you lives outside the account's config home and is shared.** Instructions, skills, plugins, hooks, memory and
@@ -163,6 +166,7 @@ csm matrix                          # what they share, and what they cannot
 csm list                            # recent sessions in every account, newest first
 csm move 3 --to work --dry-run      # the plan, and any refusal; nothing changes
 csm move 3 --to work                # row 3 of the last list -> the account "work"
+csm revive https://claude.ai/code/session_01Ab... --dry-run   # it stopped: why, and what now
 csm stop 3                          # end that moved session and free its window
 csm modes --check                   # one line: is any live session weaker than this machine's default
 csm find "refactor" --on laptop     # where is that session, on this machine or another
@@ -298,6 +302,34 @@ session (a bot, a chat bridge, a service), a plain `move` of that session would 
 talking to while the supervisor kept answering on the old account. The refusal names the owner, and `--copy-only`
 is the entry point such a supervisor uses to change account itself.
 
+### `csm revive`
+
+```sh
+csm revive SESSION [flags]
+```
+
+Brings back a session that stopped — a usage limit, a restart, a Remote Control disconnect, a kill mid-turn. It
+reads **why** it stopped out of the transcript, whether anything is still running it, how much quota its account
+has and whether anything else owns it, and then takes the first row of its decide table that matches. The whole
+narrative, the table in plain words and what it cannot do are in
+[Revive a dead session](#revive-a-dead-session) below.
+
+| flag | effect |
+|---|---|
+| `--dry-run` | print the plan — the row it would take, the note it would send, any refusal — and start, wake, move and write nothing |
+| `--json` | the diagnosis record, the decision and the note, as JSON. The prose goes to stderr, so stdout stays parseable |
+| `--to ACCOUNT` | move it to that account instead of reviving it where it is (`auto` for the one with the most weekly room). It is also the cure for a limit that is still in force |
+| `--new-link` | for a Remote Control **server child**, which cannot be resumed onto its own link: fork it to a new session id and a new link. The old link still opens the old copy |
+| `--say TEXT` | one thing to pass on to the revived session, quoted verbatim and attributed to you. At most 400 characters, and it may not start with `!` or `/`, which the CLI would run as a command |
+| `--permission-mode MODE` | the mode to come back in. Without it, the mode the session recorded, by the same rule as `move` |
+| `--unarchive` | resume a session that was archived or ended from the app, which unarchives it. Refused without this flag |
+| `--name NAME` | the Remote Control name the revived session gets |
+| `--from-machine M` | refused, and says so: every gate a revive turns on is a question about the machine the transcript is on. Run `csm --machine M revive <spec>` instead, which does the whole thing over there |
+
+**Exit codes are the answer an unattended caller reads**: `0` the session took a turn (or there was nothing to
+do, or the one thing to tap was printed), `1` something is **up** and nothing proved it read the note, `2`
+nothing was started at all.
+
 ### `csm stop`
 
 ```sh
@@ -431,6 +463,20 @@ rest are all knobs, with a documented default and a tool that works with none of
 | `CSM_ROOM_FIX` | the cure appended to that note, a template carrying `{handle}`, `{name}` and `{cwd}`. Unset, only the fact is printed — inventing a command is worse than naming none |
 | `CSM_BOTS_DIR` | where a supervisor that owns a session keeps its state: one `<name>.json` per owner, each with a `session_id`. A plain `move` of a session named there is refused (default `<state dir>/owners`; absent means no session is owned) |
 | `CSM_BOT_FIX` | the cure in that refusal, a template carrying `{owner}`, `{to}` and `{id}` |
+| `CSM_RC_JOBS_DIR` | where a **scheduled-pass** supervisor records the session each of its passes runs as: one `<job>.session` file of `key=value` lines, whose last `uuid=` is the local session id. Such a pass has a revive of its own that puts it back on the same link, so `csm revive` refuses a session named there and says whose command it is. **Unset means nothing is owned this way**, because the default installation has no such program; a directory that cannot be read is a refusal, never a "no" |
+
+**Reviving**
+
+| variable | effect |
+|---|---|
+| `CSM_RELAY_MODEL` | the model the relay runs as (default `haiku`). It reads one instruction and makes one tool call, so the cheapest one is the right one — and it is a knob because the cost lands on whichever account's home the relay runs in |
+| `CSM_RELAY_TIMEOUT_S` | how long the relay may take in all (default 120). Measured ~8 s per wake, so the bound is not for a slow relay but for a **held** one: a relay that stops to ask a person has to come back as "started, not proved" instead of hanging an unattended run |
+| `CSM_RELAY_NAME` | the name the relay runs under, which is the sender the app shows beside the message, templated over `{machine}` (default `csm revive ({machine})`). Deliberately not a person's name and not the revived session's: the reader has to see at a glance that a tool sent it |
+| `CSM_REVIVE_PROVE_S` | how long to wait for **proof** that the revived session read the note — its registry row going `busy`, or an `assistant` line past the offset taken before the relay (default 90). A bounded machine wait; passing it without proof is exit 1, never 0 |
+| `CSM_REVIVE_TAIL` | how much of a transcript `revive` reads to say why a session stopped (default 1 MiB) — deliberately **not** the listing's `CSM_TAIL_BYTES`, whose 384 KiB window misses the limit lines of a long agentic session |
+| `CSM_REVIVE_NOTE_MAX`, `CSM_REVIVE_SAY_MAX` | the revive note's budget in characters (default 1500; optional clauses are *dropped* to meet it, never sentences cut) and the longest `--say` (default 400; a longer one is refused rather than shortened, because it is quoted verbatim) |
+| `CSM_REVIVE_LOG` | one JSON record per revive, 0600 (default `<state dir>/revive.jsonl`): what was decided, what ran, what was proved — and never the note, which is conversation text |
+| `CSM_LSOF` | how `lsof` is invoked. Only `revive` asks it, and only for the one question that is in no process's argv: which folder a Remote Control server is serving |
 
 **Listing, state and binaries**
 
@@ -460,7 +506,8 @@ move's scrollback is read from, and `CSM_REMOTE_LOCAL` / `CSM_REMOTE_HOME`, whic
 process with `HOME` pointed at a fixture tree. Three of them — `CSM_LOGIN_PROBE`, `CSM_REMOTE_LOCAL`,
 `CSM_REMOTE_HOME` — are dropped from a moved session's environment **by name**, although `CSM_*` is outside the
 scrubbed families, so a stale export cannot follow a real move. The tuning internals (`CSM_HEAD_BYTES`,
-`CSM_TAIL_BYTES`, `CSM_POLL`, `CSM_SETTLE`) and the full list are in [docs/design.md](docs/design.md#env).
+`CSM_TAIL_BYTES`, `CSM_POLL`, `CSM_SETTLE`, `CSM_CANARY_CHUNK`) and the full list are in
+[docs/design.md](docs/design.md#env).
 
 <a id="wrapper"></a>
 
@@ -543,6 +590,132 @@ source running then means two CLIs append to one file, so the plan says so and n
 - **The transcript still names the source account inside itself** — paths and the recorded email from earlier turns
   — so the moved session will describe itself as the old account until its context is rebuilt.
 
+## Revive a dead session
+
+A move is for a session that is still running. `csm revive` is for the one that is **not**: the account hit its
+usage limit and the turn died on a 429, the machine restarted under it, Remote Control disconnected, something
+killed it mid-turn. Paste the claude.ai link — usually the only name you still have for it, because such a
+session has no registry row and often no title — and it answers two questions in one go: *why did it stop*, and
+*what brings it back*.
+
+```sh
+csm revive https://claude.ai/code/session_01Ab... --dry-run   # why it stopped, and what reviving it would do
+csm revive https://claude.ai/code/session_01Ab...             # ...do it
+csm revive 7f3a --to auto --say "skip the card run, just write the findings up"
+csm revive 7f3a --new-link                                    # fork a dead server child onto a new link
+```
+
+**When to use it, and when to just open the session and say *continue*.** If the session is a Remote Control one
+whose folder still has a `claude remote-control` server running, opening its link in the app and typing
+*continue* is the better answer: the server respawns the worker itself, and you keep the link, the title, the
+account and the quota window. Nothing local can make that happen — the respawn is the server's decision, taken
+when the session next gets activity — so `revive` detects exactly that case, prints the one thing to tap, and
+starts nothing (row 9). Reach for `revive` instead when **nobody is at the keyboard**, when you **do not know why
+it stopped**, when the account it was on **has no quota left** (`--to auto` moves it to the one that does), or
+when the thing you actually need to know is whether its **last tool call ever ran**.
+
+### What it decides, in order
+
+The first row that matches wins — a session that is both out of quota and dead is answered about the quota,
+because starting it would spend its first turn hitting the same wall.
+
+| # | when | what it does |
+|---|---|---|
+| 1 | something else owns the session: a supervisor in `CSM_BOTS_DIR`, a scheduled pass in `CSM_RC_JOBS_DIR` | **refuses**, naming that owner's own revive command. A second copy would answer nobody while the owner kept answering |
+| 2 | the transcript holds no conversation (0 bytes, or no main-chain line — a Remote Control server pre-creates such sessions) | **refuses**: there is nothing to continue |
+| 3 | it is live and **busy** | **nothing to do** — it is working right now, and a message would join the turn it is in the middle of |
+| 4 | it stopped on a usage limit that is **still in force**, and no `--to` | **refuses**, with the reset in local time and the cures: wait until then and run it again, or `--to auto` now. For a monthly-spend, credits or model limit it says that waiting does not clear it at all |
+| 5 | it is live and **idle** (a lazy respawn, or you opened the link) | **wakes it**: nothing is started, the note is relayed in. ⚠️ A `--to` is *not* carried out here, and the output says so: a move copies a transcript and this one has a live writer, so stop it first |
+| 6 | `--to ACCOUNT` or `--to auto` | **moves it** — an ordinary `csm move`, with its copy, its own move note and its printed cost — and then relays the revive note into the copy |
+| 7 | dead, a **self-hosted** Remote Control session (it wrote its own `bridge-session` line), same account | **resumes it in place, on the same claude.ai link**. Archived or ended from the app is refused unless `--unarchive` |
+| 8 | dead, a **terminal** session, same account | **resumes it in place** — and it gets a **new** claude.ai link, which the output says loudly: it was never a Remote Control session, so that is new exposure, not a restoration |
+| 9 | dead, a Remote Control **server child**, same account, no `--new-link` | **prints the one thing to tap** — open the link and say *continue* — plus whether that folder's server is up, and starts nothing and waits for nothing |
+| 10 | dead, a server child, same account, `--new-link` | **forks it**: `--resume <old> --fork-session --session-id <new uuid4>`, so a new id, a new link, the same past. The old transcript is left byte-identical and the old link still opens the **old** copy — archive it and do not type there |
+
+Which kind of session it is, is **proved, never guessed**: a server child's local transcript id *is*
+`uuid5` of its bridge session's API url, so the link, its registry row or an orphan `~/.claude/bridge-spawn/`
+directory that derives to this transcript's name all prove it. The registry's `entrypoint` is deliberately not
+used — it says how a process was started, and a fork or a resume rewrites it.
+
+### The three-line answer
+
+Everything above the detail block is what gets read out on a phone: **what stopped it and when · what revive
+would do · the one risk**.
+
+```
+REVIVE  the refactor sweep   (work, bf974a77)
+  1 stopped Tue 27 Oct 17:46 (19h ago): it hit a session limit, which resets 18:30 — that reset has passed
+  2 FORK it: a new session id, a new link, the same past
+  3 risk: the OLD link still opens the OLD copy — two conversations with one history, so archive the old
+          one and do not type there
+```
+
+(then the detail block — what it is and how that was proved, its state, the stop, lost work, the account and
+its meter, whether a server is up in that folder, who else owns it, the link, the folder, the mode, the row it
+took — and then the note itself.)
+
+The risk line is worst-first and outranks the row's own mechanism: an unanswered tool call, an archive somebody
+made on purpose, and the agents a frozen workflow run lost each change what you should do next. Why it stopped
+is **parsed as JSON lines over the last 1 MiB** (`CSM_REVIVE_TAIL`), from the last real prompt forward, never
+grepped — a text match on the tail says "out of quota" about any session that merely discussed one, and the
+listing's 384 KiB window misses the limit lines of a long agentic session entirely.
+
+### How the note gets in: one carrier, and it is a relay
+
+Whatever row it takes, the session comes up (or is found) as an ordinary **idle** process with no prompt of its
+own, and the note is then delivered to it by a headless Claude of its own:
+
+```
+claude -p --model haiku --permission-mode bypassPermissions --name "csm revive (<machine>)" \
+       --output-format json "<call SendMessage once, to '<that session's name>', with this text verbatim>"
+```
+
+run under that session's own config home with the environment scrubbed, stdin closed, in a folder of csm's own
+under the state dir, bounded by `CSM_RELAY_TIMEOUT_S`. Measured on CLI 2.1.312 (Wed 28 Oct 2026): ~5–8 s and
+$0.002–0.006 per wake, and it lands recorded for what it is — `isMeta: true, turnOrigin: "peer", origin:
+{kind: "peer", name: "csm revive (<machine>)", fromMode: "bypass", verifiedPeerPid, msg_id}` — with the app
+showing it as a message from that sender. **Honest attribution is the whole reason for the detour.** A
+positional prompt was measured to be recorded as *your own typing* (`origin: {kind: "human"},
+promptSource: "typed"`) whatever its text says, so a sentence csm wrote would be indistinguishable, in your own
+conversation's record, from one you typed. The alternative — a hidden `isMeta` line plus `--reply-on-resume` — is
+honest and self-starting, but it writes into a transcript, and for a fork it would have to write into the *old*
+one, where a later lazy respawn of the old link could pick it up as an interrupted turn: two actors on one
+conversation. So **a revive writes into no transcript at all**, and the note opens with its own stamp,
+`[claude-session-mover — written by the tool; the user did not type this]`.
+
+**The proof is a turn, not a link.** The transcript's byte offset is taken *before* the relay; exit `0` needs
+either the registry row going `busy` or an `assistant` line past that offset within `CSM_REVIVE_PROVE_S`. A relay
+that reports success and delivers nothing is exit `1` — "it is up but idle: open `<link>` and say continue" —
+because the proof is the session's own behaviour and not the relay's word for it.
+
+### What it cannot do
+
+- **It cannot make a server respawn a dead child.** Only server-side activity does that, so row 9 prints the tap
+  instead of pretending. It does not then sit and poll for you to tap it: a tool that waits for a person is the
+  one shape this tool never takes.
+- **It cannot wake a session by writing to its own peer socket.** The protocol is readable and the frame works,
+  but a hand-rolled frame from a plain script is **held** on a session that bypasses prompts — measured, the pane
+  reads `Held peer message … The sender did not attest its permission mode and this session bypasses prompts`,
+  which is a dialog waiting for a human. So the wake goes through Claude Code's own SendMessage tool, from the
+  relay above, or not at all.
+- **A server child cannot keep its link without its server.** `claude --resume <id>` of such a session never
+  re-attaches that claude.ai session — it registers a new one — and `--resume=<url>` hydrates from the server and
+  can *replace* the local transcript. That is why reviving a server child in the same account **forks** rather
+  than reusing its id: a csm-started process on the old id plus a later lazy respawn of the old link is two
+  writers on one conversation. A self-hosted `--remote-control=` session does re-attach, and for it the printed
+  link is the proof — a *new* link means nothing re-attached, and the note is then not sent, because the sentence
+  it carries would be false.
+- **It cannot reach a machine that is off.** A transcript lives in a config home, which is per machine;
+  `--from-machine` is refused for `revive`, because every gate it turns on — is anything still writing that
+  transcript, is a server up in that folder, can that home still run it — is a question about the machine the
+  session is *on*, and the answers are not transportable. `csm --machine M revive <spec>` runs the whole thing
+  over there instead; with that machine down, nothing here can revive it.
+- **It never waits out a limit, signals anything, or unarchives by accident.** A limit still in force is a
+  refusal carrying the time, not a sleep; `revive` has no stop of any kind; and a session archived or ended from
+  the app needs `--unarchive` said out loud.
+- **It cannot tell you whether an interrupted tool call took effect.** It tells you that there is no recorded
+  result, which is the honest answer, and the revived session is told the same thing.
+
 ## Safety
 
 Every one of these is a rule in the code, and the tests pin them:
@@ -603,7 +776,7 @@ machine; connectors are free, because they follow the account.
 
 ## Lessons
 
-Nine of the rules that cost the most to learn. **[LESSONS.md](LESSONS.md)** has 36, each with a one-line rule,
+Nine of the rules that cost the most to learn. **[LESSONS.md](LESSONS.md)** has 45, each with a one-line rule,
 the incident behind it, a command to check it, and the Claude Code version it was verified against, with the
 fast-changing (Beta) facts marked. The longer narrative is in [docs/lessons.md](docs/lessons.md).
 
@@ -642,6 +815,11 @@ to work"*, or *"move it to whichever account has quota left"*, or *"bring my lap
 *"stop the session you moved"*. The agent lists the candidates, asks when it is ambiguous, moves the session, and
 answers with the account and the new link.
 
+It covers the dead ones too: *"my session died, bring it back"*, *"revive this link"*, *"the remote control
+disconnected — restart it"*, *"it stopped on a limit, continue it on an account with room"*. Paste the claude.ai
+link and the agent runs `csm revive` with it; the answer comes back as the three lines above, the link, and the
+title you knew it by.
+
 Re-run `./install.sh --skill` after an update. It repoints a link of its own, and **refuses a link that points
 somewhere else**, printing `skipped <home>/skills/move-session: it links to …` — which is the case to watch for if
 you already kept that skill somewhere of your own: those homes go on reading the old text until you repoint them
@@ -657,7 +835,8 @@ update.
 - **ssh** for `--machine` / `--ssh`, and for `find --on` / `move --from-machine`, which also want a python on the
   far side — the system one is enough, because the helper they pipe over is standard-library-only.
 - **Claude Code's on-disk state is undocumented** and can change in any release. Everything here was measured
-  against CLI 2.1.296–2.1.300 (the shared-tree handling and LESSONS.md against 2.1.308); the tests pin every shape the tool depends on, so a format change fails loudly
+  against CLI 2.1.296–2.1.300 (the shared-tree handling and LESSONS.md against 2.1.308; everything `csm revive`
+  reads and does against 2.1.312); the tests pin every shape the tool depends on, so a format change fails loudly
   rather than quietly. Re-check anything load-bearing against the version you actually run.
 - CI runs the suite on Ubuntu and macOS against Python 3.9 and 3.12, and on Ubuntu 22.04 against **3.7** — the
   floor this page promises, so it is measured and not merely claimed — with no tmux and no account.
@@ -711,7 +890,7 @@ the machine can reach. Only move sessions between accounts you own.
 python3 tests/test_mover.py
 ```
 
-466 tests, fixtures only: fake homes and transcripts, a fake `claude` that records its argv and environment, a fake
+673 tests, fixtures only: fake homes and transcripts, a fake `claude` that records its argv and environment, a fake
 `tmux` that really runs the moved window's command on a private socket, a fake `ssh` that records the command line
 it was handed, and — for `find --on` and `--from-machine` — "the other machine" played by this process with `HOME`
 pointed at a fixture tree, so no test reaches a real host. No network, no account, no credential store, no real

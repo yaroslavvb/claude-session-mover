@@ -128,7 +128,7 @@ try:                                      # POSIX only; the tool is macOS/Linux 
 except ImportError:                       # pragma: no cover
     pwd = None
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 PROG = "claude-session-mover"
 
 HOME = Path(os.path.expanduser("~"))
@@ -9644,8 +9644,8 @@ def main(argv: list) -> int:
                     "`csm list`, or part of the title. A LINK is the one spec that always "
                     "works for a session that is no longer running")
     pr.add_argument("--dry-run", action="store_true",
-                    help="print the plan and change nothing (the only mode that answers "
-                         "today)")
+                    help="print the plan — the row it would take, the note it would send — "
+                         "and start, wake, move and write nothing")
     pr.add_argument("--json", action="store_true", dest="as_json",
                     help="the diagnosis record, the decision and the note, as JSON")
     pr.add_argument("--to", metavar="ACCOUNT",

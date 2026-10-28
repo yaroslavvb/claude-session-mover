@@ -19,7 +19,8 @@ in [docs/lessons.md](docs/lessons.md).
 
 Contents: [A. What a move is](#a) · [B. Doing the move safely](#b) ·
 [C. Credentials and identity](#c) · [D. Sharing one home between accounts](#d) ·
-[E. Checks](#e) · [F. How to work on this](#f) · [Related tools](#related)
+[E. Checks](#e) · [F. How to work on this](#f) ·
+[G. Reviving a session that died](#g) · [Related tools](#related)
 
 <a id="a"></a>
 
@@ -537,6 +538,164 @@ live-twin check across every home), but the layout has costs that are easy to mi
 - **Check.** Before relying on a new primitive, search a few of the [related tools](#related) for
   it.
 - **Verified.** 2.1.308. **Stable.**
+
+<a id="g"></a>
+
+## G. Reviving a session that died
+
+Measured on macOS, CLI **2.1.312**, Wed 28 Oct 2026, against the incident that prompted them: a
+Remote Control session whose turn died on a usage limit at 17:46 local time and sat dead for 17
+hours. Every one of these is **Beta**: it is behaviour and layout nobody documents.
+
+### L37 · A Remote Control session's transcript name is arithmetic on its link
+
+- **Rule.** Do not look a Remote Control session up — compute it.
+  `uuid5(3ab19d7e-9f35-45c2-926e-75e271cc60b3, "https://api.anthropic.com/v1/code/sessions/cse_<bare>")`
+  is the local transcript's id, and claude.ai's `session_<bare>` is the bridge's `cse_<bare>` with
+  the prefix swapped.
+- **Why.** A server-spawned child writes no `bridge-session` line into its own transcript, so a
+  session that has stopped can be resolved only through a live registry row — which a dead session
+  does not have. Every dead phone session was unreachable by the one name anybody still had for it:
+  its link. Verified on **37/37** live registry rows carrying both ids, across six account homes,
+  and 0/37 against any other name form; the namespace constant is byte-identical in 2.1.310, .311
+  and .312. A spacesheep session page's uuid *is* the local id too.
+- **Check.** `csm revive <link> --dry-run`, or recompute it from a live row:
+  `python3 -c 'import uuid,sys;print(uuid.uuid5(uuid.UUID("3ab19d7e-9f35-45c2-926e-75e271cc60b3"),"https://api.anthropic.com/v1/code/sessions/"+sys.argv[1]))' cse_<bare>`
+  against the `sessionId` in `<home>/sessions/*.json`. Re-check after every CLI upgrade: `csm` keeps
+  a canary that greps the constant out of the installed bundle and says `derivation unverified for
+  CLI <v>` when it is gone.
+- **Verified.** 2.1.310–2.1.312. **Beta.**
+
+### L38 · A respawned server child comes back idle and says nothing
+
+- **Rule.** Bringing the *process* back is not bringing the *session* back. Whoever revives a
+  session has to supply the next message.
+- **Why.** The bridge respawns a child lazily, when the server has work for that session (the app
+  opening it, a message, a trigger firing), and the respawned child re-sends nothing and writes
+  nothing. Measured on the incident transcript: between the 429 at 00:46:14Z and the peer message at
+  18:03:30Z there is **no entry at all** for the 17:56Z respawn — only three untimestamped
+  bookkeeping entries — and the session-start attachments (`instructions`, `date changed`,
+  `skill_listing`) arrive with the first turn *after* the wake, 170 ms after the prompt.
+- **Check.** Open a dead Remote Control session in the app, then `wc -l` its transcript before and
+  after: the line count does not move until something is typed.
+- **Verified.** 2.1.312. **Beta.**
+
+### L39 · Reviving a server child in its own home must FORK, never reuse its id
+
+- **Rule.** Resume a server-spawned session with `--fork-session` and an id you chose yourself; never
+  start a second process on the old local id, and never `--resume=<url>`.
+- **Why.** Three measurements meet here. `claude --resume <uuid>` of such a session does **not**
+  re-attach its claude.ai session (its ingress url is null) — it registers a *new* link. A lazy
+  respawn of the old link can arrive at any time afterwards, and it has the **same local id**, so
+  two CLIs would append to one transcript — the unrecoverable state of **L08**.
+  And `--resume=<https url>` hydrates from the server and **replaces** the local transcript
+  (`Hydrated N entries from remote`; it declines only to replace a non-empty local file with an
+  empty server set, `hydrate_skip_zero_content_replace`). A fork leaves the old file byte-identical
+  and gives the new conversation a writer of its own — at the price of a new link, which still has
+  to be said out loud, because the old link goes on opening the old copy. A self-hosted
+  `--remote-control=` session is the exception: it does re-attach, and needs no fork.
+- **Check.** Fork a throwaway: `claude --resume <old> --fork-session --session-id <new uuid4>
+  --remote-control=<label>`, then `shasum` the old transcript before and after and confirm only
+  `<new>.jsonl` was written.
+- **Verified.** 2.1.312. **Beta.**
+
+### L40 · Never wake a session before its limit resets — the wake is consumed and lost
+
+- **Rule.** Read `quotaLimits.resetsAt` off the stop line and refuse to deliver anything before it.
+  A pending wake is not queued behind a limit; it is spent on it.
+- **Why.** The incident's own heartbeat fired 45 minutes **inside** the five-hour window: the prompt
+  is at 2026-10-28T00:46:13.673Z (17:46 PDT, `isMeta: true`) and the next line is another 429 at
+  00:46:14.230Z. One turn, one more rate-limit line, and nothing re-fired after the 18:30 reset — the
+  session then sat dead until morning. Classes matter as much as the clock: a session or weekly limit
+  clears at the reset, while monthly-spend, credits and model limits do not clear by waiting at all.
+- **Check.** `csm revive <spec> --dry-run` prints `resets <time>` and refuses while it is in force;
+  the raw fact is the last `quotaLimits` object in the transcript's tail.
+- **Verified.** 2.1.312. **Beta.**
+
+### L41 · A hand-rolled peer frame is held for a human; the CLI's own SendMessage is delivered
+
+- **Rule.** Wake a live session through Claude Code's own `SendMessage` tool, run from a headless
+  `claude -p` helper under that session's config home — never by writing frames to its peer socket
+  from a script.
+- **Why.** The socket protocol is readable (`sessions/<pid>.json` → `messagingSocketPath`, token in
+  `sessions/<pid>.<sha256(socketPath)>.key`, then `{"type":"auth",…}` and a `{"type":"user",…}`
+  frame) and the frame does arrive — and is then **held**, with a dialog: `Held peer message … The
+  sender did not attest its permission mode and this session bypasses prompts. Review it below, or
+  set "crossSessionInbound" to "accept".` A tool that produces a dialog nobody is there to answer
+  has not woken anything. The relay path was measured instead: `claude -p --model haiku
+  --permission-mode bypassPermissions --name "csm revive (<machine>)" --output-format json
+  "<send this verbatim>"` with `< /dev/null`, delivered to an idle bypass session in ~5–8 s for
+  $0.002–0.006, recorded honestly on the receiver (`isMeta: true, turnOrigin: "peer", origin:
+  {kind: "peer", name: …, fromMode: "bypass", verifiedPeerPid, msg_id}`) and shown in the app as a
+  message from that sender. `SendMessage` was found without any `--allowedTools`.
+- **Check.** Send a one-word message to a throwaway session both ways and read the receiving pane:
+  the script's frame waits on a dialog, the relay's lands as a peer message.
+- **Verified.** 2.1.312. **Beta.**
+
+### L42 · A positional prompt is recorded as the user's own typing
+
+- **Rule.** Never hand a resumed session a positional prompt that a tool wrote. Deliver it as a peer
+  message instead, and stamp it.
+- **Why.** Whatever the text says about itself, the line written for a positional prompt carries
+  `origin: {kind: "human"}, promptSource: "typed", turnOrigin: "human"` — so a sentence a tool
+  composed is indistinguishable, in the conversation's own record, from one the user typed. That
+  record is what the session reads back after a compaction, and what the person reads when they ask
+  what they said. (The honest in-transcript alternative, an `isMeta` line plus `--reply-on-resume`,
+  works and self-starts — but it writes into a transcript, and for a fork it would have to be written
+  into the **old** one, where a later respawn of the old link can pick it up as an interrupted turn:
+  two actors on one conversation. Never pass `--reply-on-resume` together with a positional prompt
+  either — the prompt wins, typed as human.)
+- **Check.** Resume a throwaway with a positional prompt and read the last user line of its
+  transcript: `jq -c 'select(.type=="user")|{promptSource,turnOrigin,origin}' <file> | tail -1`.
+- **Verified.** 2.1.312. **Beta.**
+
+### L43 · The CLI's own quota auto-resume never covers a worker, and dies with the process
+
+- **Rule.** Do not count on Claude Code continuing itself after a limit resets. Build the revive.
+- **Why.** 2.1.312 does have a quota auto-resume, gated on `isInteractive() && !bg && !remote` plus
+  the `tengu_marble_heron` server flag and the `autoContinueAtUsageLimit` setting (both on by
+  default). A Remote Control **server child runs `--print`**, so it is never eligible — and it was
+  never observed firing in this multi-account setup at all (0 transcripts). It is also an in-process wait, and
+  the bundle spells out what ends it: `process_exit: "Automatic continue cancelled · Claude Code
+  exited during the wait, so the task will not resume on its own when the usage limit resets"`,
+  beside `background_handoff`, `relaunch`, `desktop_handoff` and `cloud_handoff`. A session killed by
+  a restart — the common case — has no waiting process left to continue it.
+- **Check.** `strings <the CLI binary> | grep -c 'Automatic continue cancelled'`, and look for the
+  CLI's own "usage limit has reset" continuation text in your transcripts: in the setup this was
+  written against there is none.
+- **Verified.** 2.1.312. **Beta.**
+
+### L44 · The external-imports dialog blocks an unattended start
+
+- **Rule.** A cold-start gate list that misses one dialog is a start that hangs. Add *"Allow external
+  CLAUDE.md file imports?"* to the answerer, and answer it with its focused default, **No**.
+- **Why.** Measured out of the 2.1.312 bundle: `confirmLabel: "Yes, allow external imports",
+  cancelLabel: "No, disable external imports", hideIndexes: true, cancelFirst` — the same shape as
+  the trust and bypass gates, and like them it **blocks** the session until it is answered, which
+  makes a revive that started a window and did nothing. Answering yes writes
+  `hasClaudeMdExternalIncludesApproved` into that home's project state for good, which is consent
+  only the person can give — so the right answer is No, and the consequence (a session that comes up
+  without those imports) belongs in the output, not in a silent default. It matters most in exactly
+  the folders worth reviving: the ones whose doctrine lives in an imported file.
+- **Check.** Start a cold home in a folder whose `CLAUDE.md` has an `@~/…` import line, on a private
+  tmux socket, and read the pane.
+- **Verified.** 2.1.312. **Beta.**
+
+### L45 · A usage-limit stop does not always carry `apiError`
+
+- **Rule.** Detect a quota stop by the whole shape — `isApiErrorMessage: true` with
+  `error: "rate_limit"` or a top-level `quotaLimits` — and never by `apiError` alone. Take the kind
+  from `quotaLimits.rateLimitType` when `apiError` is absent.
+- **Why.** Of 44 real assistant quota-stop lines in the config homes on this machine, **10 carry no
+  `apiError` key at all**: only `isApiErrorMessage: true`, `error: "rate_limit"`,
+  `apiErrorStatus: 429` and `quotaLimits` ({`status`, `resetsAt`, `rateLimitType`}). A reader keyed on
+  `apiError` put those in the clean-line branch, so a session sitting on a wall was reported as
+  *finished* — and, worse, the same branch marked "the session answered again", which read a genuine
+  earlier limit as waited out. Read the tail as JSON lines, too, and not with a text grep: a match on
+  the text says "out of quota" about any session that merely discussed one.
+- **Check.**
+  `grep -h '"isApiErrorMessage":true' <home>/projects/*/*.jsonl | jq -c 'select(.message.content|tostring|test("limit"))|{apiError,error,q:(.message.quotaLimits//.quotaLimits)}' | sort | uniq -c`
+- **Verified.** 2.1.312. **Beta.**
 
 <a id="related"></a>
 

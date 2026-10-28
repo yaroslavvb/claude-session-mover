@@ -1,6 +1,6 @@
 ---
 name: move-session
-description: "Move a Claude Code session from one of the user's Claude accounts to another with claude-session-mover (csm), keeping the whole conversation. Use when the user says: move this session to another account; move my <title> session to <account>; I'm out of quota, move it to <account>; this account is rate limited, switch accounts; which of my sessions are out of quota; list my sessions across accounts; move it to whichever account has quota left (csm move --to auto). Also when they name an account next to a session, or paste a claude.ai/code/session_… link and ask to run it as another account. Use it too to move a session BETWEEN MACHINES (move my session on the laptop to this machine, bring that desktop-app session over, continue this work on another computer) and to find a session anywhere by title or id, the desktop app's own sessions included (csm find, csm move --from-machine, --mirror-cwd). Use it for: stop the session you moved, close that moved window, clean up after the move; which permission mode is the moved session in; which live sessions are running weaker than this machine's default, is anything still stuck in auto, did my permission settings take, restart the idle ones in the wrong mode (csm modes); and which of my accounts are set up the same / do my accounts share settings, skills, plugins, memory (csm matrix)."
+description: "Move a Claude Code session from one of the user's Claude accounts to another with claude-session-mover (csm), keeping the whole conversation. Use when the user says: move this session to another account; move my <title> session to <account>; I'm out of quota, move it to <account>; this account is rate limited, switch accounts; which of my sessions are out of quota; list my sessions across accounts; move it to whichever account has quota left (csm move --to auto). Also when they name an account next to a session, or paste a claude.ai/code/session_… link and ask to run it as another account. Use it too when a session has DIED (csm revive): revive it, restore it, bring it back, continue my dead session, my session died, the remote control disconnected or is offline, it stopped on a limit — a pasted link with nothing answering is a revive, not a move. Use it too to move a session BETWEEN MACHINES (move my session on the laptop to this machine, bring that desktop-app session over, continue this work on another computer) and to find a session anywhere by title or id (csm find, csm move --from-machine, --mirror-cwd). Use it for: stop the session you moved, close that moved window, clean up after the move; which permission mode is the moved session in, is anything still stuck in auto, did my permission settings take, restart the idle ones in the wrong mode (csm modes); and which of my accounts are set up the same / do my accounts share settings, skills, plugins, memory (csm matrix)."
 ---
 
 # Move a session to another account
@@ -31,6 +31,8 @@ csm move SESSION --to ACCOUNT|auto [--stop-source] [--dry-run] [--permission-mod
                               [--name LABEL] [--no-remote-control] [--foreground] [--all]
                               [--from-machine M] [--mirror-cwd] [--copy-only]
                               [--from-account ACCOUNT]
+csm revive SESSION [--dry-run] [--json] [--to ACCOUNT|auto] [--new-link] [--say TEXT]
+                              [--permission-mode MODE] [--unarchive] [--name LABEL]
 csm stop SESSION [--dry-run]                  # end a session csm moved, free its window
 csm find TEXT [--on M] [--all] [--json]       # where is that session, on any machine
 csm modes [--account NAME] [--json] [--check] [--restart-idle [--apply]]
@@ -238,6 +240,77 @@ unblocker for `a window … already exists`.
   time must match `ps` byte for byte. A `ps` that could not answer is a refusal, not a pass:
   the source is still running, and nothing was proved. Offer to try again.
 
+## Revive a session that died
+
+`csm revive SESSION` is for a session that has **stopped answering**: it hit a usage limit, the machine restarted
+under it, Remote Control disconnected, something killed it mid-turn. A move needs a live session; this does not.
+
+```
+csm revive <link or title> --dry-run     # why it stopped, and what reviving it would do
+csm revive <link or title>               # ...do it
+csm revive <link> --to auto              # ...on the account with the most room, when its own has none
+csm revive <link> --new-link             # ...fork a dead Remote Control server child onto a new link
+```
+
+1. **Ask for the claude.ai link, and prefer it over every other spec.** A session that stopped has no live row,
+   and a Remote Control session usually has no title either — its transcript is named by a uuid that appears in
+   nothing the user would type. The link alone finds the file, with nothing running.
+2. 🛑 **"No session matches" is never "there is no such session."** `csm find` and `csm list` search ids and
+   titles, so 0 rows about a dead session means the search could not see it, not that it is gone. Ask for the
+   link and run `csm revive <link>` — never tell the user their session does not exist.
+3. **Run `csm revive <spec> --dry-run` first**, unless the case is obvious (the user pasted a link and said "bring
+   it back", and the plan has no refusal in it). The dry run starts nothing, prints the row it would take, the note
+   it would send, and `🛑 a real revive would be REFUSED: …` when it would be. Read it before answering.
+4. **Then run it for real** and read the exit code: `0` it took a turn (or there was nothing to do, or the one
+   thing to tap was printed), `1` it is **up** and nothing proved it read the note, `2` nothing was started.
+5. **Answer in three lines, then the link, then the title they knew it by.** The tool's own first three lines are
+   exactly that answer — what stopped it and when · what was done · the one risk — so pass them on in your own
+   words, add the `https://claude.ai/code/session_…` link to open, and name the old title, because a revived
+   session is found in the app by the name they remember. On exit 1, say plainly that it is up and nothing
+   proved it read the note, and give them the one sentence to type: open the link and say *continue*.
+
+**What it decides** (first match wins, so a session that is both dead and out of quota is answered about the
+quota):
+
+| # | when | what it does |
+|---|---|---|
+| 1 | another program owns the session (a bot, or a scheduled pass) | refuses, naming that owner's own revive command |
+| 2 | the transcript holds no conversation | refuses: there is nothing to continue |
+| 3 | it is live and busy | nothing to do — it is working right now |
+| 4 | the limit it stopped on is still in force, and no `--to` | refuses, with the reset time and the cures: wait, or `--to auto` now |
+| 5 | it is live and idle | wakes it: the note is relayed in, nothing is started. A `--to` is **not** carried out — it is still running, so stop it first and move it |
+| 6 | `--to ACCOUNT` or `--to auto` | moves it (an ordinary move, with its cost), then relays the note into the copy |
+| 7 | dead, a self-hosted Remote Control session | resumes it in place, on the **same** link. Archived needs `--unarchive` |
+| 8 | dead, a terminal session | resumes it in place — it gets a **new** link, which is new exposure, not a restoration |
+| 9 | dead, a Remote Control **server child**, no `--new-link` | prints the one thing to tap and starts nothing |
+| 10 | dead, a server child, `--new-link` | forks it: new id, new link, same past; the old link still opens the old copy |
+
+**Row 9 is the one that needs the user, and it is usually the cheapest answer.** Nothing local can make a Remote
+Control server respawn its child — the server does that when the session next gets activity. So tell them: *open
+this link and say "continue"*; the server brings the worker back, and they keep the link, the title, the
+account and the quota window. Then either they type *continue* themselves, or — once the link is open — run
+`csm revive <spec>` again and it takes row 5 and wakes it with the note for them. The zero-tap alternative is
+`csm revive <spec> --new-link`, which **forks**: a new id and a new link, the same past, and the old link still
+opens the OLD copy. Say that out loud when you use it, and tell them to archive the old one and not to type there.
+
+**Say every time, for a revive**
+
+- **The note is relayed, not typed.** The session is brought up idle and a small headless Claude of csm's own
+  sends the note with its SendMessage tool, so the app shows it as a message from **"csm revive (<machine>)"**,
+  recorded as a peer message. Nothing is ever written into a transcript, and nothing is typed as if they had typed
+  it. `--say TEXT` is the only way to put their own words in, quoted verbatim and attributed to them — at most 400
+  characters, and it may not begin `!` or `/`.
+- **`--to` makes it a move**, so it costs what a move costs: a new link, the target account's connectors and
+  plugins, and across organizations a first turn that re-reads the whole conversation on the new account's quota.
+- **A mid-turn stop is the risky one.** When the tool reports that the last tool call has no recorded result, pass
+  that on in those words: it may have fully applied, partly applied or not run, and the revived session is told
+  the same thing.
+- **Lost agents.** When the diagnosis names errored agents of a workflow run, say how many and which — that work
+  is outstanding whatever the run's own status file claims.
+- **It waits for nothing and signals nothing.** A limit still in force is a refusal carrying the local reset time,
+  not a wait; `revive` has no stop of any kind; and `--unarchive` is the only way a session that was archived or
+  ended from the app is reopened.
+
 ## "Is anything running in the wrong mode?" `csm modes`
 
 The other half of the mode question: not "move this session" but **"is any live session on
@@ -344,6 +417,18 @@ away / 🛑 per account by design` is the legend.
 | `csm did not start <session>` | `stop` only ends csm's own windows, and the refusal lists the ones that do exist: close that session in the app or its own terminal |
 | `that process is not the one in the window csm opened` | a `moved-…` window exists but the registry puts that pid elsewhere: stop it from the app |
 | `is not a permission mode` | use one of the modes listed in the message |
+| `no transcript for that link here` (`revive`, `move`, `find`) | that link's transcript is in no config home on this machine. It may be on another: `csm find <link> --on <machine>`, then `csm --machine <machine> revive <link>`. 🛑 A link is never matched by part of an id or by a title, because that would answer with somebody else's session — so do not retry it as a title search |
+| `has no main-chain line in its transcript` | that id is a session a Remote Control server pre-created and nobody ever used: there is nothing to continue. Ask which session they mean, and for its link |
+| `is still inside the <kind> limit it stopped on` | wait until the reset time in the message and run `csm revive` again, or `csm revive <spec> --to auto` now to continue it on an account with room. For a monthly-spend, credits or model limit, waiting does **not** clear it: only `--to`, or lifting the cap |
+| `was archived or ended from the app` | somebody closed that session on purpose, or the 7-day sweep did. Ask before reopening it; `--unarchive` resumes it, which unarchives it |
+| `is <owner>'s own session` (on `revive`) | run the command the refusal names: that supervisor has a revive of its own, which puts its session back on the same link. Never revive someone else's session yourself |
+| `something is running session … NOW` | a server respawned its child while csm was deciding, and nothing was started. Run `csm revive <spec>` again: an idle session is woken, not resumed |
+| `is no longer running: its registry row could not be proved` | it went away between the diagnosis and the wake, and nothing was sent. Run `csm revive <spec>` again — a dead session is resumed or forked, not woken |
+| `another revive of session … is in flight` | one revive of one session at a time. Wait for the other one; a stale lock clears itself after 120 s |
+| `--say is N characters and the limit is 400` | pass less: it is quoted verbatim into the user's own session, so it is refused rather than shortened |
+| `--say` starts with `!` or `/` | reword it — a delivered message beginning with either is run as a command, and a leading space does not help (the CLI strips it) |
+| `--from-machine is not built for revive` | run the whole thing over there: `csm --machine <machine> revive <spec>` (add `--dry-run` first). Every gate a revive turns on is a question about the machine the transcript is on |
+| `revive has no action for a <kind> session in the same account` | name where to put it: `csm revive <spec> --to <account>` |
 | `is this machine; drop the flag` | `--machine` names another machine; without it the command already runs here |
 | `is not a machine this tool knows` | use one of the names the refusal lists, or `--ssh HOST` for a host the configuration does not know |
 | `--apply is refused` (on `modes --restart-idle`) | read the plan and use a move with `--permission-mode`, or end and reopen the session from claude.ai |
@@ -352,7 +437,11 @@ away / 🛑 per account by design` is the legend.
 
 - Run `move` on the machine the session is going to. `csm --machine M …` runs the whole
   command over there instead; `--from-machine M` is what brings a session here.
-- Move only the session the user asked about, one per request unless they said otherwise.
+- Move only the session the user asked about, one per request unless they said otherwise. The same for a revive:
+  one session per request, and never revive a session the user did not name — a revived session starts spending
+  quota and may act on work they have moved on from.
+- `revive` never stops, signals or archives anything, and never writes into a transcript. If something has to be
+  ended, that is `csm stop` on a window csm opened, and it is a separate request.
 - Never stop a process or close a window csm did not start. `--stop-source` and `csm stop` are
   the only stops, and `--stop-source` fires only after the moved session has connected. Never
   reach for a bare `tmux kill-window` or `kill <pid>` instead: csm proves the pid first.

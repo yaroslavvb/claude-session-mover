@@ -1,12 +1,12 @@
 # Claude Session Mover: design and implementation
 
-Version 0.4.0 · code **[github.com/yaroslavvb/claude-session-mover](https://github.com/yaroslavvb/claude-session-mover)**
+Version 0.5.0 · code **[github.com/yaroslavvb/claude-session-mover](https://github.com/yaroslavvb/claude-session-mover)**
 (MIT, one Python file, standard library only).
 
 Everything here is Claude Code's own **undocumented on-disk state**. It has already changed inside one minor
-series, so every claim below is stamped with the CLI release it was measured on — 2.1.296 to 2.1.300, on macOS —
-and the ones that matter most come with a recipe for re-measuring them on your own build
-([Measured facts](#measured)).
+series, so every claim below is stamped with the CLI release it was measured on — 2.1.296 to 2.1.300, on macOS,
+and 2.1.312 for everything [`revive`](#revive) reads and does — and the ones that matter most come with a recipe
+for re-measuring them on your own build ([Measured facts](#measured)).
 
 One of your Claude accounts hits its usage limit while your other accounts have quota left. The usual answer is
 to start the work again in another account and lose the conversation. Claude Session Mover moves the conversation
@@ -45,6 +45,7 @@ different flags involve a second machine, and mixing them up is the common mista
 - [What the target home cannot do: the notes](#notes)
 - [Auto-memory is never copied](#memory)
 - [What a move costs](#cost)
+- [Revive: bringing back a session that stopped](#revive)
 - [`csm stop`: ending what csm started](#stop)
 - [`csm matrix`: measuring your own setup](#matrix)
 - [What is on disk: the formats it reads](#formats)
@@ -71,6 +72,8 @@ csm list                                          # recent sessions across every
 csm move 3 --to work --dry-run                    # print the plan and any refusal, change nothing
 csm move 3 --to work --stop-source                # move row 3 to the account named "work"
 csm move 3 --to auto                              # ...or to whichever account has the most room left
+csm revive <claude.ai link> --dry-run             # it stopped answering: why, and what would bring it back
+csm revive <claude.ai link>                       # ...wake it, resume it, fork it, or move it
 csm stop 3                                        # end a session csm moved, and free its window
 csm modes --check                                 # one line: is any live session weaker than the default
 csm find "refactor" --on laptop                   # where is that session, here or on another machine
@@ -744,6 +747,89 @@ can still be acted on — and again after a successful move, where the measured 
 - **The last line on disk only.** A reply still being written is not in the copy, and when you move the session
   you are talking in, the message asking for the move does not travel.
 
+<a id="revive"></a>
+
+## Revive: bringing back a session that stopped
+
+Everything above is about a session that is still running. `csm revive SESSION` is about one that is **not** — a
+usage limit, a restart, a Remote Control disconnect, a kill mid-turn — and it was built against one measured
+incident: a Remote Control session whose turn died on a 429 at 17:46 local time on 27 Oct 2026 and sat dead for
+17 hours, one of a run of such stops that cost tens of hours of agent wall-clock in five weeks. Everything in
+this section was measured on **CLI 2.1.312**, Wed 28 Oct 2026.
+
+**It starts from the link, because that is all there is.** A Remote Control session spawned by the bridge writes no
+`bridge-session` line into its own transcript, so before this release a link resolved only through a live registry
+row — which a dead session does not have. The transcript's name is *computable* instead:
+`uuid5(3ab19d7e-9f35-45c2-926e-75e271cc60b3, "https://api.anthropic.com/v1/code/sessions/cse_<bare>")`, verified on
+37/37 live pairs. `derive_local_id` does that at the **spec layer**, above `pick`'s ladder, which is also what pins
+the derived id past the listing's age cap — the session anybody is looking for stopped days ago. 🛑 A link gets
+exact rungs only (the derived transcript, then a row whose claude.ai id is that one) and is refused rather than
+handed to the id-prefix or title rungs: a session whose first prompt *pasted* the link has the link in its title.
+
+**The diagnosis is one record, and it is proved rather than guessed.**
+
+| field | what it answers, and from what |
+|---|---|
+| `kind` | `server-child` (its local id *is* `uuid5` of a bridge id — from the link, the registry, or an orphan `~/.claude/bridge-spawn/cse_X-*` directory that derives to this transcript), `self-hosted` (a `bridge-session` line or a `bridge_status` url it wrote itself), `terminal`, `desktop`. 🛑 Never the registry's `entrypoint`: that says how the process was started, and a fork or a resume rewrites it |
+| `state` | `live-busy` / `live-idle` (a registry row whose pid is proved by `procStart`) or `dead`, plus a machine-wide `ps` sweep for an argv naming `cse_<bare>` or the local id — a registry file survives the `SIGKILL` of its own process |
+| `stop` | `usage-limit` (class, window, `resetsAt`, still in force?), `api-error`, `mid-turn` (the last main-chain assistant line holds a `tool_use` no later `tool_result` answers), `archived` (a `code 4090` line after the last `bridge_status`), `finished`, `empty`, `unknown` — parsed as JSON lines over `CSM_REVIVE_TAIL` (1 MiB), from the last real prompt forward |
+| `lost_work` | the agents whose own `state` is `error` in the sibling directory's `workflows/wf_*.json`. 🛑 Never the file's top-level `status`, which reads `completed` on the incident where five agents died on the limit |
+| `account` | whether the session's own home can still run it, plus the meter — and the 5-hour instant comes from the transcript, never from the meter's seven-day `resets_at` |
+| `server` | whether a `claude remote-control` server is up with that folder as its cwd (`ps` plus `lsof -a -d cwd`), which is the one thing that decides whether opening the link brings a server child back by itself |
+| `owner` | a supervisor in `CSM_BOTS_DIR`, or a scheduled pass in `CSM_RC_JOBS_DIR` whose `<job>.session` file names this id |
+
+**The decide table is data** (`REVIVE_ROWS`), walked in order, first match wins — so a session that is both dead
+and out of quota is answered about the quota, because starting it would spend its first turn on the same wall.
+Rows 1, 2 and 4 refuse (exit 2); row 3 has nothing to do; rows 5–8 and 10 act; row 9 prints one sentence. The
+plan a `--dry-run` prints and the thing a real run carries out come from **one function**, so a plan that said
+row 7 cannot be followed by a run that takes row 10.
+
+| # | condition | action |
+|---|---|---|
+| 1 | a bot or a scheduled pass owns it | refuse, naming that owner's own command |
+| 2 | `stop == empty` | refuse: nothing to continue |
+| 3 | `live-busy` | nothing to do |
+| 4 | a usage limit still in force, no `--to` | refuse, with the reset and the cures |
+| 5 | `live-idle` | wake it — relay the note, start nothing |
+| 6 | `--to ACCOUNT\|auto` | `do_move` unchanged, then relay the note into the copy |
+| 7 | dead, `self-hosted` | resume in place on the same link (archived refuses without `--unarchive`) |
+| 8 | dead, `terminal` | resume in place; it gets a new link, and is told so |
+| 9 | dead, `server-child`, no `--new-link` | print the one tap; start nothing, wait for nothing |
+| 10 | dead, `server-child`, `--new-link` | fork: `--resume <old> --fork-session --session-id <new uuid4>` |
+
+**One carrier, and it is a relay.** Whatever the row, the session comes up (or is found) as an ordinary idle
+process with **no positional prompt**, and the note is then delivered by a headless Claude of its own:
+`claude -p --model <CSM_RELAY_MODEL> --permission-mode bypassPermissions --name "csm revive (<machine>)"
+--output-format json "<call SendMessage once, verbatim, between these markers>"`, run under that session's own
+config home with the environment scrubbed, stdin closed, in a folder of csm's own under the state dir, bounded by
+`CSM_RELAY_TIMEOUT_S`. It lands recorded for what it is — `isMeta: true, turnOrigin: "peer", origin: {kind:
+"peer", name: …, fromMode: "bypass", verifiedPeerPid, msg_id}` — and the app shows it as a message from that
+sender. The two alternatives were measured and are worse: a positional prompt is recorded as the user's own
+typing, and an `isMeta` line plus `--reply-on-resume` writes into a transcript — for a fork, into the *old* one,
+where a later lazy respawn of the old link could pick it up as an interrupted turn. So **a revive writes into no
+transcript at all**; the cross-account move still appends its own move note to the copy, as it always has.
+
+**The proof is a turn, not a link.** The transcript's byte offset is taken before the relay; exit 0 needs the
+registry row going `busy` or an `assistant` line past that offset within `CSM_REVIVE_PROVE_S`. A relay that
+reports success and delivers nothing is exit 1, printing the one sentence to type. For a row-7 resume the **link**
+is a second proof: a self-hosted session re-attaches its own claude.ai session, so a *new* link means nothing
+re-attached and the note is not sent, because the sentence it carries would be false.
+
+**At most once, and the gate is re-run in the last second.** `state_lock`'s lock-directory shape (with its 120 s
+stale break) keyed on the local id is held from the diagnosis to the start, and because a lazy respawn has the
+*same* local id before and after, every home's registry and the machine-wide `ps` sweep are re-read immediately
+before anything starts: a child that appeared while csm was deciding is a refusal, not a second writer. Each
+revive appends a JSON record to `CSM_REVIVE_LOG` (0600) carrying the at-most-once triple — local id, bridge id,
+transcript size at diagnosis — the row, the action, what was started, what was proved and the exit code. Never
+the note: that is conversation text.
+
+**What it will not do.** It cannot make a server respawn a dead child (row 9 prints the tap, and does not poll for
+a person). It will not wake a session by writing to its peer socket, because a hand-rolled frame is *held* for a
+human on a session that bypasses prompts. It will not reuse a server child's id in its own home. It will not reach
+a machine that is off: `--from-machine` is refused for `revive`, because every gate it turns on is a question
+about the machine the transcript is on, and `csm --machine M revive <spec>` runs the whole thing over there
+instead. And it signals nothing, ever.
+
 <a id="stop"></a>
 
 ## `csm stop`: ending what csm started
@@ -868,6 +954,15 @@ behind, so a file alone means nothing.
 | A desktop-app transcript records its mode on every prompt line, not in a `permission-mode` line, and a first prompt with a pasted screenshot can be bigger than the 96 KB head — hence the backwards read when head and tail have neither | 2.1.296 | a session started from the desktop app |
 | Per-session data outside `projects/`, keyed by session id: `file-history/<id>/` is real and populated. `<home>/tasks/` is a path the CLI knows (its read-allowlist names it), but a session's task OUTPUT is written outside the config home, under a cache root keyed on the working directory — so `tasks/<id>/` is carried opportunistically and is usually absent. Older builds wrote `todos/<id>-*.json` | 2.1.300 (the bundle's path builders and read-allowlist; on disk, per-session `file-history/<uuid>/` directories, no `todos/` and no `tasks/`) | `ls <home>/file-history \| head` after using `/rewind`; `ls <home>/tasks` for the other half |
 | `jobs/`, `daemon.json`, `shell-snapshots/` and `session-env/` are treated as code-execution surfaces that even a bypassing session may not write — another reason nothing but the session's own data travels | 2.1.300 | the reserved-name set in the bundle |
+| A Remote Control session's local transcript id is `uuid5(3ab19d7e-9f35-45c2-926e-75e271cc60b3, "https://api.anthropic.com/v1/code/sessions/cse_<bare>")`, and claude.ai's `session_<bare>` is the bridge's `cse_<bare>` with the prefix swapped. A server-spawned child's transcript carries **no** bridge id of its own | 2.1.312 on 37/37 live registry rows across six homes (0/37 for any other name form); the namespace constant is byte-identical in 2.1.310, .311 and .312 | compare `sessionId` against `bridgeSessionId` in `<home>/sessions/*.json`: `python3 -c 'import uuid,sys;print(uuid.uuid5(uuid.UUID("3ab19d7e-9f35-45c2-926e-75e271cc60b3"),"https://api.anthropic.com/v1/code/sessions/"+sys.argv[1]))' cse_<bare>` |
+| A killed server child leaves an orphan `~/.claude/bridge-spawn/cse_<bare>-<6 chars>/` directory — the bridge removes it only on a handled exit — and that root is hardcoded to `~/.claude` for **every** account. It is a pid-free death index | 2.1.312, 40/40 such directories deriving to exactly one transcript each | `ls ~/.claude/bridge-spawn` and derive each name with the one-liner above |
+| A respawned server child comes back **idle**: it re-sends nothing and writes nothing until a message arrives, and the session-start attachments arrive with the first turn *after* the wake | 2.1.312, on the incident transcript: no entry at all between the 429 at 00:46:14Z and the peer prompt at 18:03:30Z, whose attachments are stamped 170 ms later | open a dead Remote Control session in the app and watch `wc -l` on its transcript |
+| `claude --resume <uuid>` of a server child does **not** re-attach its claude.ai session (ingress url null) — it registers a new one; `--resume <path.jsonl>` silently mints a fresh id; `--resume=<https url>` hydrates from the server and **replaces** the local transcript, declining only to replace a non-empty local file with an empty server set. A self-hosted `--remote-control=` session resumed with `--resume <id> --remote-control=<name>` does re-attach the same session | 2.1.312 (`Hydrated N entries from remote` and `hydrate_skip_zero_content_replace` in the bundle; the resume behaviour on disk, and the re-attach measured on 2.1.285/286 for a scheduled pass) | resume a throwaway of each kind and compare the link it prints with the one it had |
+| `--resume <old> --fork-session --session-id <new uuid4> --remote-control=<label>` writes exactly `<new>.jsonl`, leaves the old transcript byte-identical, and prints a link. A **positional prompt** on such a start is recorded as the user's own typing: `origin: {kind: "human"}, promptSource: "typed", turnOrigin: "human"`, whatever its text says | 2.1.312, on a throwaway in an isolated home | `shasum` the old file before and after; `jq -c 'select(.type=="user")\|{promptSource,turnOrigin,origin}' <new>.jsonl \| tail -1` |
+| A message sent by Claude Code's own `SendMessage`, from a headless `claude -p … --permission-mode bypassPermissions --name <sender>` helper, is **delivered** to an idle bypass session and recorded as `isMeta: true, turnOrigin: "peer", origin: {kind: "peer", name, fromMode: "bypass", verifiedPeerPid, msg_id}` — ~5–8 s, $0.002–0.006, and `SendMessage` is available without `--allowedTools`. A **hand-rolled** frame to the same session's `messagingSocketPath` is *held*: `Held peer message … The sender did not attest its permission mode and this session bypasses prompts` | 2.1.312, both on throwaway sessions in an isolated home | send one word each way to a throwaway and read its pane |
+| A usage-limit stop is `isApiErrorMessage: true` with `error: "rate_limit"` — and **`apiError` is optional**: 10 of 44 real stop lines carry only `apiErrorStatus: 429` and a top-level `quotaLimits` ({`status`, `resetsAt`, `rateLimitType`}). A wake delivered before `resetsAt` is consumed and lost | 2.1.312; the 44 lines are every quota stop in the config homes on this machine, and the lost wake is the incident's own 17:46 PDT turn, 45 min inside the window | `grep -h '"isApiErrorMessage":true' <home>/projects/*/*.jsonl \| jq -c '{apiError,error,q:(.message.quotaLimits//.quotaLimits)}' \| sort \| uniq -c` |
+| The CLI's own quota auto-resume is gated on `isInteractive() && !bg && !remote`, plus the `tengu_marble_heron` server flag and the `autoContinueAtUsageLimit` setting (both on by default) — so a `--print` worker, which is what a Remote Control server spawns, is never eligible. It is also an in-process wait, cancelled by `process_exit`: *"Automatic continue cancelled · Claude Code exited during the wait, so the task will not resume on its own when the usage limit resets"* (beside `background_handoff`, `relaunch`, `desktop_handoff`, `cloud_handoff`) | 2.1.312 (the gate and the five cancellation reasons in the bundle); never observed firing in any transcript in this multi-account setup | `strings <the CLI binary> \| grep -c 'Automatic continue cancelled'`, and search your own transcripts for the CLI's "usage limit has reset" continuation text |
+| A fifth cold-home gate: **"Allow external CLAUDE.md file imports?"** — `confirmLabel: "Yes, allow external imports", cancelLabel: "No, disable external imports", hideIndexes: true, cancelFirst`. It **blocks** an interactive start until answered, and accepting it writes `hasClaudeMdExternalIncludesApproved` into that home's project state permanently, so the answerer walks the marker to the **No** | 2.1.312 (the construction in the bundle; live in a cold home, in a folder whose `CLAUDE.md` has an `@` import) | the dialog recipe below, in a folder whose `CLAUDE.md` imports a file from outside it |
 
 **Re-verifying the dialog shapes safely.** Never against a live tmux server or a real config home:
 
@@ -954,6 +1049,11 @@ It runs to hundreds of `CLAUDE*` names and dozens of `ANTHROPIC*` ones, which is
 - **A running process can rewrite the state file.** If something in the target home rewrites `.claude.json` right
   after the pre-answers, a dialog can come back; the marker-reading answerer is the fallback.
 - **The quota flag is a heuristic** read off transcripts, not the meter.
+- **`revive` is local to the machine the transcript is on.** `--from-machine` is refused for it, because every gate
+  it turns on — is anything still writing that file, is a server up in that folder, can that home still run it — is
+  a question about *that* machine; `csm --machine M revive <spec>` runs the whole thing over there instead
+  ([above](#revive)). It also cannot make a server respawn a dead child, cannot wake a session except through
+  Claude Code's own `SendMessage`, and never reuses a server child's session id.
 - **`csm accounts` and `csm matrix` can be slow with many homes on a locked macOS keychain**: the credential
   probe is capped at 10 s per home before it falls back to "unverified".
 - **Undocumented formats.** Everything above is Claude Code's internal state and can change in any release; the
@@ -987,6 +1087,14 @@ a test or a one-off can point any of them somewhere else.
 | `CSM_MIRROR_FILE_MAX`, `CSM_MIRROR_TOTAL_MAX` | `--mirror-cwd`'s per-file and total ceilings (default 25 MB, 2 GB) |
 | `CSM_ROOM_CMD`, `CSM_ROOM_FIX` | an optional probe for whether the target account can already be reached in this folder, and the cure sentence for its note. Unset, no note is made; a probe that exits non-zero says nothing |
 | `CSM_BOTS_DIR`, `CSM_BOT_FIX` | where a supervisor that owns a session keeps its `<name>.json` state (default `<state dir>/owners`), and the cure in the refusal that names it |
+| `CSM_RC_JOBS_DIR` | where a **scheduled-pass** supervisor records the session each pass runs as: one `<job>.session` file of `key=value` lines whose last `uuid=` is the local id. `revive` refuses a session named there and says whose command it is. **Unset** means no such program, which is the default; unreadable is a refusal, never a "no" |
+| `CSM_RELAY_MODEL`, `CSM_RELAY_TIMEOUT_S`, `CSM_RELAY_NAME` | the relay that carries the revive note: the model it runs as (default `haiku` — one instruction, one tool call, and the cost lands on the home it runs in), how long it may take in all (default 120 s, a bound for a *held* relay rather than a slow one), and the sender the app shows, templated over `{machine}` (default `csm revive ({machine})`) |
+| `CSM_REVIVE_PROVE_S` | how long to wait for proof that the revived session read the note — its registry row going `busy`, or an `assistant` line past the offset taken before the relay (default 90). Passing it without proof is exit 1, never 0 |
+| `CSM_REVIVE_TAIL` | how much of a transcript `revive` reads to say why a session stopped (default 1 MiB), deliberately not `CSM_TAIL_BYTES`: on the incident transcript the limit lines are in the last 512 KiB and *not* in the last 384 KiB |
+| `CSM_REVIVE_NOTE_MAX`, `CSM_REVIVE_SAY_MAX` | the note's character budget (default 1500; optional clauses are dropped in a documented order, never sentences cut) and the longest `--say` (default 400; longer is refused, because it is quoted verbatim) |
+| `CSM_REVIVE_LOG` | one JSON record per revive, 0600 (default `<state dir>/revive.jsonl`): the at-most-once triple, the row, the action, what was proved, the exit code — and never the note |
+| `CSM_LSOF` | how `lsof` is invoked. Only `revive` asks it, for the one question that is in no argv: which folder a Remote Control server is serving |
+| `CSM_CANARY_CHUNK` | the read size of the once-per-CLI-version scan that checks the uuid5 namespace constant is really in the installed bundle (~290 MB, 0.22 s, read in chunks with a needle-sized overlap; the verdict is cached in the state dir against the bundle's path, size and mtime) |
 | `CSM_LIMIT`, `CSM_ALL_LIMIT`, `CSM_ROW_TITLE` | the default row count (20), the `--all` ceiling (300), and the title width in a row (44) |
 | `CSM_SHARED_HOME` | the machine's shared settings home, read first when asking what permission mode this machine asks for (default `~/.claude`). Deliberately *not* where a home's memory store is read from |
 | `CSM_KEEP_ENV` | `CLAUDE*` / `ANTHROPIC*` names the scrub keeps for the moved session, comma-separated. Empty by default; a name outside those families is dropped rather than honoured |
@@ -1074,7 +1182,7 @@ More of them, grouped and generalised: [docs/lessons.md](lessons.md).
 | [`docs/lessons.md`](lessons.md) | the generic lessons behind the rules |
 | `docs/design.md` | this page |
 
-The tests — 466 of them — run the real script against fake homes and transcripts, a fake `claude` that records its
+The tests — 673 of them — run the real script against fake homes and transcripts, a fake `claude` that records its
 argv and environment, and a fake `tmux` that really runs the moved window's command, alongside in-process unit
 tests of the pure parts (the dialog answerer, the mode chooser, the memory resolver, the meter arithmetic, folder
 translation, the matrix cells). Anything that would reach another machine runs against `CSM_REMOTE_LOCAL`, with

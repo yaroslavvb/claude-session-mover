@@ -9,13 +9,18 @@ Every fact below was measured against Claude Code 2.1.296–2.1.300 on macOS. Th
 state it reads is undocumented and can change in any CLI release; the tests pin every shape
 the tool depends on.
 
-## [Unreleased]
+## [0.5.0] — 2026-10-28
 
 `csm revive`: resolution that reaches a session nothing is running, a stop reason that is right
 for all of them, the diagnosis those two make possible, and now **the actions** — wake it,
 resume it in place, fork it onto a new link, move it to another account, or print the one thing
 to tap. Everything here is measured against Claude Code **2.1.312** on macOS (Wed 28 Oct 2026)
 — a newer version than the 2.1.296–2.1.300 the rest of this file was written against.
+
+466 tests became **673**, on Python 3.12 and on the 3.7 floor the README promises. Nothing about
+`move`, `stop`, `list`, `modes`, `matrix` or `find` changed behaviour except where this file says
+so: `check_target`'s split is byte-for-byte identical for a move, and `find`'s exit code is the one
+deliberate change to an existing contract.
 
 ### Added
 
@@ -241,6 +246,44 @@ to tap. Everything here is measured against Claude Code **2.1.312** on macOS (We
   likely to have a title at all (11% of v5 transcripts here carry an `ai-title`, against 64%
   of v4 ones). The hint names the derived transcript when a link was given, and asks for the
   link when one was not.
+- **`--version` says 0.5.0**, and `revive --help`'s `--dry-run` line no longer calls itself "the
+  only mode that answers today" — it was written while only the diagnosis existed, and a flag's
+  own help saying the command does nothing is the one doc nobody re-reads.
+
+### Documentation
+
+- README: a **Revive a dead session** section beside the move narrative — when to use it and when
+  opening the link and saying *continue* is the better answer, the decide table in plain words, the
+  relay and why the detour is what keeps the attribution honest, the three-line answer as it
+  prints, and what it cannot do (make a server respawn a dead child; wake a session by a
+  hand-rolled socket frame, which is *held*; keep a server child's link without its server; reach
+  a machine that is off). A `csm revive` entry in the command reference with its flags and its
+  three exit codes, the new knobs in the Environment tables (`CSM_RELAY_MODEL`,
+  `CSM_RELAY_TIMEOUT_S`, `CSM_RELAY_NAME`, `CSM_REVIVE_PROVE_S`, `CSM_REVIVE_TAIL`,
+  `CSM_REVIVE_NOTE_MAX`, `CSM_REVIVE_SAY_MAX`, `CSM_REVIVE_LOG`, `CSM_LSOF`, `CSM_RC_JOBS_DIR`),
+  the revive phrasings in *From a phone*, and the test count and version stamps brought up to date.
+- The `move-session` skill: revive triggers in its description (revive, restore, bring it back, the
+  session died, remote control disconnected or offline, it stopped on a limit, continue my dead
+  session, a pasted link with nothing answering), a **Revive a session that died** section — the
+  dry run first, the decide table, row 9's one tap and the `--new-link` alternative, what to answer
+  in three lines plus the link and the title they knew it by, 🛑 that 0 rows is never "no such
+  session", and what to say every time about a relayed note, `--to`, a mid-turn stop and lost
+  agents — twelve new rows in *Refusals and their fixes*, and two revive boundaries. Two
+  phrases of the description paid for the new triggers (`the desktop app's own sessions
+  included`, `which live sessions are running weaker than this machine's default`), because the
+  harness shows a skill's description to about 1,500 characters when it decides whether to load
+  it, and a trigger past the cut is a trigger that never fires. Both are still in the body, and
+  the phrases either side of them trigger the same two questions.
+- `LESSONS.md`: **L37–L45** in a new section G — the nine lessons this build was bought with, each
+  with its measured evidence and the date: the link→transcript arithmetic, a respawned child being
+  idle, forking rather than reusing a server child's id, never waking before the reset, a
+  hand-rolled peer frame being held where Claude Code's own SendMessage is delivered, a positional
+  prompt being recorded as the user's own typing, `--print` workers never auto-resuming at a limit,
+  the external-imports dialog blocking an unattended start, and a quota stop that carries no
+  `apiError`.
+- `docs/design.md`: a **Revive** section (what it reads, the decide table, the one carrier, the
+  proof, at-most-once, and the limits), **ten** new rows in the measured-facts table — each stamped
+  2.1.312, each with its own re-verification recipe — and the revive knobs in the knob table.
 
 ## [0.4.0] — 2026-10-25
 
@@ -880,6 +923,7 @@ Initial public release.
 - Fixture-only tests (fake homes, fake `claude`, fake tmux; no network, no account) and CI on
   ubuntu and macOS × Python 3.9 and 3.12.
 
+[0.5.0]: https://github.com/yaroslavvb/claude-session-mover/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/yaroslavvb/claude-session-mover/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/yaroslavvb/claude-session-mover/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/yaroslavvb/claude-session-mover/compare/v0.2.0...v0.3.0

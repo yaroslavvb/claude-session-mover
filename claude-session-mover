@@ -349,6 +349,47 @@ HANDLE_RE = re.compile(r"^(?![0-9]+$)[a-z0-9][a-z0-9-]{0,31}$")
 FULL_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 URL_RE = re.compile(r"(?:cse_|session_)([A-Za-z0-9]{10,})")
 LINK_RE = re.compile(r"https://claude\.ai/code/session_[A-Za-z0-9]+")
+#: 🛑 HOW A claude.ai LINK FINDS ITS TRANSCRIPT WITH NOTHING RUNNING. A Remote Control
+#: session's local id is not random: the CLI derives it from the bridge session's own API
+#: url, `uuid5(BRIDGE_NS, BRIDGE_NAME % bare)`, where `bare` is the id the claude.ai
+#: `session_X` link and the bridge's `cse_X` share (one id, a swapped prefix). So the
+#: transcript of a session that is no longer running can be COMPUTED from the link alone:
+#: no registry row, no process, no network — which is the only way to reach it, because a
+#: Remote-Control server child's transcript carries no bridge id of its own and a dead
+#: session leaves no registry row.
+#: Measured on CLI 2.1.312, Wed 28 Oct 2026: the constant is in the bundle verbatim (twice,
+#: beside the resume-argument parser) and byte-identical in 2.1.310 and 2.1.311 while the
+#: minified identifiers around it change — so `canary` matches the CONSTANT, never a
+#: function name. 37/37 live registry rows carrying both ids derive exactly, and 0/37 match
+#: any other name form (the bare id, `cse_<bare>`, `session_<bare>`, the claude.ai url, a
+#: trailing slash). Two pinned pairs: `cse_01PHXskvoLtckdvqFv3F8rei` →
+#: `bf974a77-c0b0-5763-81be-f057a3dc7e57`, `cse_01PHXskvDdMLxdjXDuoZkBpF` →
+#: `38ffa06c-4d9a-5981-96b0-a3447ac0c094`.
+#: ⚠️ IT IS THE DEFAULT API HOST'S DERIVATION. A CLI pointed at another `ANTHROPIC_BASE_URL`,
+#: or one whose `CLAUDE_CODE_REMOTE_SESSION_ID` is set (hashed verbatim, with no url around
+#: it), derives something else. That is why a derived id is only ever used as an EXACT match
+#: against a transcript that is really on disk, and is never handed to the id-prefix or
+#: title rungs: a wrong derivation must come back as "no transcript for that link", never as
+#: somebody else's session. See `derive_local_id` and `pick_resolved`.
+BRIDGE_NS = "3ab19d7e-9f35-45c2-926e-75e271cc60b3"
+BRIDGE_NAME = "https://api.anthropic.com/v1/code/sessions/cse_%s"
+#: The CLI's own rule for finding the session id in whatever was pasted: split on `/`, `?`
+#: and `#`, then take the first segment that is ENTIRELY a `session_`/`cse_` id. Stricter
+#: than `URL_RE`, which finds such an id anywhere in a string, on purpose: the derivation
+#: has to agree with the CLI character for character or it names another file.
+SPEC_SEG_RE = re.compile(r"^(?:session|cse)_[A-Za-z0-9_]+$")
+#: A spacesheep session page. Measured Wed 28 Oct 2026: sessionpipe's `claude-code` session
+#: id IS the local transcript id — `…/sessions/claude-code/bf974a77-c0b0-5763-81be-f057a3dc7e57`
+#: is the page of `session_01PHXskvoLtckdvqFv3F8rei`, whose derived local id is that uuid —
+#: so such a link names the transcript directly and needs no arithmetic.
+SHEEP_SESSION_RE = re.compile(
+    r"spacesheep\.dev/sessions/claude-code/"
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
+#: How much of the CLI bundle `canary` reads at a time, with a needle-sized overlap. The
+#: bundle is ~290 MB (measured 2.1.312: 287 MB, the constant at offset 226,593,890) and the
+#: engine must stay usable in a 3.7 process, so it is never read whole — and the verdict is
+#: cached per CLI version, so it is normally not read at all. See `canary`.
+CANARY_CHUNK = _env_num("CSM_CANARY_CHUNK", 1 << 20)
 PERM_RE = re.compile(rb'"permissionMode"\s*:\s*"([A-Za-z]+)"')
 #: Tool names of the form `mcp__<server>__<tool>`; a server named `claude_ai_<Connector>`
 #: is a claude.ai connector, which belongs to the ACCOUNT and not to any config home.
@@ -1212,6 +1253,117 @@ def self_session():
     return _SELF[0]
 
 
+# ------------------------------------------------- a link, a bridge id, and its transcript
+
+def bare_bridge_id(spec: str) -> str:
+    """The bare claude.ai / bridge session id in `spec`, by the CLI's own rule, or `""`.
+
+    Accepts a claude.ai link, any url carrying such a segment, and a bare `session_X` or
+    `cse_X`: the two prefixes are one id with the prefix swapped. ⚠️ The SEGMENT has to be
+    the whole id (`SPEC_SEG_RE`, matched per segment, not searched for anywhere in the
+    string), because what comes out of it is used as a filename — and a sloppy match names
+    a different file. `URL_RE` stays as it is for the listing's own link rung, which
+    compares against an id csm read off disk and so cannot invent one.
+    """
+    for part in re.split(r"[/?#]", (spec or "").strip()):
+        if SPEC_SEG_RE.match(part):
+            return part.split("_", 1)[1]
+    return ""
+
+
+def derive_local_id(spec: str) -> str:
+    """The local transcript id `spec` names, COMPUTED — `""` when it names none.
+
+    Two forms, both measured (see `BRIDGE_NS`):
+      * a claude.ai link, a `session_X`/`cse_X` id, or any url carrying such a segment —
+        the local id is `uuid5` of the bridge session's own api url;
+      * a spacesheep session page — the uuid in it IS the local id.
+    The answer is always a version-5 uuid for the first form, so it can never collide with
+    a terminal session's random v4 id.
+    """
+    m = SHEEP_SESSION_RE.search(spec or "")
+    if m:
+        return m.group(1).lower()
+    bare = bare_bridge_id(spec)
+    if not bare:
+        return ""
+    return str(uuidlib.uuid5(uuidlib.UUID(BRIDGE_NS), BRIDGE_NAME % bare))
+
+
+def canary_path(version: str) -> Path:
+    return STATE_DIR / ("canary-%s.json" % re.sub(r"[^A-Za-z0-9._-]", "-", version or "?"))
+
+
+def canary() -> dict:
+    """Is `BRIDGE_NS` really in the CLI bundle this machine runs? Asked once per version.
+
+    `{"ok": True | False | None, "version", "where", "why"}`. `None` is "could not look",
+    which is never a pass: the caller SAYS the derivation is unverified instead of deriving
+    in silence (`spec_notes`).
+
+    🛑 ONCE PER CLI VERSION, NEVER ON EVERY RUN. Every subcommand resolves a spec, and the
+    bundle is ~290 MB, so a scan on the resolution path would be paid by every scheduled
+    check on this machine. The verdict is cached in the state dir against the bundle's own
+    path, size and mtime, so an upgrade — and only an upgrade — scans again (0.22 s and
+    69 MB peak RSS, measured on 2.1.312, Wed 28 Oct 2026). The scan reads `CANARY_CHUNK` at
+    a time with a needle-sized overlap, so a constant lying across a chunk boundary is
+    still found and nothing holds the bundle in memory.
+    🛑 And the NEEDLE IS THE CONSTANT, not a function name: the construction around it is
+    byte-identical in 2.1.310/311/312 while every minified identifier in it changes.
+    """
+    ver, where = cli_version()
+    out = {"ok": None, "version": ver, "where": where, "why": ""}
+    exe = claude_bin()
+    real = os.path.realpath(exe) if exe else ""
+    if not ver or not real:
+        out["why"] = where if not ver else "no `claude` on PATH (and CSM_CLAUDE is not set)"
+        return out
+    try:
+        st = os.stat(real)
+    except OSError as e:
+        out["why"] = "%s could not be read (%s)" % (tilde(real), e.__class__.__name__)
+        return out
+    key = {"path": real, "size": st.st_size, "mtime": int(st.st_mtime)}
+    cache = canary_path(ver)
+    d = read_json(cache)
+    if (isinstance(d, dict) and isinstance(d.get("ok"), bool)
+            and all(d.get(k) == v for k, v in key.items())):
+        out["ok"], out["why"] = d["ok"], str(d.get("why") or "")
+        return out
+    needle = BRIDGE_NS.encode()
+    # ⚠️ Never below twice the needle, whatever the knob says, or the overlap below would
+    # eat the whole chunk and the scan would never move forward.
+    step = max(len(needle) * 2, int(CANARY_CHUNK))
+    hits, carry = 0, b""
+    try:
+        with open(real, "rb") as f:
+            while True:
+                buf = f.read(step)
+                if not buf:
+                    break
+                blob = carry + buf
+                hits += blob.count(needle)
+                carry = blob[-(len(needle) - 1):]
+    except OSError as e:
+        out["why"] = "%s could not be read (%s)" % (tilde(real), e.__class__.__name__)
+        return out
+    out["ok"] = hits > 0
+    out["why"] = ("the namespace is in %s (%d occurrence%s)"
+                  % (tilde(real), hits, "" if hits == 1 else "s") if hits else
+                  "the namespace csm derives with is NOT in %s" % tilde(real))
+    rec = dict(key)
+    rec["ok"], rec["why"], rec["at"] = out["ok"], out["why"], time.time()
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = Path(str(cache) + ".tmp")
+        tmp.write_text(json.dumps(rec, indent=1))
+        os.chmod(str(tmp), 0o600)
+        os.replace(str(tmp), str(cache))
+    except OSError:
+        pass                                 # a verdict that cannot be cached is a verdict
+    return out
+
+
 # ---------------------------------------------------------------------------- sessions
 
 @dataclass
@@ -1346,6 +1498,21 @@ def _text_of(message) -> str:
     return "\n".join(out)
 
 
+def _status_bridge(d: dict) -> str:
+    """The bridge id a `/remote-control is active` line carries in its url, or `""`.
+
+    Measured on CLI 2.1.312, Wed 28 Oct 2026: a `--remote-control=` session writes
+    `{"type": "system", "subtype": "bridge_status", "url":
+    "https://claude.ai/code/session_X", "content": "/remote-control is active · Continue
+    here, on your phone, or at https…", …}`. It is the third place a local transcript ever
+    names its claude.ai session, after the `bridge-session` line and the live registry row.
+    """
+    if d.get("type") != "system" or d.get("subtype") != "bridge_status":
+        return ""
+    u = d.get("url")
+    return bare_bridge_id(u) if isinstance(u, str) else ""
+
+
 _TITLE_KINDS = (("custom-title", "customTitle"), ("ai-title", "aiTitle"),
                 ("last-prompt", "lastPrompt"))
 
@@ -1375,7 +1542,7 @@ def scan_transcript(path: Path) -> dict:
 
     titles = {k: "" for k, _ in _TITLE_KINDS}
     used = set()
-    first_prompt = head_perm = head_bridge = ""
+    first_prompt = head_perm = head_bridge = url_bridge = ""
     for d in _iter_json_lines(head):
         used |= _mcp_called(d)
         if not d.get("isSidechain", False):
@@ -1390,6 +1557,7 @@ def scan_transcript(path: Path) -> dict:
                 titles[kind] = d[key]
         if t == "bridge-session" and isinstance(d.get("bridgeSessionId"), str):
             head_bridge = d["bridgeSessionId"]
+        url_bridge = _status_bridge(d) or url_bridge
         if not first_prompt and t == "user" and not d.get("isSidechain"):
             txt = _text_of(d.get("message"))
             if txt and not txt.lstrip().startswith("<"):
@@ -1406,6 +1574,7 @@ def scan_transcript(path: Path) -> dict:
                 titles[kind] = d[key]            # the tail comes later in the file: it wins
         if t == "bridge-session" and isinstance(d.get("bridgeSessionId"), str):
             bridge = d["bridgeSessionId"]
+        url_bridge = _status_bridge(d) or url_bridge
         if t == "permission-mode" and isinstance(d.get("permissionMode"), str):
             perm = d["permissionMode"]
         # 🛑 The desktop app writes no `permission-mode` line: it puts the mode on every
@@ -1421,21 +1590,40 @@ def scan_transcript(path: Path) -> dict:
             info["ended_remotely"] = True
         if t == "assistant" and isinstance(m, dict) and not d.get("isSidechain"):
             err = d.get("apiError") or m.get("apiError")
-            if err in QUOTA_ERRORS:
+            # 🛑 TWO SHAPES OF ONE STOP, and the second one used to read as a clean finish.
+            # Measured on this machine, CLI 2.1.312, Wed 28 Oct 2026: of 44 assistant
+            # quota-stop lines in the config homes here, 34 carry an `apiError` and 10
+            # carry NO `apiError` key at all — only `isApiErrorMessage: true`,
+            # `error: "rate_limit"`, `apiErrorStatus: 429` and a top-level `quotaLimits`
+            # ({status, resetsAt, rateLimitType, …}). Those fell into the clean-line branch
+            # below, so `quota` stayed empty AND `assistant_idx` was set, which additionally
+            # defeated the in-force heuristic for a real quota line earlier in the tail:
+            # csm said such a session had FINISHED. Both keys are required together,
+            # because `error` alone is not this line.
+            if err in QUOTA_ERRORS or (d.get("isApiErrorMessage")
+                                       and d.get("error") == "rate_limit"):
                 quota_idx = i
                 p = d.get("apiErrorParams") or m.get("apiErrorParams") or {}
                 rl = p.get("rate_limit_info") if isinstance(p, dict) else None
                 rl = rl if isinstance(rl, dict) else {}
                 resets = epoch_s(rl.get("resetsAt"))
-                if not resets:
+                kind = rl.get("rateLimitType") or ""
+                if not resets or not kind:
                     # Some builds carry the reset under `quotaLimits` instead, on the line
-                    # or inside the message.
+                    # or inside the message — and the no-`apiError` shape carries the WINDOW
+                    # there too (`five_hour` / `seven_day`), which is the word a caller keys
+                    # on to say whether waiting clears the stop at all.
                     for holder in (p, d, m):
                         q = holder.get("quotaLimits") if isinstance(holder, dict) else None
-                        if isinstance(q, dict) and epoch_s(q.get("resetsAt")):
+                        if not isinstance(q, dict):
+                            continue
+                        if not resets and epoch_s(q.get("resetsAt")):
                             resets = epoch_s(q.get("resetsAt"))
+                        if not kind and isinstance(q.get("rateLimitType"), str):
+                            kind = q["rateLimitType"]
+                        if resets and kind:
                             break
-                quota = {"error": err, "kind": rl.get("rateLimitType") or "",
+                quota = {"error": err or str(d.get("error") or ""), "kind": kind,
                          "resets_at": resets, "message": tidy(_text_of(m), 80)}
             elif not err:
                 # Only a CLEAN line counts: an error line names its model `<synthetic>`,
@@ -1470,7 +1658,16 @@ def scan_transcript(path: Path) -> dict:
             names.add(mm.group(1).decode("utf-8", "ignore"))
     info["mcp_servers"] = sorted(n for n in names if n)
     info["mcp_used"] = sorted(n for n in used if n)
-    info["bridge_id"] = re.sub(r"^(cse_|session_)", "", bridge or head_bridge)
+    # 🛑 A `bridge-session` line first, a `bridge_status` url second: they name the same
+    # session, and the explicit line is the one the CLI writes on purpose. The url is read
+    # because the two sit in DIFFERENT PLACES in the file — `bridge-session` is written once
+    # near the start and falls into the unread middle of a long transcript, while
+    # `bridge_status` is rewritten every time `/remote-control` reports in and is therefore
+    # in the tail. Measured on CLI 2.1.312, Wed 28 Oct 2026: 97 of the 1,935 transcripts in
+    # the config homes here carry such a line, every one of them beside a `bridge-session`
+    # line — so today it is a second source for the same id, not the only source for any.
+    info["bridge_id"] = re.sub(r"^(cse_|session_)", "",
+                               bridge or head_bridge or url_bridge)
     info["title"] = tidy(titles["custom-title"] or titles["ai-title"]
                          or titles["last-prompt"] or first_prompt)
     return info
@@ -1900,6 +2097,135 @@ def pick(spec: str, rows: list, soft: bool = False):
     if soft:
         return None
     die(f"'{s}' matches no session in this listing. `csm list --all` widens it")
+    raise AssertionError("unreachable")
+
+
+# ----------------------------------------------------------------------- the spec layer
+
+@dataclass
+class Spec:
+    """What a typed session spec resolves to BEFORE any listing is built.
+
+    `pick` is a ladder over a LISTING; this is about the spec itself, and it runs first for
+    one reason: a claude.ai link, a bridge id or a spacesheep session link names its
+    transcript by arithmetic (`derive_local_id`), so a session with no registry row — a
+    DEAD one, which is the case a link lookup exists for — still resolves.
+    """
+    #: What was typed, trimmed. The only thing handed to `pick` when this is not a link.
+    typed: str = ""
+    #: The spec is a link / bridge id / spacesheep session link. It changes what a MISS
+    #: means: a link is an exact question and gets an exact answer or a refusal.
+    link: bool = False
+    #: The bare claude.ai id, when the spec carried one (empty for a spacesheep link).
+    bare: str = ""
+    #: The local transcript id the spec names, computed.
+    derived: str = ""
+    #: A WHOLE local id to pin into the listing past its age cap: the typed id, or a
+    #: derived one whose transcript is really in a home here.
+    pin: str = ""
+    #: Account labels whose `projects/` holds `<derived>.jsonl`, and all the labels looked
+    #: in — the second is what a refusal has to name, so the reader knows what was asked.
+    homes: list = field(default_factory=list)
+    searched: list = field(default_factory=list)
+    canary: dict = field(default_factory=dict)
+
+    @property
+    def what(self) -> str:
+        """What to CALL the thing that was typed, in a sentence."""
+        if self.bare:
+            return "session_" + self.bare
+        return "that spacesheep session page" if self.link else self.typed
+
+
+def resolve_spec(spec: str, accts: list) -> Spec:
+    """Derive what a typed spec names, and say which home holds it. Reads no transcript.
+
+    🛑 THE SPEC LAYER, ABOVE `pick`. Three things happen here and nowhere else:
+      * a WHOLE local id is pinned, exactly as before (`FULL_ID_RE`);
+      * a LINK is derived, and when that transcript really is in a home here the full id is
+        pinned too — which is what carries it past the listing's age cap and past the
+        absence of a registry row. A link used to resolve only through a live row or a
+        transcript's own `bridge-session` line, so every dead server child was unreachable;
+      * the spec is MARKED as a link, which is what stops `pick_resolved` from ever handing
+        it to the id-prefix or title rungs.
+    """
+    typed = (spec or "").strip()
+    out = Spec(typed=typed)
+    low = typed.lower()
+    if FULL_ID_RE.match(low):
+        out.pin = low
+        return out
+    derived = derive_local_id(typed)
+    if not derived:
+        return out
+    out.link, out.bare, out.derived = True, bare_bridge_id(typed), derived
+    for a in accts:
+        out.searched.append(a.label)
+        try:
+            # `glob`, not `is_file` on a guessed folder: one id can sit in several project
+            # folders of one home (a folder reached through a symlink is a second slug).
+            if any(p.is_file() for p in a.projects.glob("*/" + derived + ".jsonl")):
+                out.homes.append(a.label)
+        except OSError:
+            continue
+    if out.homes:
+        out.pin = derived
+    out.canary = canary()
+    return out
+
+
+def spec_notes(sp: Spec) -> list:
+    """What a plan says about how the spec was resolved: facts, never a guess."""
+    out = []
+    if not sp.link:
+        return out
+    if sp.pin:
+        out.append("resolved from the link: %s is the transcript %s names, in %s "
+                   "(computed from the link, not looked up — nothing has to be running)"
+                   % (sp.derived[:8], sp.what, ", ".join(sp.homes)))
+    c = sp.canary or {}
+    if sp.bare and c.get("ok") is not True:
+        # 🛑 NEVER A SILENT PASS. The derivation is still used — it is the only way to this
+        # file — but a reader who is about to act on it is told that the constant behind it
+        # was not found in the CLI this machine runs.
+        out.append("⚠ derivation unverified for CLI %s: %s"
+                   % (c.get("version") or "?", c.get("why") or "nothing to check against"))
+    return out
+
+
+def pick_resolved(sp: Spec, rows: list, soft: bool = False):
+    """`pick`, with a link resolved first and NEVER falling through to a weaker rung.
+
+    🛑 A LINK IS AN EXACT QUESTION. Its three rungs are the three places a local transcript
+    is tied to a claude.ai session, and they are all exact:
+      1. the DERIVED id names a transcript in this listing (`BRIDGE_NS`);
+      2. a row's `bridge_id` is that bare id — which covers the transcript's own
+         `bridge-session` line, a `bridge_status` url in it, and a live registry row's
+         `bridgeSessionId`, all three of which `scan_transcript`/`sessions_for` fold into
+         that one field.
+    Nothing else. A link may never reach the id-prefix rung (a mis-derived id is a plausible
+    prefix of some other session) or the TITLE rung — and the title rung is the sharp edge,
+    because a session whose first prompt QUOTED the link has the link in its title, so
+    "find me this link" would have answered with the session that merely talks about it.
+    """
+    if not sp.link:
+        return pick(sp.typed, rows, soft)
+    hits = [r for r in rows if r.local_id.lower() == sp.derived]
+    if hits:
+        return one_of(hits, "%s (transcript %s)" % (sp.what, sp.derived), soft)
+    if sp.bare:
+        hits = [r for r in rows if r.bridge_id == sp.bare]
+        if hits:
+            return one_of(hits, "claude.ai id %s" % sp.bare, soft)
+    if soft:
+        return None
+    looked = ", ".join(sp.searched) or "no account home"
+    die("no transcript for that link here: %s names %s, and nothing under %s on %s holds "
+        "it. It may be on another machine (`csm find %s --on M`), or belong to a session "
+        "this machine never ran. A link is never matched by part of an id or by title — "
+        "that would answer with somebody else's session%s"
+        % (sp.what, sp.derived, looked, machine(), shlex.quote(sp.typed),
+           "".join("; " + n for n in spec_notes(sp))))
     raise AssertionError("unreachable")
 
 
@@ -2674,17 +3000,22 @@ def do_modes(args, accts: list) -> int:
 #:   find <text> <days>          sessions in every `~/.claude*` home there — the default one
 #:                               included, which is where the desktop app keeps its sessions
 #:                               — matched by id (the CLI's uuid or the desktop app's
-#:                               `local_` id, 4+ characters), a claude.ai link, or title text
-#:                               (the desktop app's own title first)
-#:   detail <path> <id>          the sibling directory's size, the desktop-app tools the
+#:                               `local_` id, 4+ characters), a claude.ai link (DERIVED to
+#:                               the transcript's name, so a dead session resolves; and
+#:                               through the live registry's own `bridgeSessionId`), or
+#:                               title text (the desktop app's own title first)
+#:   detail <path> <id> [cse]    the sibling directory's size, the desktop-app tools the
 #:                               session used, the process that owns it (`--resume[= ]<id>`,
 #:                               never a bare id: a side session's argv names it in a path)
-#:                               and what that process started that is still running
+#:                               and what that process started that is still running. The
+#:                               optional third word is the BARE bridge id, because a
+#:                               Remote-Control server child's argv carries only that
+#:                               (`--session-id cse_X`) and never the local uuid
 #:   mirror <cwd> <file max>     the files `--mirror-cwd` would copy, and what it would leave
 #: ⚠️ It reads `CSM_DESKTOP_INDEX` from ITS OWN environment, because the path is that
 #: machine's, not this one's: an override set here would be the wrong spelling there.
 REMOTE_HELPER = r'''
-import json, os, re, subprocess, sys, time
+import json, os, re, subprocess, sys, time, uuid
 
 H = os.path.expanduser("~")
 HEAD, TAIL = 96 * 1024, 512 * 1024
@@ -2693,6 +3024,76 @@ DESK = os.environ.get("CSM_DESKTOP_INDEX") or os.path.join(
     H, "Library", "Application Support", "Claude", "claude-code-sessions")
 NOISE = re.compile(r"(disclaimer|/claude(\.app)?/|MacOS/claude|\bnode\b|\bnpx\b|\buvx\b|\bbun\b|"
                    r"mcp|caffeinate|^\S*/?(ba|z)?sh -c |^\S*/?(ba|z)?sh$)")
+# The engine's BRIDGE_NS / SPEC_SEG_RE / SHEEP_SESSION_RE, kept identical word for word: a
+# link has to resolve to the same transcript here as it does there, or a row found on one
+# machine is not the row found on the other.
+NS = uuid.UUID("3ab19d7e-9f35-45c2-926e-75e271cc60b3")
+SEG = re.compile(r"^(?:session|cse)_[A-Za-z0-9_]+$")
+SHEEP = re.compile(r"spacesheep\.dev/sessions/claude-code/"
+                   r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                   r"-[0-9a-fA-F]{12})")
+
+
+def bare_id(spec):
+    """The bare claude.ai/bridge id in `spec`, by the CLI's own rule, or "" — the engine's
+    `bare_bridge_id`: split on `/?#`, first segment that is ENTIRELY such an id."""
+    for part in re.split(r"[/?#]", (spec or "").strip()):
+        if SEG.match(part):
+            return part.split("_", 1)[1]
+    return ""
+
+
+def derive(spec):
+    """The local transcript id `spec` names, computed — the engine's `derive_local_id`.
+
+    🛑 This is what makes a link find a DEAD session: the local id is uuid5 of the bridge
+    session's own api url, so the transcript's name is arithmetic. Without it, `find` could
+    only match a link against a live registry row (which the helper never read) or a
+    transcript's own `bridge-session` line (which a server child never writes), so every
+    link to a stopped phone session answered "no session matches".
+    """
+    m = SHEEP.search(spec or "")
+    if m:
+        return m.group(1).lower()
+    b = bare_id(spec)
+    if not b:
+        return ""
+    return str(uuid.uuid5(NS, "https://api.anthropic.com/v1/code/sessions/cse_" + b))
+
+
+def live_bridges(home):
+    """`{local session id: bare bridge id}` from `<home>/sessions/*.json`.
+
+    The registry is the only place a LIVE Remote-Control child's two ids sit together: its
+    transcript carries no bridge id at all. `os.listdir`, never glob, for the same reason
+    the engine gives: a directory this process may not read has to raise, not read as empty.
+    """
+    out = {}
+    d = os.path.join(home, "sessions")
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return out
+    for n in names:
+        if not n.endswith(".json") or n.startswith("."):
+            continue
+        try:
+            f = open(os.path.join(d, n))
+        except Exception:
+            continue
+        try:
+            r = json.load(f)
+        except Exception:
+            r = None
+        finally:
+            f.close()
+        if not isinstance(r, dict):
+            continue
+        sid = r.get("sessionId")
+        b = re.sub(r"^(cse_|session_)", "", str(r.get("bridgeSessionId") or ""))
+        if isinstance(sid, str) and sid and b:
+            out[sid] = b
+    return out
 
 
 def jlines(blob, drop_first=False):
@@ -2844,6 +3245,13 @@ def scan(p):
             info["last"] = d["lastPrompt"]
         elif t == "bridge-session" and isinstance(d.get("bridgeSessionId"), str):
             info["bridge"] = re.sub(r"^(cse_|session_)", "", d["bridgeSessionId"])
+        elif t == "system" and d.get("subtype") == "bridge_status" and not info["bridge"]:
+            # The engine's `_status_bridge`: a `/remote-control is active` line carries the
+            # claude.ai url, and it sits in the TAIL while a `bridge-session` line sits once
+            # near the start and can fall into the unread middle of a long transcript.
+            u = d.get("url")
+            if isinstance(u, str):
+                info["bridge"] = bare_id(u)
         if not info["cwd"] and isinstance(d.get("cwd"), str):
             info["cwd"] = d["cwd"]
         if (t in ("permission-mode", "user") and not d.get("isSidechain")
@@ -2871,6 +3279,7 @@ def find(spec, days):
     low = raw.lower()
     m = re.search(r"(?:session_|cse_)([A-Za-z0-9]{10,})", raw)
     bridge = m.group(1) if m else ""
+    derived = derive(raw)
     idq = low[6:] if low.startswith("local_") else low
     idlike = bool(re.match(r"^[0-9a-f][0-9a-f-]{3,35}$", idq))
     desk = desktop()
@@ -2878,6 +3287,7 @@ def find(spec, days):
     out = []
     for home in homes():
         email, org = login(home)
+        lb = live_bridges(home)
         pj = os.path.join(home, "projects")
         try:
             folders = sorted(os.listdir(pj))
@@ -2903,7 +3313,15 @@ def find(spec, days):
                 hit = ""
                 if idlike and (sid.lower().startswith(idq) or local.startswith("local_" + idq)):
                     hit = "id"
+                # 🛑 THE DERIVED NAME AND THE LIVE REGISTRY, BOTH ABOVE THE AGE CUTOFF. The
+                # cutoff's `continue` below runs before the transcript is even read, so a
+                # link rung placed after it could not reach a session older than the window
+                # — and the session somebody has lost the link to is exactly the old one.
+                elif derived and sid.lower() == derived:
+                    hit = "url"
                 elif bridge and any(bridge in str(b) for b in (dk.get("bridgeSessionIds") or [])):
+                    hit = "url"
+                elif bridge and bridge == lb.get(sid, ""):
                     hit = "url"
                 elif st.st_mtime < cutoff:
                     continue
@@ -2930,7 +3348,11 @@ def find(spec, days):
                             "cwd": info["cwd"] or str(dk.get("cwd") or ""), "title": title,
                             "title_from": src, "hit": hit, "desktop": dk or None,
                             "quota": str(dk.get("error") or "") or info["quota"],
-                            "bridge": info["bridge"] or (bids[-1] if bids else ""),
+                            # The transcript's own claim first, then the LIVE registry row
+                            # (the only place a running server child's two ids meet), then
+                            # the desktop app's index.
+                            "bridge": (info["bridge"] or lb.get(sid, "")
+                                       or (bids[-1] if bids else "")),
                             "perm": str(dk.get("permissionMode") or "") or info["perm"],
                             "model": info["model"] or str(dk.get("model") or "")})
     out.sort(key=lambda c: -c["mtime"])
@@ -2955,7 +3377,7 @@ def short_cmd(cmd):
     return " ".join([os.path.basename(toks[0])] + toks[1:])[:160]
 
 
-def detail(path, sid):
+def detail(path, sid, bridge=""):
     out = {"sibling_bytes": 0, "sibling_files": 0, "app_tools": 0, "owners": [], "left": []}
     side = path[:-6] if path.endswith(".jsonl") else path
     for root, _d, files in os.walk(side):
@@ -2980,7 +3402,19 @@ def detail(path, sid):
             f.close()
     rows = ps_rows()
     me = (os.getpid(), os.getppid())
-    own = re.compile(r"--(resume|session-id)[= ]" + re.escape(sid) + r"\b")
+    # 🛑 A SERVER CHILD NAMES ONLY ITS BRIDGE ID, and this used to fail in the dangerous
+    # direction. A Remote-Control worker's argv is `--print --sdk-url …/cse_X --session-id
+    # cse_X --resume=<that url>` and carries the local uuid NOWHERE (measured on CLI 2.1.312,
+    # Wed 28 Oct 2026), so matching on `sid` alone came back with no owner — read upstream
+    # as "nothing is running on that machine", which is what `--stop-source`'s cross-machine
+    # refusal and the move note's "still running on <origin>" clause both key on. The bare
+    # bridge id is the third argv word for exactly this; `\S*` covers both spellings, the
+    # bare `cse_X` and the sdk url that ends in it.
+    pats = [r"--(?:resume|session-id)[= ]" + re.escape(sid) + r"\b"]
+    if bridge:
+        pats.append(r"--(?:resume|session-id|sdk-url)[= ]\S*cse_" + re.escape(bridge)
+                    + r"\b")
+    own = re.compile("|".join(pats))
     owners = [p for p, r in rows.items() if p not in me and own.search(r[2])]
     kids = {}
     for p, r in rows.items():
@@ -3059,7 +3493,10 @@ if __name__ == "__main__":
     if mode == "find":
         res = find(sys.argv[2], float(sys.argv[3]))
     elif mode == "detail":
-        res = detail(sys.argv[2], sys.argv[3])
+        # The bridge id is OPTIONAL on purpose: an older engine calling a newer helper, or
+        # a session that has no claude.ai id at all, passes three words and still works.
+        res = detail(sys.argv[2], sys.argv[3],
+                     sys.argv[4] if len(sys.argv) > 4 else "")
     elif mode == "mirror":
         res = mirror(sys.argv[2], int(sys.argv[3]))
     else:
@@ -3344,7 +3781,9 @@ def remote_session(args, accts: list) -> Session:
             die("%d sessions on %s match %r; name one by its id:\n%s"
                 % (len(found), m, args.session, render_found(found[:10], m)))
     c = found[0]
-    det = run_helper(m, "detail", c["path"], c["id"]) or {}
+    # The bare bridge id goes with the local one: a server child over there names only the
+    # bridge id in its argv, so without it `detail` reports no owner at all (see `detail`).
+    det = run_helper(m, "detail", c["path"], c["id"], c.get("bridge") or "") or {}
     cwd, folder = c.get("cwd") or "", c["folder"]
     here_cwd = translate_cwd(m, cwd, c["path"])
     if here_cwd:
@@ -5318,12 +5757,17 @@ def do_move(args, accts: list) -> int:
     if copy_only and (args.foreground or args.no_remote_control):
         die("--copy-only starts nothing, so there is no window and no terminal to choose: "
             "drop --foreground / --no-remote-control")
+    # 🛑 THE SPEC LAYER FIRST, and on the ONE-MACHINE path only: `--from-machine` resolves
+    # over there, through `REMOTE_HELPER find`, which runs the same derivation against that
+    # machine's own homes. An empty `Spec` for that branch is what keeps `spec_notes` from
+    # claiming anything about a resolution this process did not do.
+    sp = Spec()
     if origin:
         s = remote_session(args, accts)
     else:
-        spec = (args.session or "").strip().lower()
+        sp = resolve_spec(args.session, accts)
         rows = all_sessions(accts, ALL_LIMIT if args.all else max(DEFAULT_LIMIT, 60),
-                            pin=spec if FULL_ID_RE.match(spec) else "")
+                            pin=sp.pin)
         src_only = getattr(args, "from_account", None)
         if src_only:
             # 🛑 A MOVE IS A COPY, so after a to b the id is in both homes and a move back
@@ -5331,7 +5775,7 @@ def do_move(args, accts: list) -> int:
             # copy is the live one. A caller that DOES know names the home it is in.
             src = resolve(src_only, accts)
             rows = [r for r in rows if r.account.name == src.name]
-        s = pick(args.session, rows)
+        s = pick_resolved(sp, rows)
     # 🛑 Before the target is even resolved: an owned session is not moved, it is handed
     # to its supervisor. Across machines there is no local supervisor to ask, and the
     # staged copy is not the file any supervisor here is pointing at.
@@ -5383,7 +5827,7 @@ def do_move(args, accts: list) -> int:
         rc_name = rc_label(args.name or s.label,
                            "" if args.name else f"moved from {s.account.label}")
     warn = target_quota_note(tgt)
-    notes = target_notes(s, tgt, perm)
+    notes = target_notes(s, tgt, perm) + spec_notes(sp)
 
     if origin:
         # On the other machine there is no registry to read, so "running" is what `ps`
@@ -5723,14 +6167,18 @@ def do_stop(args, accts: list) -> int:
     # of every transcript in every home. The full scan still runs, but only to produce the
     # refusal, which keeps ONE producer of that text.
     prefixes = set(n[len("moved-"):] for w in wins.values() for n in w)
-    rows = all_sessions(accts, ALL_LIMIT, only=prefixes) if prefixes else []
+    # The spec layer runs here too, so `csm stop <link>` reaches the window csm opened for
+    # a session whose link is the only thing the caller has (a moved session's own link is
+    # printed by the move, and it is a server child's only name on a phone).
+    sp = resolve_spec(args.session, accts)
+    rows = all_sessions(accts, ALL_LIMIT, only=prefixes, pin=sp.pin) if prefixes else []
     mine = [r for r in rows if window_name(r) in wins.get(r.account.name, {})]
     # The narrowed list first: after a move the same id sits in two homes, and only one of
     # them has a window csm opened.
-    s = pick(args.session, mine, soft=True)
+    s = pick_resolved(sp, mine, soft=True)
     if s is None:
-        rows = all_sessions(accts, ALL_LIMIT)
-        s = pick(args.session, rows)
+        rows = all_sessions(accts, ALL_LIMIT, pin=sp.pin)
+        s = pick_resolved(sp, rows)
     sess, win = s.account.tmux_session, window_name(s)
     have = wins.get(s.account.name, {})
     if win not in have:
@@ -5769,6 +6217,9 @@ def do_stop(args, accts: list) -> int:
             f"(0600)",
             f"  - {kill}",
             "  - the transcript is NEVER deleted: " + tilde(s.transcript)]
+    # After the `source:` line and before the blank one: how the spec was resolved belongs
+    # with the facts about the row, not with the steps.
+    plan[4:4] = [f"      {n}" for n in spec_notes(sp)]
     if s.live and not ok:
         plan.append("  - ⚠ killing the window destroys its pane and SIGHUPs the process "
                     "tree in it, so\n    that process ends with the window even though it "
@@ -6807,6 +7258,43 @@ def over_ssh(dest: str, argv: list, named_machine: bool = True) -> int:
     return r.returncode
 
 
+def no_match_hint(args, on) -> list:
+    """🛑 0 ROWS IS NOT PROOF, and this is the line that says so.
+
+    What `find` searched is transcript names, ids and titles. The session a caller is
+    looking for is typically the one that STOPPED — and such a session has no registry row,
+    its transcript is named by a uuid that appears nowhere in the words anybody types, and
+    a Remote-Control session is the kind least likely to carry a title at all (measured on
+    this machine, Wed 28 Oct 2026: 11% of v5 transcripts have an `ai-title` against 64% of
+    v4 ones). "no session matches" therefore has to name the ONE spec that always works.
+    """
+    d = derive_local_id(args.text)
+    out = ["", "🛑 0 rows is not proof that the session is gone. This searched transcript "
+               "ids and titles; a session that is no longer running has no registry row, "
+               "and a Remote Control session usually has no title either — its transcript "
+               "is named by a uuid that is in nothing you would type."]
+    if d:
+        out.append("   %s names transcript %s, and no config home on %s holds that file."
+                   % ("That link" if SHEEP_SESSION_RE.search(args.text)
+                      else "session_" + (bare_bridge_id(args.text) or "?"),
+                      d, on or machine()))
+        if not on:
+            c = canary()
+            if c.get("ok") is not True:
+                out.append("   ⚠ derivation unverified for CLI %s: %s"
+                           % (c.get("version") or "?", c.get("why") or "nothing to check "
+                              "against"))
+    else:
+        out.append("   Paste its claude.ai link instead — `csm find "
+                   "https://claude.ai/code/session_…` computes the transcript's name from "
+                   "the link, with nothing running and nothing to look up.")
+    if not args.all:
+        out.append("   `--all` widens the window past the last %s days." % FIND_DAYS)
+    out.append("   And a transcript lives in a config home, which is per machine: `csm "
+               "find <spec> --on <other machine>` is a different set of files.")
+    return out
+
+
 def cmd_find(args) -> int:
     """`find <text>`: sessions matching an id, a link or title text — here, or on `--on M`.
 
@@ -6814,6 +7302,14 @@ def cmd_find(args) -> int:
     where the desktop app keeps its sessions) and the desktop app's own titles, and it does
     it through the same helper whether the machine is this one or another: one reading rule,
     so a row found here and a row found there are the same row.
+
+    🛑 EXIT 1 ON NO MATCH (added Wed 28 Oct 2026). It used to exit 0 whatever it found,
+    which read as "asked and answered" to anything that checked a status — and the answer
+    this command gives most often about a session somebody has lost is the empty one. The
+    exit code was verified to be unused first: nothing under `flush-util`, the one
+    installation that drives csm from scheduled passes, runs `find` at all, let alone
+    branches on its status. ⚠️ A caller that wants rows still reads `--json` and counts
+    them: 1 means "nothing matched", never "the search failed".
     """
     on = args.on if (args.on and args.on != machine()) else None
     if on:
@@ -6826,9 +7322,17 @@ def cmd_find(args) -> int:
     log("find %r on %s: %d rows" % (args.text, on or machine(), len(rows)))
     if args.as_json:
         print(json.dumps(rows, indent=1))
+        if not rows:
+            # ⚠️ STDERR, so the hint cannot land inside the JSON a script is parsing. The
+            # exit code is the same 1 either way.
+            print("\n".join(no_match_hint(args, on)).strip(), file=sys.stderr)
+            return 1
         return 0
     print(render_found(rows, on or machine()))
-    if on and rows:
+    if not rows:
+        print("\n".join(no_match_hint(args, on)))
+        return 1
+    if on:
         print("\nto bring one here: csm move <id> --from-machine %s --to <account> "
               "[--mirror-cwd]" % on)
     return 0

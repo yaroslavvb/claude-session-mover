@@ -9,6 +9,97 @@ Every fact below was measured against Claude Code 2.1.296–2.1.300 on macOS. Th
 state it reads is undocumented and can change in any CLI release; the tests pin every shape
 the tool depends on.
 
+## [Unreleased]
+
+Towards `csm revive`. These are the two milestones it needs before it can decide anything:
+resolution that reaches a session nothing is running, and a stop reason that is right for all
+of them. Both are useful on their own, and both are measured against Claude Code **2.1.312**
+on macOS (Wed 28 Oct 2026) — a newer version than the 2.1.296–2.1.300 the rest of this file
+was written against.
+
+### Added
+
+- **A claude.ai link now finds its transcript with nothing running.** A Remote Control
+  session's local id is not random: the CLI derives it from the bridge session's own API url,
+  `uuid5(3ab19d7e-9f35-45c2-926e-75e271cc60b3, "https://api.anthropic.com/v1/code/sessions/
+  cse_<bare>")`. So `derive_local_id` computes the transcript's **name** from the link alone —
+  no process, no registry row, no network. Before this, a link resolved only through a live
+  registry row or a transcript's own `bridge-session` line, and a Remote-Control server child
+  writes neither: every dead phone session was unreachable by the only name anybody has for
+  it. Verified on 37/37 live registry rows carrying both ids, and 0/37 against any other name
+  form; two pairs are pinned in the tests as constants rather than recomputed, so the test
+  cannot agree with the tool by construction.
+  - It accepts a claude.ai link, a bare `session_X` or `cse_X`, any url carrying such a
+    segment (by the CLI's own rule: split on `/?#`, first segment that is *entirely* such an
+    id), and a **spacesheep session page**, `…spacesheep.dev/sessions/claude-code/<uuid>`,
+    whose uuid *is* the local id.
+  - It is applied at the **spec layer**, above `pick`'s ladder, in `move`, `stop` and (through
+    the remote helper, which runs for a local `find` too) `find`. That is what lets a derived
+    id be **pinned** into the listing: only a whole id survives the age cap, and the session
+    reached by its link is typically the oldest file in the home — it stopped days ago, which
+    is why anyone is looking for it.
+  - 🛑 **A link never falls through to a weaker rung.** Its rungs are exact: the derived
+    transcript, then a row whose claude.ai id is that one. A link that derives to nothing here
+    is refused, naming the file it wanted, and is never handed to the id-prefix or title
+    rungs. The title rung is the sharp edge — a session whose first prompt *pasted* the link
+    has the link in its title, so "find me this link" would have answered with the session
+    that merely talks about the one you asked for. (A spacesheep link reached that rung for
+    real: `URL_RE` does not match it at all.)
+  - A **version canary** checks that the namespace constant really is in the CLI bundle this
+    machine runs, and says `derivation unverified for CLI <v>` in the plan when it is not —
+    never a silent pass. The needle is the constant, not a function name: the construction
+    around it is byte-identical in 2.1.310/311/312 while every minified identifier in it
+    changes. The bundle is ~290 MB, so the verdict is cached in the state dir against the
+    bundle's path, size and mtime and the scan runs **once per CLI version** (0.22 s, 69 MB
+    peak RSS, in `CSM_CANARY_CHUNK`-sized reads with a needle-sized overlap).
+- **A third source for a session's claude.ai id:** a `{"type": "system", "subtype":
+  "bridge_status", "url": …}` line, which a `--remote-control=` session writes every time
+  `/remote-control` reports in. An explicit `bridge-session` line still wins; this one is read
+  because the two sit in different places in the file — `bridge-session` is written once near
+  the start and falls into the unread middle of a long transcript, while `bridge_status` is in
+  the tail. (97 of the 1,935 transcripts in the config homes here carry one.)
+- **The remote helper answers about links and about server children.** `find` runs the same
+  derivation (so a dead link resolves on another machine too, and above the age cutoff, where
+  it has to be to matter), and reads `<home>/sessions/*.json` for a live child's
+  `bridgeSessionId` — the only place a running server child's two ids sit together, which the
+  helper never read before, so `find` failed for *live* children as well.
+
+### Fixed
+
+- **`scan_transcript` missed roughly a quarter of real usage-limit stops, and read them as a
+  clean finish.** Detection was `apiError in QUOTA_ERRORS`, but of 44 assistant quota-stop
+  lines in the config homes on this machine **10 carry no `apiError` key at all** — only
+  `isApiErrorMessage: true`, `error: "rate_limit"`, `apiErrorStatus: 429` and a top-level
+  `quotaLimits` ({`status`, `resetsAt`, `rateLimitType`}). Those fell into the clean-line
+  branch, so `csm list` said the session had finished and `out_of_quota` was false. Worse, the
+  same branch set the "the session answered again" marker, so a *genuine* limit earlier in the
+  tail was read as waited out. Both shapes are now read, and `kind` — the word that says
+  whether waiting clears the stop at all — falls back to `quotaLimits.rateLimitType`.
+- **The remote helper could not identify the process owning a Remote Control session, and it
+  failed in the dangerous direction: "nothing is running there".** A server child's argv is
+  `--print --sdk-url …/cse_X --session-id cse_X --resume=<that url>` and names the local uuid
+  nowhere, while `detail` matched on the local uuid alone. `--stop-source`'s cross-machine
+  refusal and the move note's "still running on `<origin>`" clause both key on that answer, so
+  a `--from-machine` move of a session that was very much alive reported the other machine
+  idle. `detail` now takes the bare bridge id as an optional third word (older callers still
+  work) and matches it after `--resume`, `--session-id` or `--sdk-url`.
+
+### Changed
+
+- **`csm find` exits 1 when nothing matched** (it used to exit 0 whatever it found, which
+  reads as "asked and answered" to anything checking a status — and the answer it gives most
+  often about a session somebody has lost is the empty one). The exit code was verified unused
+  first: nothing under the `flush-util` installation that drives csm from scheduled passes
+  runs `find` at all, let alone branches on its status. A caller that wants rows still reads
+  `--json` and counts them; 1 means "nothing matched", never "the search failed", and with
+  `--json` the hint goes to stderr so stdout stays parseable.
+- **"No session matches" now says that 0 rows is not proof** and names the one spec that
+  always works. What `find` searches is ids and titles, and the session being looked for is
+  the one that stopped: it has no registry row, and a Remote Control session is the kind least
+  likely to have a title at all (11% of v5 transcripts here carry an `ai-title`, against 64%
+  of v4 ones). The hint names the derived transcript when a link was given, and asks for the
+  link when one was not.
+
 ## [0.4.0] — 2026-10-25
 
 **One engine.** This release merges in a private fork that had been used daily for two weeks and

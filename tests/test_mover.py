@@ -34,6 +34,7 @@ import tempfile
 import time
 import types
 import unittest
+import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -241,9 +242,19 @@ def user(text, cwd, sid, perm=None, sidechain=False, uuid=None, parent=None):
 
 
 def assistant(text, cwd, sid, model="claude-sonnet-4-5", error=None, resets=None,
-              kind="five_hour", uuid=None, parent=None, tools=()):
+              kind="five_hour", uuid=None, parent=None, tools=(), shape="apiError"):
     """`tools` are MCP tool names, written as real `tool_use` blocks: a name in a block of
-    this shape is a CALL, which is what tells `mcp_used` from `mcp_servers`."""
+    this shape is a CALL, which is what tells `mcp_used` from `mcp_servers`.
+
+    🛑 `shape` IS WHICH OF THE TWO MEASURED QUOTA-STOP SHAPES `error` is written as, and
+    the default is the one with an `apiError` so every older test is byte-for-byte what it
+    was. Measured on CLI 2.1.312, Wed 28 Oct 2026: of 44 assistant quota-stop lines in the
+    config homes on this machine, 34 carry `apiError` + `apiErrorParams.rate_limit_info`
+    and 10 carry no `apiError` key at all — only `isApiErrorMessage: true`,
+    `error: "rate_limit"`, `apiErrorStatus: 429` and a top-level `quotaLimits`
+    ({status: "rejected", resetsAt: <unix s>, rateLimitType: "five_hour"|"seven_day", …}).
+    `shape="rate_limit"` writes that second one.
+    """
     d = {"type": "assistant", "cwd": cwd, "sessionId": sid, "isSidechain": False,
          "message": {"role": "assistant", "model": model,
                      "content": [{"type": "text", "text": text}]
@@ -252,9 +263,18 @@ def assistant(text, cwd, sid, model="claude-sonnet-4-5", error=None, resets=None
     if uuid:
         d["uuid"], d["parentUuid"] = uuid, parent
     if error:
-        d["apiError"] = error
         d["message"]["model"] = "<synthetic>"
-        d["apiErrorParams"] = {"rate_limit_info": {"rateLimitType": kind, "resetsAt": resets}}
+        if shape == "apiError":
+            d["apiError"] = error
+            d["apiErrorParams"] = {"rate_limit_info": {"rateLimitType": kind,
+                                                       "resetsAt": resets}}
+        else:
+            d["isApiErrorMessage"] = True
+            d["error"] = "rate_limit"
+            d["apiErrorStatus"] = 429
+            d["quotaLimits"] = {"status": "rejected", "resetsAt": resets,
+                                "rateLimitType": kind, "overageStatus": "rejected",
+                                "isUsingOverage": False}
     return d
 
 
@@ -426,6 +446,23 @@ class World:
 SID_A = "11111111-aaaa-4aaa-8aaa-111111111111"
 SID_B = "22222222-bbbb-4bbb-8bbb-222222222222"
 SID_C = "33333333-cccc-4ccc-8ccc-333333333333"
+
+#: 🛑 TWO MEASURED PAIRS, NOT TWO INVENTED ONES. A Remote Control session's local id is
+#: `uuid5(3ab19d7e-9f35-45c2-926e-75e271cc60b3, "https://api.anthropic.com/v1/code/
+#: sessions/cse_<bare>")`, and these two pairs were read off this machine (CLI 2.1.312,
+#: Wed 28 Oct 2026, 37/37 live registry rows carrying both ids). They are written out
+#: rather than computed here on purpose: a fixture that derives the id with the same
+#: arithmetic as the tool agrees with the tool by construction and could never catch the
+#: namespace, the name form or the prefix rule changing. ⚠️ If one of these ever fails,
+#: the CLI changed: re-measure against a live registry row, do not edit the constant.
+LINK_BARE = "01PHXskvoLtckdvqFv3F8rei"
+LINK_SID = "bf974a77-c0b0-5763-81be-f057a3dc7e57"
+LINK_BARE2 = "01PHXskvDdMLxdjXDuoZkBpF"
+LINK_SID2 = "38ffa06c-4d9a-5981-96b0-a3447ac0c094"
+
+
+def link_of(bare):
+    return "https://claude.ai/code/session_" + bare
 
 
 class Base(unittest.TestCase):
@@ -1153,6 +1190,10 @@ class Picking(Base):
                                  "--dry-run"))
         return out.splitlines()[0]
 
+    def plan_to(self, spec, to):
+        """…when the row the spec names is itself in `work`, which `plan_for` moves TO."""
+        return self.ok(self.w.run("move", spec, "--to", to, "--dry-run"))
+
     def test_row_number_from_the_last_list(self):
         self.ok(self.w.run("list"))
         self.assertIn("write the tests", self.plan_for("1"))
@@ -1189,6 +1230,84 @@ class Picking(Base):
             user("refactor the parser", str(self.w.work), SID_A)])
         self.refused(self.w.run("move", SID_A, "--to", "work", "--dry-run"),
                      "a move is a copy")
+
+    # --- a link, resolved by arithmetic -----------------------------------
+    def dead_server_child(self, home=None):
+        """A session as a dead Remote Control child leaves it: a transcript whose NAME is
+        the only thing tying it to its claude.ai link — no `bridge-session` line in it, and
+        no registry row, because the process is gone."""
+        cwd = str(self.w.work)
+        return self.w.session(home or self.work, LINK_SID, mtime=time.time() - 40 * 86400,
+                              lines=[user("the one that died", cwd, LINK_SID),
+                                     assistant("working on it", cwd, LINK_SID)])
+
+    def test_a_dead_server_child_is_found_by_its_link_with_nothing_running(self):
+        self.dead_server_child()
+        out = self.ok(self.w.run("move", link_of(LINK_BARE), "--to", "personal",
+                                 "--dry-run"))
+        self.assertIn("the one that died", out.splitlines()[0])
+        self.assertIn(LINK_SID, out)
+        self.assertIn("resolved from the link", out)
+        # and a bare bridge id, which is what the app copies, is the same question
+        self.assertIn("the one that died", self.plan_to("cse_" + LINK_BARE, "personal"))
+
+    def test_a_spacesheep_session_link_finds_the_same_transcript(self):
+        self.dead_server_child()
+        out = self.ok(self.w.run(
+            "move", "https://spacesheep.dev/sessions/claude-code/" + LINK_SID,
+            "--to", "personal", "--dry-run"))
+        self.assertIn("the one that died", out.splitlines()[0])
+        self.assertIn("resolved from the link", out)
+
+    def test_a_link_with_no_transcript_here_is_refused_and_names_the_file_it_wanted(self):
+        r = self.w.run("move", link_of(LINK_BARE), "--to", "personal", "--dry-run")
+        self.refused(r, "no transcript for that link here", LINK_SID,
+                     "session_" + LINK_BARE, "work", "personal")
+
+    def test_a_link_NEVER_matches_by_title_even_when_a_session_quotes_it(self):
+        """🛑 The sharp edge of falling through. A session whose own first prompt pasted the
+        link has the link IN ITS TITLE, so the title rung would answer "found it" with the
+        session that merely talks about the one you asked for — and then move that.
+
+        A spacesheep link is the form that really reached that rung: `URL_RE` does not
+        match it at all, so before the spec layer the ladder fell straight past the id
+        rungs to the title.
+        """
+        cwd = str(self.w.work)
+        sheep = "https://spacesheep.dev/sessions/claude-code/" + LINK_SID
+        decoy = "44444444-dddd-4ddd-8ddd-444444444444"
+        self.w.session(self.personal, decoy, lines=[
+            user("read " + sheep + " and tell me what it says", cwd, decoy)])
+        r = self.w.run("move", sheep, "--to", "work", "--dry-run")
+        self.refused(r, "no transcript for that link here", LINK_SID)
+        self.assertNotIn("read http", r.stdout + r.stderr)
+        # the same for the claude.ai spelling
+        link = link_of(LINK_BARE2)
+        self.w.session(self.personal, "55555555-eeee-4eee-8eee-555555555555", lines=[
+            user("look at " + link, cwd, "55555555-eeee-4eee-8eee-555555555555")])
+        self.refused(self.w.run("move", link, "--to", "work", "--dry-run"),
+                     "no transcript for that link here", LINK_SID2)
+
+    def test_a_link_still_resolves_through_a_bridge_session_line(self):
+        """The old rung, unchanged: a self-hosted session whose transcript names its link,
+        and whose derived id is not a file here."""
+        self.assertIn("refactor the parser",
+                      self.plan_to("https://claude.ai/code/session_01PickMeByLink99",
+                                   "personal"))
+
+    def test_a_link_resolves_through_a_live_registry_row_too(self):
+        cwd = str(self.w.work)
+        sid = "66666666-ffff-4fff-8fff-666666666666"
+        self.w.session(self.personal, sid, lines=[user("the live one", cwd, sid)])
+        self.w.live(self.personal, sid, self.w.spawn().pid, bridge="cse_" + LINK_BARE2)
+        self.assertIn("the live one", self.plan_for(link_of(LINK_BARE2)))
+
+    def test_stop_takes_a_link_too_and_says_csm_did_not_start_it(self):
+        """`stop`'s own authorisation is unchanged — but it has to get as far as checking
+        it, which before the spec layer a link to a dead child never did."""
+        self.dead_server_child()
+        self.refused(self.w.run("stop", link_of(LINK_BARE)), "csm did not start",
+                     LINK_SID[:8])
 
 
 # ------------------------------------------------------------------------- refusals
@@ -1658,10 +1777,89 @@ class CrossMachine(Base):
         self.assertIn("transcript file's last write", out)
         self.assertIn("one moved session is two rows", out)
 
-    def test_nothing_matching_is_not_an_error(self):
-        out = self.ok(self.csm("find", "no-such-session", "--on", "desktop"))
-        self.assertIn("no session on desktop matches", out)
-        self.assertNotIn("--from-machine", out)
+    def test_nothing_matching_exits_1_and_says_0_rows_is_not_proof(self):
+        """🛑 It used to exit 0 whatever it found, which reads as "asked and answered".
+
+        The exit code was verified unused before it was changed: nothing under
+        `flush-util` — the one installation that drives csm from scheduled passes — runs
+        `find` at all. A caller wanting rows counts `--json`, never the status.
+        """
+        r = self.csm("find", "no-such-session", "--on", "desktop")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("no session on desktop matches", r.stdout)
+        self.assertIn("0 rows is not proof", r.stdout)
+        self.assertIn("Paste its claude.ai link", r.stdout)
+        self.assertIn("--all", r.stdout)
+        self.assertNotIn("--from-machine", r.stdout)
+
+    def test_a_link_that_matches_nothing_says_which_FILE_it_wanted(self):
+        r = self.csm("find", link_of(LINK_BARE), "--on", "desktop")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn(LINK_SID, r.stdout)
+        self.assertIn("session_" + LINK_BARE, r.stdout)
+        self.assertNotIn("Paste its claude.ai link", r.stdout, "it already is one")
+
+    def test_a_json_find_with_no_rows_keeps_stdout_pure_json_and_exits_1(self):
+        r = self.csm("find", "no-such-session", "--on", "desktop", "--json")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual(json.loads(r.stdout), [])
+        self.assertIn("0 rows is not proof", r.stderr)
+
+    # --- a link, resolved by arithmetic, over there ------------------------
+    def dead_child_over_there(self, sid=LINK_SID, folder=None, lines=None):
+        """A session as a dead Remote Control child leaves it on the other machine: the
+        transcript's NAME is the only thing tying it to its claude.ai link."""
+        cwd = str(self.w.work)
+        d = self.remote / ".claude-yvb2" / "projects" / (folder or slug_of(cwd))
+        d.mkdir(parents=True, exist_ok=True)
+        (d / (sid + ".jsonl")).write_text(jl(*(lines or [
+            user("the one that died over there", cwd, sid),
+            assistant("working on it", cwd, sid)])))
+        (self.remote / ".claude-yvb2" / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "you@two.example",
+                              "organizationUuid": "org-two"}}))
+        return d / (sid + ".jsonl")
+
+    def test_find_resolves_a_dead_link_over_there_by_deriving_the_transcript_name(self):
+        t = self.dead_child_over_there()
+        os.utime(str(t), (time.time() - 90 * 86400,) * 2)    # past the 21-day window too
+        rows = self.rows(link_of(LINK_BARE), "--on", "desktop")
+        self.assertEqual([x["id"] for x in rows], [LINK_SID])
+        self.assertEqual(rows[0]["hit"], "url")
+        self.assertEqual(rows[0]["email"], "you@two.example")
+
+    def test_a_spacesheep_session_link_resolves_over_there_as_well(self):
+        self.dead_child_over_there()
+        rows = self.rows("https://spacesheep.dev/sessions/claude-code/" + LINK_SID,
+                         "--on", "desktop")
+        self.assertEqual([x["id"] for x in rows], [LINK_SID])
+
+    def test_find_resolves_a_LIVE_childs_link_through_the_registry_over_there(self):
+        """A running server child's transcript carries no bridge id at all, so before this
+        the helper could not match its link either — `find` failed for live sessions too."""
+        sid = "77777777-aaaa-4aaa-8aaa-777777777777"
+        self.dead_child_over_there(sid=sid, lines=[
+            user("the live child", str(self.w.work), sid)])
+        sess = self.remote / ".claude-yvb2" / "sessions"
+        sess.mkdir(exist_ok=True)
+        (sess / "4242.json").write_text(json.dumps(
+            {"pid": 4242, "sessionId": sid, "cwd": str(self.w.work),
+             "bridgeSessionId": "cse_" + LINK_BARE2, "status": "idle",
+             "entrypoint": "sdk-cli"}))
+        rows = self.rows(link_of(LINK_BARE2), "--on", "desktop")
+        self.assertEqual([x["id"] for x in rows], [sid])
+        self.assertEqual(rows[0]["bridge"], LINK_BARE2)
+
+    def test_find_resolves_a_link_through_a_bridge_status_url_over_there(self):
+        sid = "88888888-bbbb-4bbb-8bbb-888888888888"
+        self.dead_child_over_there(sid=sid, lines=[
+            user("the self-hosted one", str(self.w.work), sid),
+            {"type": "system", "subtype": "bridge_status", "sessionId": sid,
+             "content": "/remote-control is active · Continue here, on your phone",
+             "url": link_of(LINK_BARE2)}])
+        rows = self.rows(link_of(LINK_BARE2), "--on", "desktop")
+        self.assertEqual([x["id"] for x in rows], [sid])
+        self.assertEqual(rows[0]["bridge"], LINK_BARE2)
 
     def test_find_with_no_on_reads_this_machines_own_homes(self):
         cwd = str(self.w.work)
@@ -2063,6 +2261,46 @@ class RemoteHelper(unittest.TestCase):
                 os.kill(p["pid"], signal.SIGKILL)
             except OSError:
                 pass
+
+    def test_a_server_childs_owner_is_found_by_its_cse_id_and_not_by_the_local_uuid(self):
+        """🛑 IT FAILED IN THE DANGEROUS DIRECTION: "nothing is running there".
+
+        A Remote Control server's child runs `--print --sdk-url …/cse_X --session-id cse_X
+        --resume=<that url>` and names the local uuid NOWHERE (measured on CLI 2.1.312,
+        Wed 28 Oct 2026). `detail` matched on the local uuid alone, so it reported no owner
+        — and that is what `--stop-source`'s cross-machine refusal and the move note's
+        "still running on <origin>" clause both read, so a `--from-machine` move of a
+        session that was very much alive said the other machine was idle.
+        """
+        # 🛑 A MADE-UP BRIDGE ID, NOT ONE OF THE MEASURED PAIRS, and this test is the
+        # reason the rule exists: `detail` sweeps the WHOLE machine's `ps`, and the two
+        # measured ids in `LINK_BARE`/`LINK_BARE2` were read off this machine's own live
+        # registry — so the first draft of this test matched a real Remote Control worker
+        # (pid 91121) beside its fixture and the assertion failed. A fixture that names a
+        # real session reaches outside itself; `detail` only reads, but the next sweep that
+        # acts on an owner would not.
+        bare = "01FixtureOnlyNeverReal00"
+        sid = "4b4b4b4b-1111-5111-8111-111111111111"
+        url = "https://api.anthropic.com/v1/code/sessions/cse_" + bare
+        worker = subprocess.Popen([PY, "-c", "import time; time.sleep(40)", "--print",
+                                   "--sdk-url", url, "--session-id", "cse_" + bare,
+                                   "--resume=" + url])
+        # a DECOY: the bridge id in a path, not after a flag that means "this is my session"
+        decoy = subprocess.Popen([PY, "-c", "import time; time.sleep(40)",
+                                  "/x/logs/cse_" + bare + ".log"])
+        for p in (worker, decoy):
+            self.addCleanup(p.wait)        # cleanups run last in first out: kill, then wait
+            self.addCleanup(p.kill)
+        time.sleep(1.0)
+        t = self.dir / (sid + ".jsonl")
+        t.write_text('{"type":"user"}\n')
+        det = self.helper("detail", str(t), sid, bare)
+        self.assertEqual([o["pid"] for o in det["owners"]], [worker.pid])
+        # ...and without the bridge id it is still blind, which is what the third word fixes
+        self.assertEqual(self.helper("detail", str(t), sid)["owners"], [])
+        # a bridge id that is not this one must not match either
+        self.assertEqual(
+            self.helper("detail", str(t), sid, "01SomeOtherFixtureId000")["owners"], [])
 
     def test_the_mirror_copies_code_and_leaves_the_ignored_and_the_big_files(self):
         repo = self.dir / "repo"
@@ -3419,6 +3657,212 @@ class BridgeLine(InProc):
         info = self.mod.scan_transcript(s.transcript)
         self.assertEqual(info["bridge_id"], "01NewLink0123456")
 
+    #: The measured shape of a `/remote-control is active` line (CLI 2.1.312, Wed 28 Oct
+    #: 2026: 97 of the 1,935 transcripts in the config homes here carry one). `content` and
+    #: `url` both name the session; only `url` is machine-readable.
+    STATUS = {"type": "system", "subtype": "bridge_status", "sessionId": SID_A,
+              "isMeta": False, "isSidechain": False, "userType": "external",
+              "entrypoint": "cli", "version": "2.1.312",
+              "content": "/remote-control is active · Continue here, on your phone, or at "
+                         "https://claude.ai/code/session_01StatusLink0001",
+              "url": "https://claude.ai/code/session_01StatusLink0001"}
+
+    def test_a_bridge_status_url_is_a_bridge_id_source_too(self):
+        """🛑 The third place a transcript names its claude.ai session.
+
+        Without this, a self-hosted session whose one `bridge-session` line fell into the
+        unread middle of a long transcript had no claude.ai id at all — so its own link
+        could not find it, which is the whole point of resolving a link.
+        """
+        acct = self.account("work")
+        s = self.session(acct, lines=[user("go", str(self.root / "work"), SID_A),
+                                      self.STATUS])
+        self.assertEqual(self.mod.scan_transcript(s.transcript)["bridge_id"],
+                         "01StatusLink0001")
+
+    def test_an_explicit_bridge_session_line_wins_over_a_status_url(self):
+        """They name the same session; the line the CLI writes on purpose is the answer."""
+        acct = self.account("work")
+        line = {"type": "bridge-session", "sessionId": SID_A,
+                "bridgeSessionId": "cse_01TheRealOne001"}
+        s = self.session(acct, lines=[user("go", str(self.root / "work"), SID_A),
+                                      self.STATUS, line])
+        self.assertEqual(self.mod.scan_transcript(s.transcript)["bridge_id"],
+                         "01TheRealOne001")
+
+    def test_a_status_line_without_a_url_says_nothing(self):
+        acct = self.account("work")
+        bad = dict(self.STATUS)
+        bad.pop("url")
+        s = self.session(acct, lines=[user("go", str(self.root / "work"), SID_A), bad,
+                                      {"type": "system", "subtype": "other",
+                                       "url": "https://claude.ai/code/session_01Nope00001"}])
+        self.assertEqual(self.mod.scan_transcript(s.transcript)["bridge_id"], "")
+
+
+class DeriveId(InProc):
+    """🛑 A LINK NAMES ITS TRANSCRIPT BY ARITHMETIC, and these are the measured pairs.
+
+    This is the one fact the whole dead-session lookup rests on: with no process, no
+    registry row and no network, `uuid5(BRIDGE_NS, <the bridge session's api url>)` is the
+    name of the file on disk. See `LINK_BARE` above for why the pairs are written out.
+    """
+
+    PAIRS = ((LINK_BARE, LINK_SID), (LINK_BARE2, LINK_SID2))
+
+    def test_the_two_measured_pairs_derive_from_every_spelling(self):
+        for bare, want in self.PAIRS:
+            for form in ("cse_" + bare, "session_" + bare, link_of(bare),
+                         link_of(bare) + "?tab=files", link_of(bare) + "#top",
+                         "https://api.anthropic.com/v1/code/sessions/cse_" + bare,
+                         "  " + link_of(bare) + "  "):
+                self.assertEqual(self.mod.derive_local_id(form), want, form)
+                self.assertEqual(self.mod.bare_bridge_id(form), bare, form)
+
+    def test_a_derived_id_is_always_a_version_5_uuid(self):
+        """So it can never collide with a terminal session, which gets a random v4 id."""
+        for bare, want in self.PAIRS:
+            self.assertEqual(uuid.UUID(self.mod.derive_local_id("cse_" + bare)).version, 5)
+            self.assertEqual(uuid.UUID(want).version, 5)
+
+    def test_a_spacesheep_session_page_is_the_local_id_itself(self):
+        # measured Wed 28 Oct 2026: sessionpipe's claude-code session id IS the local id
+        self.assertEqual(
+            self.mod.derive_local_id(
+                "https://spacesheep.dev/sessions/claude-code/" + LINK_SID.upper()),
+            LINK_SID)
+        self.assertEqual(self.mod.bare_bridge_id(
+            "https://spacesheep.dev/sessions/claude-code/" + LINK_SID), "")
+
+    def test_nothing_that_is_not_a_link_derives_anything(self):
+        for spec in ("", "   ", "refactor the parser", "3", SID_A, SID_A[:8],
+                     "https://claude.ai/code/", "https://claude.ai/code/sessions",
+                     "cse-" + LINK_BARE, "session" + LINK_BARE,
+                     "https://spacesheep.dev/sessions/claude-code/not-a-uuid"):
+            self.assertEqual(self.mod.derive_local_id(spec), "", repr(spec))
+
+    def test_the_segment_must_be_the_WHOLE_segment(self):
+        """⚠️ Stricter than `URL_RE` on purpose: this output is a filename."""
+        self.assertEqual(self.mod.bare_bridge_id("x-session_" + LINK_BARE), "")
+        self.assertEqual(self.mod.bare_bridge_id("session_" + LINK_BARE + ".jsonl"), "")
+        self.assertEqual(self.mod.bare_bridge_id("/a/b/session_" + LINK_BARE + "/c"),
+                         LINK_BARE)
+
+    # --- the spec layer ---------------------------------------------------
+    def test_a_whole_local_id_is_pinned_and_is_not_a_link(self):
+        sp = self.mod.resolve_spec(SID_A.upper(), [])
+        self.assertEqual(sp.pin, SID_A)
+        self.assertFalse(sp.link)
+        self.assertEqual(self.mod.spec_notes(sp), [])
+
+    def test_a_spec_that_is_not_a_link_pays_nothing_for_any_of_this(self):
+        """🛑 The canary is only asked about a spec that was DERIVED. An ordinary `csm move
+        3` must not read a 290 MB bundle, glob for a file it did not compute, or leave a
+        cache behind — the resolution path is on every subcommand."""
+        a = self.account("work")
+        self.bundle(b"a build with no such namespace in it")
+        for spec in ("3", "refactor", SID_A, SID_A[:8], ""):
+            sp = self.mod.resolve_spec(spec, [a])
+            self.assertEqual(sp.canary, {}, spec)
+            self.assertFalse(sp.link, spec)
+        self.assertFalse(list(self.mod.STATE_DIR.glob("canary-*")),
+                         "nothing was derived, so nothing should have been checked")
+
+    def test_a_link_whose_transcript_is_here_pins_the_derived_id(self):
+        a = self.account("work")
+        self.session(a, sid=LINK_SID)
+        sp = self.mod.resolve_spec(link_of(LINK_BARE), [a])
+        self.assertTrue(sp.link)
+        self.assertEqual((sp.bare, sp.derived, sp.pin), (LINK_BARE, LINK_SID, LINK_SID))
+        self.assertEqual(sp.homes, ["work"])
+        self.assertIn("resolved from the link", " ".join(self.mod.spec_notes(sp)))
+
+    def test_a_link_whose_transcript_is_not_here_pins_nothing_but_stays_a_link(self):
+        a = self.account("work")
+        self.session(a, sid=SID_A)
+        sp = self.mod.resolve_spec(link_of(LINK_BARE), [a])
+        self.assertTrue(sp.link)
+        self.assertEqual(sp.derived, LINK_SID)
+        self.assertEqual(sp.pin, "")
+        self.assertEqual((sp.homes, sp.searched), ([], ["work"]))
+
+    def test_a_home_whose_projects_cannot_be_read_does_not_answer_for_the_others(self):
+        a = self.account("locked")
+        b = self.account("work", email="me@home.example")
+        self.session(b, sid=LINK_SID)
+        (a.home / "projects").chmod(0o000)
+        self.addCleanup(lambda: (a.home / "projects").chmod(0o700))
+        sp = self.mod.resolve_spec(link_of(LINK_BARE), [a, b])
+        self.assertEqual(sp.homes, ["work"])
+
+    # --- the version canary -----------------------------------------------
+    def bundle(self, body, version="9.9.9"):
+        """A stand-in CLI bundle at the path `cli_version` reads a version out of."""
+        p = self.root / "versions" / version
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(body)
+        p.chmod(0o755)
+        os.environ["CSM_CLAUDE"] = str(p)
+        self.addCleanup(os.environ.pop, "CSM_CLAUDE", None)
+        return p
+
+    def test_the_canary_finds_the_constant_across_a_chunk_boundary(self):
+        """⚠️ The needle sits at an offset the chunking cannot land on, so the overlap —
+        not luck — is what finds it."""
+        needle = self.mod.BRIDGE_NS.encode()
+        self.bundle(b"a" * 60 + needle + b"b" * 500)
+        self.mod.CANARY_CHUNK = 1          # floored at 2x the needle inside `canary`
+        c = self.mod.canary()
+        self.assertIs(c["ok"], True)
+        self.assertEqual(c["version"], "9.9.9")
+        self.assertIn("1 occurrence", c["why"])
+
+    def test_the_verdict_is_cached_per_version_and_0600(self):
+        p = self.bundle(b"x" * 100 + self.mod.BRIDGE_NS.encode())
+        self.assertIs(self.mod.canary()["ok"], True)
+        cache = self.mod.canary_path("9.9.9")
+        self.assertTrue(cache.exists())
+        self.assertEqual(stat.S_IMODE(cache.stat().st_mode), 0o600)
+        # 🛑 THE CACHE IS WHAT ANSWERS THE SECOND TIME, and this is how that is proved:
+        # the bundle becomes unreadable, so a rescan could only say "could not look", while
+        # the cached verdict (keyed on path, size and mtime, all still readable) stands.
+        p.chmod(0o000)
+        self.addCleanup(p.chmod, 0o755)
+        self.assertIs(self.mod.canary()["ok"], True)
+
+    def test_an_upgrade_invalidates_the_cache(self):
+        p = self.bundle(b"x" * 100 + self.mod.BRIDGE_NS.encode())
+        self.assertIs(self.mod.canary()["ok"], True)
+        p.write_bytes(b"a new build that does not derive ids this way")
+        os.utime(str(p), (time.time() + 5, time.time() + 5))
+        c = self.mod.canary()
+        self.assertIs(c["ok"], False)
+        self.assertIn("is NOT in", c["why"])
+
+    def test_a_bundle_nothing_can_read_is_unknown_and_never_a_pass(self):
+        p = self.bundle(b"x" * 100 + self.mod.BRIDGE_NS.encode())
+        p.chmod(0o000)
+        self.addCleanup(p.chmod, 0o755)
+        c = self.mod.canary()
+        self.assertIsNone(c["ok"], "could not look is not ok")
+        self.assertIn("could not be read", c["why"])
+
+    def test_no_claude_at_all_is_unknown_and_says_where_it_looked(self):
+        os.environ["CSM_CLAUDE"] = str(self.root / "nope" / "claude")
+        self.addCleanup(os.environ.pop, "CSM_CLAUDE", None)
+        c = self.mod.canary()
+        self.assertIsNone(c["ok"])
+        self.assertTrue(c["why"], c)
+
+    def test_an_unverified_derivation_is_said_out_loud(self):
+        a = self.account("work")
+        self.session(a, sid=LINK_SID)
+        self.bundle(b"a build with no such namespace in it")
+        sp = self.mod.resolve_spec(link_of(LINK_BARE), [a])
+        notes = " ".join(self.mod.spec_notes(sp))
+        self.assertIn("derivation unverified for CLI 9.9.9", notes)
+        self.assertIn("resolved from the link", notes, "and it still resolves")
+
 
 class SoftPick(InProc):
     def rows(self):
@@ -3481,6 +3925,114 @@ class TranscriptFacts(Base):
                  {"type": "tool_use", "name": "mcp__local_notes__add", "input": {}}]}}])
         self.assertEqual(self.listing()[0]["mcp_servers"],
                          ["claude_ai_Gmail", "local_notes"])
+
+
+class QuotaShapes(InProc):
+    """🛑 TWO SHAPES OF ONE STOP, and the second read as a clean finish.
+
+    Measured on this machine, CLI 2.1.312, Wed 28 Oct 2026: of 44 assistant quota-stop
+    lines in the config homes here, 34 carry an `apiError` and 10 carry none at all — only
+    `isApiErrorMessage: true`, `error: "rate_limit"`, `apiErrorStatus: 429` and a top-level
+    `quotaLimits` ({status: "rejected", resetsAt, rateLimitType}). Those landed in the
+    clean-assistant-line branch, so csm reported the session as FINISHED and `quota` stayed
+    empty — on roughly a quarter of the real stops on this machine. Every answer that keys
+    on "why did it stop" is wrong for those, which is why both shapes are pinned here and
+    not merely one.
+    """
+
+    def quota_of(self, *lines):
+        a = self.account("work")
+        s = self.session(a, lines=list(lines))
+        return self.mod.scan_transcript(s.transcript)
+
+    def stop(self, shape, resets=None, kind="five_hour", text="You've hit your limit"):
+        cwd = str(self.root / "work")
+        return assistant(text, cwd, SID_A, error="usage_limit_reached", resets=resets,
+                         kind=kind, shape=shape)
+
+    def go(self):
+        return user("go", str(self.root / "work"), SID_A)
+
+    def clean(self, text="answering again"):
+        return assistant(text, str(self.root / "work"), SID_A)
+
+    def test_both_shapes_are_read_as_a_quota_stop(self):
+        future = time.time() + 3600
+        for shape in ("apiError", "rate_limit"):
+            q = self.quota_of(self.go(), self.stop(shape, resets=future))["quota"]
+            self.assertTrue(q, shape)
+            self.assertEqual(q["kind"], "five_hour", shape)
+            self.assertAlmostEqual(q["resets_at"], future, delta=1, msg=shape)
+            self.assertIn("hit your limit", q["message"], shape)
+
+    def test_the_no_apiError_shape_names_its_own_error(self):
+        q = self.quota_of(self.go(), self.stop("rate_limit", resets=time.time() + 60))
+        self.assertEqual(q["quota"]["error"], "rate_limit")
+        self.assertEqual(
+            self.quota_of(self.go(), self.stop("apiError", resets=time.time() + 60))
+            ["quota"]["error"], "usage_limit_reached")
+
+    def test_the_window_falls_back_to_quotaLimits_rateLimitType(self):
+        """The word a caller keys on to say whether WAITING clears the stop at all: a
+        five-hour or weekly limit resets, a monthly spend cap does not."""
+        for kind in ("five_hour", "seven_day"):
+            q = self.quota_of(self.go(), self.stop("rate_limit", resets=time.time() + 60,
+                                                   kind=kind))
+            self.assertEqual(q["quota"]["kind"], kind)
+
+    def test_a_reset_in_unix_SECONDS_is_read_as_well_as_milliseconds(self):
+        # the measured no-apiError lines carry plain unix seconds (1789362000)
+        secs = int(time.time() + 7200)
+        q = self.quota_of(self.go(), self.stop("rate_limit", resets=secs))
+        self.assertAlmostEqual(q["quota"]["resets_at"], secs, delta=1)
+        q = self.quota_of(self.go(), self.stop("rate_limit", resets=secs * 1000))
+        self.assertAlmostEqual(q["quota"]["resets_at"], secs, delta=1)
+
+    def test_a_stop_line_is_not_a_clean_assistant_line_in_either_shape(self):
+        """🛑 The second half of the bug, and the subtler one. A stop line that fell into
+        the clean branch also set `assistant_idx`, which is what the in-force heuristic
+        compares against — so a GENUINE limit earlier in the tail was read as waited out
+        because the limit line after it counted as the session answering again.
+        """
+        past = time.time() - 7200
+        for shape in ("apiError", "rate_limit"):
+            q = self.quota_of(self.go(), self.stop(shape, resets=past))["quota"]
+            self.assertTrue(q, "%s: the last line is the stop, so it is still waiting"
+                            % shape)
+        # two stops in a row: the second must not cancel the first either
+        q = self.quota_of(self.go(), self.stop("apiError", resets=past),
+                          self.stop("rate_limit", resets=past))["quota"]
+        self.assertTrue(q)
+
+    def test_a_limit_that_was_waited_out_is_still_not_flagged(self):
+        """The existing heuristic, unchanged: a transcript records every limit it ever hit."""
+        for shape in ("apiError", "rate_limit"):
+            info = self.quota_of(self.go(), self.stop(shape, resets=time.time() - 7200),
+                                 self.clean())
+            self.assertEqual(info["quota"], {}, shape)
+            self.assertEqual(info["model"], "claude-sonnet-4-5", shape)
+
+    def test_an_ordinary_assistant_line_is_still_clean(self):
+        info = self.quota_of(self.go(), self.clean())
+        self.assertEqual(info["quota"], {})
+        self.assertEqual(info["model"], "claude-sonnet-4-5")
+
+    def test_error_alone_is_not_this_line(self):
+        """⚠️ BOTH KEYS, TOGETHER. `isApiErrorMessage` without `error: "rate_limit"`, or the
+        word on its own, is some other line — and reading either as a quota stop would put
+        "out of quota" on sessions that are not."""
+        cwd = str(self.root / "work")
+        just_flag = assistant("something failed", cwd, SID_A)
+        just_flag["isApiErrorMessage"] = True
+        just_word = assistant("something failed", cwd, SID_A)
+        just_word["error"] = "rate_limit"
+        for line in (just_flag, just_word):
+            self.assertEqual(self.quota_of(self.go(), line)["quota"], {})
+
+    def test_a_sidechain_stop_is_not_the_session_stopping(self):
+        line = self.stop("rate_limit", resets=time.time() + 60)
+        line["isSidechain"] = True
+        self.assertEqual(self.quota_of(self.go(), self.clean(), line)["quota"], {})
 
 
 # -------------------------------------------------------- what the move says it will cost
@@ -5937,6 +6489,8 @@ class FullIdPin(Base):
         cwd = str(self.w.work)
         self.w.session(self.work, SID_A, lines=[user("ancient", cwd, SID_A)],
                        mtime=time.time() - 60 * 86400)
+        self.w.session(self.work, LINK_SID, mtime=time.time() - 60 * 86400,
+                       lines=[user("ancient link", cwd, LINK_SID)])
         for n in range(self.NEWER):
             sid = "%08d-dddd-4ddd-8ddd-dddddddddddd" % n
             self.w.session(self.work, sid, lines=[user("newer %d" % n, cwd, sid)])
@@ -5945,6 +6499,18 @@ class FullIdPin(Base):
         out = self.ok(self.w.run("move", SID_A, "--to", "personal", "--dry-run"))
         self.assertIn(SID_A, out)
         self.assertIn("ancient", out)
+
+    def test_a_link_past_the_window_is_pinned_by_the_id_it_derives(self):
+        """🛑 The pin is the whole reason the derivation runs at the SPEC layer and not
+        inside `pick`: only a WHOLE id survives the listing's age cap, and a link is not
+        one until it has been derived. A session reached by its link is typically the
+        oldest file in the home — it stopped days ago, which is why anyone is looking.
+        """
+        out = self.ok(self.w.run("move", link_of(LINK_BARE), "--to", "personal",
+                                 "--dry-run"))
+        self.assertIn(LINK_SID, out)
+        self.assertIn("ancient link", out)
+        self.assertIn("resolved from the link", out)
 
     def test_a_prefix_of_that_id_is_deliberately_not_pinned(self):
         # ⚠️ not `SID_A[:8]`: an all-digit spec is a ROW NUMBER, a different refusal.

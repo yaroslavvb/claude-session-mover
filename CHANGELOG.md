@@ -11,21 +11,91 @@ the tool depends on.
 
 ## [Unreleased]
 
-Towards `csm revive`: resolution that reaches a session nothing is running, a stop reason that
-is right for all of them, and now the diagnosis those two make possible — `csm revive <link>
---dry-run`, which says why a session stopped, what bringing it back would do, and the one risk
-in doing it. It still **starts nothing**: the actions are the next milestone. Everything here
-is measured against Claude Code **2.1.312** on macOS (Wed 28 Oct 2026) — a newer version than
-the 2.1.296–2.1.300 the rest of this file was written against.
+`csm revive`: resolution that reaches a session nothing is running, a stop reason that is right
+for all of them, the diagnosis those two make possible, and now **the actions** — wake it,
+resume it in place, fork it onto a new link, move it to another account, or print the one thing
+to tap. Everything here is measured against Claude Code **2.1.312** on macOS (Wed 28 Oct 2026)
+— a newer version than the 2.1.296–2.1.300 the rest of this file was written against.
 
 ### Added
+
+- **`csm revive SESSION` acts.** It takes the first row of the decide table that matches, and
+  whatever that row is, the session comes up (or is found) as an ordinary **idle** process with
+  no prompt of its own and the note is then **relayed** to it. Exit `0` means it took a turn
+  (or that there was nothing to do, or that the one thing to tap was printed), `1` that
+  something is up and nothing proved it read the note, `2` that nothing was started at all.
+  - **Row 5, wake**: it is up and idle, so nothing is started — the note is relayed into it.
+  - **Rows 7 and 8, resume in place**: `claude --resume <id> --remote-control=<label>` in
+    `moved-<id8>`, in the session's own home. For a self-hosted session the **link is the
+    proof**: it re-attaches its own claude.ai session, so a NEW link means nothing re-attached
+    and the note is *not* sent, because the sentence it carries ("the link you had still opens
+    this conversation") would be false. A terminal session gets a new link and is told so.
+  - **Row 6, move**: `do_move` unchanged — its copy, its own `isMeta` move note into the copy,
+    its window, its link, its printed cost — and then the revive note relayed into the copy.
+  - **Row 9, keep-link**: a dead server child cannot be resumed onto its own link, so the one
+    tap is printed (open the link; its server respawns the child, idle) and **nothing is
+    started and nothing is waited for**.
+  - **Row 10, fork** (`--new-link`): `--resume <old> --fork-session --session-id <new uuid4>`,
+    in `moved-<new8>`. csm chooses the id, which is what makes the window name, `preflight`
+    and `csm stop`'s authorisation work on a forked session at all; bare `--fork-session`
+    mints an id csm never learns. The old transcript is left byte-identical, and the old link
+    is reported loudly: it still opens the OLD copy.
+- **The relay, and it is the only carrier.** `claude -p --model <CSM_RELAY_MODEL, haiku>
+  --permission-mode bypassPermissions --name "csm revive (<machine>)" --output-format json`,
+  run under the target session's own config home with the environment scrubbed, stdin closed,
+  in a folder of csm's own under the state dir, bounded by `CSM_RELAY_TIMEOUT_S` — instructed
+  to call its SendMessage tool **once**, to that session's registry `name`, with the note
+  verbatim between two marker lines.
+  - 🛑 **Nothing is ever written into a transcript by a revive, and no positional prompt is
+    ever passed.** Measured in a spike (2.1.312, Wed 28 Oct 2026): a positional prompt is
+    recorded as the user's own typing (`origin: {kind: "human"}, promptSource: "typed"`)
+    whatever its text says, while a relayed message is recorded for what it is —
+    `isMeta: true, turnOrigin: "peer", origin: {kind: "peer", name: "csm revive (<machine>)",
+    fromMode: "bypass", verifiedPeerPid, msg_id}` — and the app shows it as a message from
+    that sender. The `isMeta`-line-plus-`--reply-on-resume` alternative was measured too and
+    rejected: it writes into a transcript, and for a fork it would have to write into the
+    *old* one, where a later lazy respawn of the old link could pick it up as an interrupted
+    turn. (A hand-rolled frame to the session's own peer socket is *held* for a person on a
+    bypassPermissions session, so the relay goes through Claude Code's own tool or not at all.)
+  - **The proof is a turn, never a link**: the registry row going `busy`, or an `assistant`
+    line past the byte offset taken *before* the relay (`continued_past`, written in
+    `appended_mode`'s shape), within `CSM_REVIVE_PROVE_S`. A relay that reports success and
+    sends nothing is exit 1, because the proof is the session's own behaviour and not the
+    relay's word for it.
+- **At most one revive of one session at a time**, held from the diagnosis to the start:
+  `state_lock`'s own lock-directory shape (including its 120 s stale break, so a killed revive
+  does not wedge the session), keyed on the local id. And because a lazy respawn has the *same*
+  local id before and after, the liveness check is **re-run in the last second before anything
+  starts**: every home's registry and the machine-wide `ps` sweep, through `revive_state`, so a
+  child that appeared while csm was deciding is a refusal rather than a second writer.
+- **`<STATE_DIR>/revive.jsonl`** (0600), one JSON record per revive, plus one `CSM_LOG` line:
+  the at-most-once triple (local id, bridge id, transcript size at diagnosis), the row, the
+  action, what was started, what was proved and the exit code. 🛑 Never the note — that is
+  conversation text, and this file is a record of what ran.
+- **Knobs**: `CSM_RELAY_MODEL` (`haiku`), `CSM_RELAY_TIMEOUT_S` (120 s), `CSM_RELAY_NAME`
+  (`csm revive ({machine})`), `CSM_REVIVE_PROVE_S` (90 s), `CSM_REVIVE_LOG`.
+- **The external-imports dialog** — "Allow external CLAUDE.md file imports?" — is in `PROMPTS`,
+  answered with its focused default, **No**. Measured out of the 2.1.312 bundle:
+  `confirmLabel: "Yes, allow external imports", cancelLabel: "No, disable external imports",
+  hideIndexes: true, cancelFirst`, and answering it writes
+  `hasClaudeMdExternalIncludesApproved` into that home's state file for the project, for good.
+  Approving a CLAUDE.md to import files from outside its own working directory is consent only
+  the person can give, so csm declines — and it answers at all only because the dialog *blocks*
+  an interactive start, which would otherwise make a revive that did nothing. ⚠️ The revived
+  session therefore comes up without those imports, which matters in a folder whose doctrine
+  lives in an imported file.
+- **Optional plan keys** `session_id`, `fork_session` and `revive_of`, with the plan `version`
+  left at **1**: `run_window` reads every field but `kind` and `local_id` with `.get`, so a
+  reflexive bump would refuse a plan already on disk from a move that is still starting. A
+  `--session-id` is emitted only beside `--fork-session` and only for a whole uuid, because the
+  CLI refuses the pair otherwise.
 
 - **`csm revive SESSION --dry-run`: the diagnosis, the plan and the note.** One record about
   one session, printed as a three-line answer (what stopped it and when · what revive would do
   · the one risk), then the detail, then the row of the decide table it would take and the note
   it would send. `--json` carries the record, the decision and the note. It is read-only and
-  offline: it starts nothing, signals nothing and writes nothing, and without `--dry-run` it
-  refuses rather than print a plan that could be read as work done.
+  offline: it starts nothing, signals nothing and writes nothing — and it is built by the same
+  function the real run uses, so what the plan says is what the run carries out.
   - **What kind of session it is, proved rather than guessed.** A Remote Control *server
     child*'s local id *is* `uuid5` of its bridge session's api url, so a bare bridge id from
     the link, from its registry row or from an orphan `~/.claude/bridge-spawn/cse_X-*`

@@ -5212,11 +5212,23 @@ class ReviveNoteText(InProc):
         self.assertIn(str(self.mod.REVIVE_SAY_MAX), str(e.exception))
 
     def test_a_fork_says_loudly_that_the_old_link_opens_the_old_copy(self):
-        n = self.note("fork", new_id=SID_B)
+        """🛑 AND ONLY WHERE THERE IS AN OLD LINK. `--new-link` forks a dead TERMINAL
+        session too (row 11), and that session never had a claude.ai link — so the sentence
+        that is right for a server child would be false in its note.
+        """
+        n = self.note("fork", new_id=SID_B,
+                      over={"session": {"short": self.s.short, "title": "t",
+                                        "url": link_of(LINK_BARE)}})
         self.assertIn("csm FORKED it: this copy is %s, forked from %s"
                       % (SID_B[:8], self.s.short), n)
         self.assertIn("The old link still opens the OLD copy", n)
         self.assertIn("do not type there, and archive it", n)
+        # the same action on a session with no link of its own (`rec`'s own `url` is ""):
+        # the old COPY, and not one word about a link that never existed
+        n = self.note("fork", new_id=SID_B)
+        self.assertIn("csm FORKED it: this copy is %s" % SID_B[:8], n)
+        self.assertIn("had no claude.ai link of its own", n)
+        self.assertNotIn("The old link still opens", n)
 
     def test_a_wake_says_nothing_was_restarted(self):
         n = self.note("wake")
@@ -5338,9 +5350,16 @@ class ReviveDryRun(Base):
                               lines=lines if lines is not None
                               else [self.go(sid), self.clean(sid)])
 
-    def live(self, sid=SID_A, status="idle", lines=None):
+    def live(self, sid=SID_A, status="idle", lines=None, mode=""):
+        """A transcript plus a live, provable registry row.
+
+        `mode` puts a real `--permission-mode` on that process's own command line — which is
+        where the mode a RUNNING session is in is measured from (`launch_mode`, the same
+        reading `csm modes` takes), and what a row that starts nothing has to report.
+        """
         self.dead(sid, lines)
-        p = self.w.spawn()
+        p = (self.w.spawn(argv_tail=("--resume", sid, "--permission-mode", mode))
+             if mode else self.w.spawn())
         self.w.live(self.work, sid, p.pid, cwd=self.cwd, status=status)
         return p
 
@@ -5579,6 +5598,122 @@ class ReviveDryRun(Base):
         self.assertIn("The old link still opens the OLD copy", note)
         self.assertIn("csm FORKED it", self.ok(self.revive(link_of(LINK_BARE),
                                                            "--new-link")))
+
+    def test_row_11_new_link_FORKS_a_dead_self_hosted_session(self):
+        """🛑 MEASURED LIVE ON CLI 2.1.312, Wed 28 Oct 2026: `csm revive <dead self-hosted
+        session> --new-link --dry-run` took row 7 — "resume it in place, on the same
+        claude.ai link" — with no mention of the flag at all, because `new_link` was read
+        only at the row-9/row-10 split. `--new-link` means a fresh copy on a new link.
+        """
+        self.dead(lines=[self.go(), self.clean(), BRIDGE_LINE])
+        self.assertEqual(self.row_of(SID_A)["row"], 7, "without the flag it resumes")
+        dec = self.row_of(SID_A, "--new-link")
+        self.assertEqual((dec["row"], dec["action"], dec["exit"]), (11, "fork", 0))
+        self.assertIn("FORK it onto a NEW claude.ai link", dec["what"])
+        self.assertIn("still opens the OLD copy", dec["risk"])
+        self.assertEqual(dec["dropped"], "", "the flag IS carried out here")
+        self.assertTrue(dec["note"])
+        note = self.rec(SID_A, "--new-link")["note"]
+        self.assertIn("csm FORKED it", note)
+        self.assertIn("The old link still opens the OLD copy", note)
+        out = self.ok(self.revive(SID_A, "--new-link"))
+        self.assertIn("decide       row 11 — fork", out)
+
+    def test_row_11_forks_a_dead_terminal_session_and_invents_no_old_link(self):
+        """A terminal session never had a claude.ai link, so the sentence a server child's
+        fork needs — "the old link still opens the OLD copy" — would be false in its note."""
+        self.dead()
+        self.assertEqual(self.row_of(SID_A)["row"], 8, "without the flag it resumes")
+        dec = self.row_of(SID_A, "--new-link")
+        self.assertEqual((dec["row"], dec["action"]), (11, "fork"))
+        self.assertIn("left byte-identical", dec["what"])
+        self.assertIn("SECOND conversation", dec["risk"])
+        note = self.rec(SID_A, "--new-link")["note"]
+        self.assertIn("csm FORKED it", note)
+        self.assertIn("had no claude.ai link of its own", note)
+        self.assertNotIn("The old link still opens", note)
+
+    def test_new_link_on_a_row_that_forks_nothing_says_it_was_NOT_carried_out(self):
+        """🛑 A FLAG THAT WAS NOT CARRIED OUT SAYS SO — on the live rows and on a refusal,
+        not only on the two rows `dropped` used to be called for."""
+        self.live(status="idle")                                       # row 5
+        dec = self.row_of(SID_A, "--new-link")
+        self.assertEqual(dec["row"], 5)
+        self.assertIn("NOT carry out --new-link", dec["dropped"])
+        self.assertIn("live writer", dec["dropped"])
+        self.assertIn("NOT carry out --new-link", dec["what"])
+        self.live(sid=SID_B, status="busy")                            # row 3
+        dec = self.row_of(SID_B, "--new-link")
+        self.assertEqual(dec["row"], 3)
+        self.assertIn("NOT carry out --new-link", dec["what"])
+        # and a refusal: a transcript with no conversation in it
+        self.dead(sid=SID_C, lines=[{"type": "custom-title", "customTitle": "pre-made"}])
+        dec = self.row_of(SID_C, "--new-link")
+        self.assertEqual((dec["row"], dec["action"]), (2, "refuse"))
+        self.assertIn("NOT carry out --new-link: nothing is started on this row",
+                      dec["what"])
+
+    # --- the mode a row that starts nothing LEAVES ALONE -------------------
+    def test_row_5_reports_the_mode_the_wake_LEAVES_ALONE_not_the_one_asked_for(self):
+        """🛑 MEASURED LIVE ON CLI 2.1.312, Wed 28 Oct 2026: a session running
+        `--permission-mode bypassPermissions`, woken with `--permission-mode plan`, was
+        reported as `mode plan (from --permission-mode)` while it went on running in bypass
+        — the UNSAFE direction. A wake starts no process, so no mode is applied to anything.
+        """
+        self.live(status="idle", mode="bypassPermissions",
+                  lines=[user("run the campaign", self.cwd, SID_A, perm="auto", uuid="u1"),
+                         self.clean()])
+        got = self.rec(SID_A, "--permission-mode", "plan")
+        self.assertEqual(got["decision"]["row"], 5)
+        self.assertEqual(got["record"]["state"]["mode_launched"], "bypassPermissions")
+        # the mode REPORTED is the one it is in, and the weaker recorded `auto` — what a
+        # Remote Control worker records by accident — does not outrank the argv
+        self.assertEqual(got["mode"]["mode"], "bypassPermissions")
+        self.assertIs(got["mode"]["applied"], False)
+        self.assertIn("unchanged: a wake starts nothing", got["mode"]["why"])
+        self.assertIn("its command line says --permission-mode bypassPermissions",
+                      got["mode"]["why"])
+        self.assertIn("its transcript last recorded auto", got["mode"]["why"])
+        self.assertNotIn("from --permission-mode", json.dumps(got["mode"]))
+        # and the flag is reported as NOT carried out, in the sentence a person reads
+        self.assertIn("NOT put it in plan", got["decision"]["what"])
+        out = self.ok(self.revive(SID_A, "--permission-mode", "plan"))
+        self.assertIn("mode         bypassPermissions (unchanged: a wake starts nothing",
+                      out)
+        self.assertNotIn("mode         plan", out)
+
+    def test_a_mode_nothing_could_measure_is_unknown_and_never_a_guess(self):
+        """Row 9 starts nothing either, and a dead session has no command line to read: so
+        the line says `unknown` with the reason, and never `default`."""
+        self.w.session(self.work, LINK_SID, cwd=self.cwd,
+                       lines=[self.go(LINK_SID), self.clean(LINK_SID)])
+        got = self.rec(link_of(LINK_BARE), "--permission-mode", "bypassPermissions")
+        self.assertEqual(got["decision"]["row"], 9)
+        self.assertEqual(got["mode"]["mode"], "")
+        self.assertIs(got["mode"]["applied"], False)
+        self.assertIn("nothing here records what mode it is in", got["mode"]["why"])
+        self.assertIn("NOT put it in bypassPermissions", got["decision"]["what"])
+        out = self.ok(self.revive(link_of(LINK_BARE), "--permission-mode",
+                                  "bypassPermissions"))
+        self.assertIn("mode         unknown (unchanged: this row starts nothing", out)
+
+    def test_the_mode_IS_the_one_asked_for_on_a_row_that_starts_a_process(self):
+        """The other half of the same contract: where csm really starts the session, the
+        mode is the one it will be started in and `applied` says so."""
+        self.dead(lines=[self.go(), self.clean(), BRIDGE_LINE])
+        got = self.rec(SID_A, "--permission-mode", "plan")
+        self.assertEqual(got["decision"]["row"], 7)
+        self.assertEqual((got["mode"]["mode"], got["mode"]["why"]),
+                         ("plan", "from --permission-mode"))
+        self.assertIs(got["mode"]["applied"], True)
+        self.assertEqual(got["decision"]["dropped"], "")
+
+    def test_a_permission_mode_typo_is_refused_on_a_row_that_starts_nothing_too(self):
+        """A flag is either wrong or it is not; which row the session happens to take is not
+        what decides (`check_say`'s own rule, now `--permission-mode`'s as well)."""
+        self.live(status="busy")
+        self.refused(self.revive(SID_A, "--permission-mode", "sideways"),
+                     "sideways", "not a permission mode")
 
     # --- the flags --------------------------------------------------------
     def test_the_say_text_is_quoted_into_the_note_and_a_command_is_refused(self):
@@ -5867,10 +6002,15 @@ class ReviveRun(Base):
                               lines=lines if lines is not None
                               else [self.go(sid), self.clean(sid)])
 
-    def alive(self, sid=SID_A, status="idle", lines=None, name="rc-name"):
-        """A session with a transcript AND a live, provable registry row."""
+    def alive(self, sid=SID_A, status="idle", lines=None, name="rc-name", mode=""):
+        """A session with a transcript AND a live, provable registry row.
+
+        `mode` puts a real `--permission-mode` on that process's own command line, which is
+        the only measurement of the mode a running session is in.
+        """
         t = self.dead(sid, lines)
-        p = self.w.spawn()
+        p = (self.w.spawn(argv_tail=("--resume", sid, "--permission-mode", mode))
+             if mode else self.w.spawn())
         self.w.live(self.work, sid, p.pid, cwd=self.cwd, status=status, name=name)
         return t, p
 
@@ -5920,6 +6060,29 @@ class ReviveWake(ReviveRun):
         self.assertIn(("user", "peer"), kinds)
         self.assertEqual(kinds[-1][0], "assistant")
         self.assertGreater(t.stat().st_size, before)
+
+    def test_a_real_wake_reports_the_mode_it_is_RUNNING_in_and_applies_none(self):
+        """🛑 MEASURED LIVE ON CLI 2.1.312, Wed 28 Oct 2026: a session running
+        `--permission-mode bypassPermissions`, woken with `--permission-mode plan`, was
+        reported as `mode plan (from --permission-mode)` while it kept running in bypass.
+        A wake starts no process, so the only honest line is what it is already in — and the
+        flag that was not carried out says so.
+        """
+        self.alive(mode="bypassPermissions")
+        got, r = self.rec(SID_A, "--permission-mode", "plan")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(got["decision"]["row"], 5)
+        self.assertEqual(got["mode"]["mode"], "bypassPermissions")
+        self.assertIs(got["mode"]["applied"], False)
+        self.assertIn("unchanged: a wake starts nothing", got["mode"]["why"])
+        self.assertIn("NOT put it in plan", got["decision"]["what"])
+        # nothing was started at all, so no process got any `--permission-mode` but the
+        # relay's own measured one
+        self.assertEqual([c for c in self.w.claude_calls() if "--resume" in c["argv"]], [])
+        relay = [c for c in self.w.claude_calls() if "-p" in c["argv"]][0]["argv"]
+        self.assertEqual(relay[relay.index("--permission-mode") + 1], "bypassPermissions")
+        self.assertIn("mode         bypassPermissions (unchanged: a wake starts nothing",
+                      r.stderr)
 
     def test_the_relay_is_the_measured_command_line_in_the_sessions_own_home(self):
         self.alive()
@@ -6319,6 +6482,73 @@ class ReviveFork(ReviveRun):
         self.ok(r)
         self.assertIn("keep-link", r.stdout)
         self.assertNothingStarted(r)
+
+
+class ReviveForkOnNewLink(ReviveRun):
+    """Row 11: `--new-link` on a dead session that is NOT a server child — a fresh copy.
+
+    🛑 MEASURED LIVE ON CLI 2.1.312, Wed 28 Oct 2026: `csm revive <dead self-hosted session>
+    --new-link --dry-run` took row 7 — "resume it in place, on the same claude.ai link" —
+    and said nothing about the flag, because `new_link` was read only at the row-9/row-10
+    split and `dropped` named only `--to` and `--say`. The mechanics are row 10's, because
+    they are one function: `--fork-session` with an id csm chose, a window named for the new
+    id, the old file left byte-identical, and the loud warning afterwards.
+    """
+
+    def test_new_link_forks_a_dead_self_hosted_session_onto_a_new_id(self):
+        old = self.dead(lines=[self.go(), self.clean(), BRIDGE_LINE])
+        before = old.read_bytes()
+        got, r = self.rec(SID_A, "--new-link")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res, new = got["result"], got["result"]["new_id"]
+        self.assertEqual((got["decision"]["row"], got["decision"]["action"]),
+                         (11, "fork"))
+        self.assertNotEqual(new, SID_A)
+        self.assertEqual(old.read_bytes(), before, "the old transcript is never touched")
+        self.assertEqual(Path(res["fork_file"]).name, new + ".jsonl")
+        self.assertEqual(self.w.windows().get("csm-work"), ["moved-" + new[:8]])
+        argv = [c for c in self.w.claude_calls() if "--resume" in c["argv"]][0]["argv"]
+        self.assertIn("--fork-session", argv)
+        self.assertEqual(argv[argv.index("--session-id") + 1], new)
+        self.assertEqual(argv[-2:], ["--resume", SID_A])
+        # the note and the warning both name the link it had, which still opens the old copy
+        self.assertIn("The old link still opens the OLD copy",
+                      self.w.relay_calls()[0]["note"])
+        self.assertIn("🛑 OLD LINK", r.stderr)
+        self.assertIn("https://claude.ai/code/session_01SelfHosted00001", r.stderr)
+
+    def test_a_forked_terminal_session_warns_about_the_old_COPY_and_names_no_link(self):
+        """A terminal session never had a claude.ai link: the old-link sentence would be
+        false, and inventing one is what row 9 refuses to do."""
+        old = self.dead()
+        before = old.read_bytes()
+        got, r = self.rec(SID_A, "--new-link")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(got["decision"]["row"], 11)
+        self.assertEqual(old.read_bytes(), before)
+        self.assertIn("🛑 OLD COPY", r.stderr)
+        self.assertNotIn("🛑 OLD LINK", r.stderr)
+        note = self.w.relay_calls()[0]["note"]
+        self.assertIn("had no claude.ai link of its own", note)
+        self.assertNotIn("The old link still opens", note)
+
+    def test_the_mode_asked_for_reaches_a_forked_window(self):
+        """Row 11 starts a process, so `--permission-mode` IS applied here — the other half
+        of the wake's contract."""
+        self.dead(lines=[self.go(), self.clean(), BRIDGE_LINE])
+        got, r = self.rec(SID_A, "--new-link", "--permission-mode", "acceptEdits")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIs(got["mode"]["applied"], True)
+        self.assertEqual(got["mode"]["mode"], "acceptEdits")
+        argv = [c for c in self.w.claude_calls() if "--resume" in c["argv"]][0]["argv"]
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "acceptEdits")
+
+    def test_stop_ends_the_window_by_the_forks_new_id(self):
+        self.dead(lines=[self.go(), self.clean(), BRIDGE_LINE])
+        got, _r = self.rec(SID_A, "--new-link")
+        out = self.ok(self.w.run("stop", got["result"]["new_id"]))
+        self.assertIn("The window is gone", out)
+        self.assertEqual(self.w.windows().get("csm-work", []), [])
 
 
 class ReviveMove(ReviveRun):

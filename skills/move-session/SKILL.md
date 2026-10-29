@@ -250,7 +250,7 @@ under it, Remote Control disconnected, something killed it mid-turn. A move need
 csm revive <link or title> --dry-run     # why it stopped, and what reviving it would do
 csm revive <link or title>               # ...do it
 csm revive <link> --to auto              # ...on the account with the most room, when its own has none
-csm revive <link> --new-link             # ...fork a dead Remote Control server child onto a new link
+csm revive <link> --new-link             # ...fork a dead session onto a new link: a fresh copy, same past
 ```
 
 1. **Ask for the claude.ai link, and prefer it over every other spec.** A session that stopped has no live row,
@@ -279,16 +279,24 @@ quota):
 | 2 | the transcript holds no conversation | refuses: there is nothing to continue |
 | 3 | it is live and busy | nothing to do — it is working right now |
 | 4 | the limit it stopped on is still in force, and no `--to` | refuses, with the reset time and the cures: wait, or `--to auto` now |
-| 5 | it is live and idle | wakes it: the note is relayed in, nothing is started. A `--to` is **not** carried out — it is still running, so stop it first and move it |
+| 5 | it is live and idle | wakes it: the note is relayed in, nothing is started. A `--to`, a `--new-link` or a `--permission-mode` is **not** carried out — it is still running, so stop it first, and this row starts no process to put in a mode |
 | 6 | `--to ACCOUNT` or `--to auto` | moves it (an ordinary move, with its cost), then relays the note into the copy |
-| 7 | dead, a self-hosted Remote Control session | resumes it in place, on the **same** link. Archived needs `--unarchive` |
-| 8 | dead, a terminal session | resumes it in place — it gets a **new** link, which is new exposure, not a restoration |
+| 7 | dead, a self-hosted Remote Control session, no `--new-link` | resumes it in place, on the **same** link. Archived needs `--unarchive` |
+| 8 | dead, a terminal session, no `--new-link` | resumes it in place — it gets a **new** link, which is new exposure, not a restoration |
 | 9 | dead, a Remote Control **server child**, no `--new-link` | prints the one thing to tap and starts nothing |
 | 10 | dead, a server child, `--new-link` | forks it: new id, new link, same past; the old link still opens the old copy |
+| 11 | dead, a self-hosted or terminal session, `--new-link` | forks it the same way: `--new-link` means a fresh copy on a new link whatever kind it is. A self-hosted session's old link still opens the old copy; a terminal one never had a link, so the warning is about the old **copy** |
 
 The `action` in `--json` names the row: `refuse`, `nothing`, `wake`, `move`, `resume`, `resume-new-link` (8),
-`keep-link` (9), `fork` (10). ⚠️ `resume-new-link` is row 8, a resume in place; the `--new-link` FLAG takes row 10,
-which records `fork`.
+`keep-link` (9), `fork` (10 and 11). ⚠️ `resume-new-link` is row 8, a resume in place; the `--new-link` FLAG takes
+row 10 or 11, which record `fork`.
+
+**Read `decision.dropped` and `mode.applied` before you say what happened.** A flag that was not carried out is
+named there and in the second line — `--to` on a row that is not a move, `--say` on a row that sends no note,
+`--new-link` on a row that forks nothing, `--permission-mode` on a row that starts no process — so pass that on
+instead of reporting the flag as honoured. `mode.applied: false` means the `mode` shown is the one the session is
+**already** running in (measured from its own command line and its transcript, `why` beginning `unchanged:`), not
+one csm set: never tell the user their session was put into a mode on a wake, on row 3, on row 9 or on a refusal.
 
 **A dead server child often cannot name its own link, and that is still row 9.** When nothing records which
 claude.ai session it was — no registry row, no bridge line in its file, no `bridge-spawn` directory — csm proves

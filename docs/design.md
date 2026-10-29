@@ -780,8 +780,8 @@ handed to the id-prefix or title rungs: a session whose first prompt *pasted* th
 
 **The decide table is data** (`REVIVE_ROWS`), walked in order, first match wins — so a session that is both dead
 and out of quota is answered about the quota, because starting it would spend its first turn on the same wall.
-Rows 1, 2 and 4 refuse (exit 2); row 3 has nothing to do; rows 5–8 and 10 act; row 9 prints one sentence. The
-plan a `--dry-run` prints and the thing a real run carries out come from **one function**, so a plan that said
+Rows 1, 2 and 4 refuse (exit 2); row 3 has nothing to do; rows 5–8, 10 and 11 act; row 9 prints one sentence.
+The plan a `--dry-run` prints and the thing a real run carries out come from **one function**, so a plan that said
 row 7 cannot be followed by a run that takes row 10.
 
 | # | condition | action |
@@ -792,23 +792,48 @@ row 7 cannot be followed by a run that takes row 10.
 | 4 | a usage limit still in force, no `--to` | refuse, with the reset and the cures |
 | 5 | `live-idle` | wake it — relay the note, start nothing |
 | 6 | `--to ACCOUNT\|auto` | `do_move` unchanged, then relay the note into the copy |
-| 7 | dead, `self-hosted` | resume in place on the same link (archived refuses without `--unarchive`) |
-| 8 | dead, `terminal` | resume in place; it gets a new link, and is told so |
+| 7 | dead, `self-hosted`, no `--new-link` | resume in place on the same link (archived refuses without `--unarchive`) |
+| 8 | dead, `terminal`, no `--new-link` | resume in place; it gets a new link, and is told so |
 | 9 | dead, `server-child`, no `--new-link` | print the one tap; start nothing, wait for nothing |
 | 10 | dead, `server-child`, `--new-link` | fork: `--resume <old> --fork-session --session-id <new uuid4>` |
+| 11 | dead, `self-hosted` or `terminal`, `--new-link` | fork, by row 10's mechanics: `--new-link` is a fresh copy on a new link whatever the kind |
+
+⚠️ **Row 11 is a row NUMBER, not a position in the walk.** It is reached from inside the `self-hosted` and
+`terminal` branches, beside rows 7 and 8, and the three are mutually exclusive by kind and by `--new-link` — as
+rows 9 and 10 already are. Everything that depends on the ORDER is in rows 1–6. It was added rather than
+renumbered because the row number is carried by `--json`, by every line of `revive.jsonl` and by the README, and
+renumbering would silently re-label every record already written.
 
 <a id="the-decide-table"></a>
 The `action` string each row records is part of the interface: `--json` carries it and so does every line of
 `revive.jsonl`.
 
-| row | 1, 2, 4 | 3 | 5 | 6 | 7 | 8 | 9 | 10 |
+| row | 1, 2, 4 | 3 | 5 | 6 | 7 | 8 | 9 | 10, 11 |
 |---|---|---|---|---|---|---|---|---|
 | `action` | `refuse` | `nothing` | `wake` | `move` | `resume` | `resume-new-link` | `keep-link` | `fork` |
 | exit | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 
 ⚠️ Row 8's action was `new-link` before 0.5.0's review fixes and is `resume-new-link` now. The old spelling read
-like the `--new-link` FLAG, and the flag takes row **10**, which records `fork` — so a caller filtering
+like the `--new-link` FLAG, and the flag takes row **10** or **11**, which record `fork` — so a caller filtering
 `action == "new-link"` matched a resume in place and never a fork.
+
+**A FLAG THAT WAS NOT CARRIED OUT SAYS SO**, and on every row. `dropped(row)` is called by `take` for all of them,
+refusals included, and what it returns is both appended to the second line and carried as `decision.dropped`:
+`--to` where the row is not a move, `--say` where the row sends no note, `--new-link` where the row forks nothing
+(with the reason: a live writer on rows 3 and 5, a move's own new link on row 6, "nothing is started on this row"
+otherwise), and `--permission-mode` where the row starts no process.
+
+**The mode is RESOLVED only where it is APPLIED.** `REVIVE_ROWS_THAT_START` is `(6, 7, 8, 10, 11)`; on those rows
+`resolve_mode` picks the mode the window is started in and `--json`'s `mode.applied` is `true`. Every other row
+— 3, 5, 9 and every refusal — starts no process, so `unchanged_mode` REPORTS the mode the session is already in
+instead: `revive_state`'s `mode_launched` (the proved pid's own `--permission-mode`, off the same `ps` sweep
+`csm modes` reads) and the last `permissionMode` its transcript recorded, each named in `why`, which opens
+`unchanged:`. When they disagree the stronger is reported — a Remote Control worker records `auto` while its
+server's argv says `bypassPermissions` — an unknown mode is carried through untouched, and when neither source
+says anything the line reads `unknown`, never `default`. 🛑 Measured live on CLI 2.1.312, Wed 28 Oct 2026: a
+session running `--permission-mode bypassPermissions`, woken with `--permission-mode plan`, was reported as
+`mode plan (from --permission-mode)` while it kept running in bypass — the unsafe direction, and the reason
+`unchanged_mode` and `mode.applied` exist.
 
 **A `server-child` whose link nothing records is still row 9.** The four sources of a bare bridge id above are all
 things that can be gone: a dead child has no registry row, writes no bridge id into its own transcript (2 of the
@@ -1242,7 +1267,7 @@ More of them, grouped and generalised: [docs/lessons.md](lessons.md).
 | [`docs/lessons.md`](lessons.md) | the generic lessons behind the rules |
 | `docs/design.md` | this page |
 
-The tests — 694 of them — run the real script against fake homes and transcripts, a fake `claude` that records its
+The tests — 706 of them — run the real script against fake homes and transcripts, a fake `claude` that records its
 argv and environment, and a fake `tmux` that really runs the moved window's command, alongside in-process unit
 tests of the pure parts (the dialog answerer, the mode chooser, the memory resolver, the meter arithmetic, folder
 translation, the matrix cells). Anything that would reach another machine runs against `CSM_REMOTE_LOCAL`, with

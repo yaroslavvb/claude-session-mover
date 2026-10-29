@@ -17,7 +17,7 @@ resume it in place, fork it onto a new link, move it to another account, or prin
 to tap. Everything here is measured against Claude Code **2.1.312** on macOS (Wed 28 Oct 2026)
 — a newer version than the 2.1.296–2.1.300 the rest of this file was written against.
 
-466 tests became **694**, on Python 3.12 and on the 3.7 floor the README promises. Nothing about
+466 tests became **706**, on Python 3.12 and on the 3.7 floor the README promises. Nothing about
 `move`, `stop`, `list`, `modes`, `matrix` or `find` changed behaviour except where this file says
 so: `check_target`'s split is byte-for-byte identical for a move, and `find`'s exit code is the one
 deliberate change to an existing contract.
@@ -322,6 +322,44 @@ Each one has a test that fails without the fix.
   a `--from-machine` move of a session that was very much alive reported the other machine
   idle. `detail` now takes the bare bridge id as an optional third word (older callers still
   work) and matches it after `--resume`, `--session-id` or `--sdk-url`.
+
+#### Fixed after the live test
+
+Two bugs the first end-to-end run of `csm revive` against real sessions found, both reproduced live
+on CLI **2.1.312** (Wed 28 Oct 2026). Each has a test that fails without the fix.
+
+- 🛑 **A wake REPORTED a permission mode it had not applied, in the unsafe direction.** Every row
+  with a note resolved `resolve_mode`, row 5 included — and row 5 starts no process at all: it
+  relays a note to a session that is already running. Live: a session running
+  `--permission-mode bypassPermissions`, woken with `--permission-mode plan`, was reported as
+  `mode plan (from --permission-mode)` while it went on running in bypass, and `--json` carried
+  `{"mode": "plan", "why": "from --permission-mode"}` — telling an unattended caller that a
+  session had been put into the safest mode when it was in the least safe one. A mode is now
+  resolved only on the rows that START a process (`REVIVE_ROWS_THAT_START` — 6, 7, 8, 10, 11),
+  and rows 3, 5, 9 and every refusal REPORT what the session is already in instead
+  (`unchanged_mode`): the proved pid's own `--permission-mode`, off the same `ps` sweep
+  `csm modes` reads (`revive_state.mode_launched`, new), and the last `permissionMode` its
+  transcript recorded, each named in a `why` that opens `unchanged:`. When the two disagree the
+  **stronger** one is reported, because a Remote Control worker records `auto` while its server's
+  argv says `bypassPermissions`; an unknown mode is carried through untouched; and when neither
+  source says anything the line reads `unknown`, never `default`. `--json`'s `mode` block gained
+  **`applied`**, false on every row that starts nothing, and a `--permission-mode` typed at such a
+  row is reported as not carried out by the existing `dropped()` convention. A typo in the flag is
+  now also refused on every row (`check_mode`), as `--say`'s own check already was: it used to
+  reach a wake in silence.
+- 🛑 **`--new-link` was silently dropped on every row but 9 and 10.** The flag was read only at
+  that one split, and `dropped()` named only `--to` and `--say`, on rows 3 and 9. Live:
+  `csm revive <dead self-hosted session> --new-link --dry-run` took row 7 — "resume it in place,
+  on the same claude.ai link" — with no mention of the flag anywhere in the plan or in `--json`.
+  On a dead **self-hosted** or **terminal** session `--new-link` now takes the fork action as
+  **row 11**: row 10's mechanics unchanged (`--resume <old> --fork-session --session-id <new
+  uuid4>`, the window `moved-<new8>`, the old file left byte-identical, the loud warning
+  afterwards), named honestly in the plan, in `--json` and in `revive.jsonl`. A terminal session
+  never had a claude.ai link, so its fork's note and its warning talk about the old **copy** and
+  invent no link. On every other row — the live rows 3 and 5, the move, and every refusal — the
+  flag is reported as NOT carried out with the reason. `dropped()` is now called for **every**
+  row rather than two, covers `--new-link` and `--permission-mode` as well as `--to` and `--say`,
+  and what it returns is carried as `decision.dropped` so an unattended caller reads it as data.
 
 ### Changed
 

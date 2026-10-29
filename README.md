@@ -319,10 +319,10 @@ narrative, the table in plain words and what it cannot do are in
 | `--dry-run` | print the plan — the row it would take, the note it would send, any refusal — and start, wake, move and write nothing |
 | `--json` | the diagnosis record, the decision and the note, as JSON. The prose goes to stderr, so stdout stays parseable |
 | `--to ACCOUNT` | move it to that account instead of reviving it where it is (`auto` for the one with the most weekly room). It is also the cure for a limit that is still in force |
-| `--new-link` | for a Remote Control **server child**, which cannot be resumed onto its own link: fork it to a new session id and a new link. The old link still opens the old copy |
+| `--new-link` | a fresh copy on a new link: **fork** the dead session to a new session id and a new link, leaving its transcript byte-identical. It is the only way back for a Remote Control **server child**, which cannot be resumed onto its own link at all, and on a dead self-hosted or terminal session it forks instead of resuming in place (row 11). The old link, where there was one, still opens the old copy. On a row that forks nothing — live, a move, a refusal — the output says it was **not** carried out, and why |
 | `--account NAME` | which home's copy to revive. Only needed when a move has left copies of one id in more than one home and none of them is running — revive refuses rather than choose, the same as `move` and `stop` |
 | `--say TEXT` | one thing to pass on to the revived session, quoted verbatim and attributed to you. At most 400 characters, and it may not start with `!` or `/`, which the CLI would run as a command |
-| `--permission-mode MODE` | the mode to come back in. Without it, the mode the session recorded, by the same rule as `move` |
+| `--permission-mode MODE` | the mode to come back in. Without it, the mode the session recorded, by the same rule as `move`. ⚠️ It is applied only on the rows that START a process (6, 7, 8, 10, 11); on a wake, on row 3, on row 9 and on a refusal nothing is started, so the mode line REPORTS what the session is already in (`unchanged: …`, `applied: false` in `--json`) and the flag is named as not carried out |
 | `--unarchive` | resume a session that was archived or ended from the app, which unarchives it. Refused without this flag |
 | `--name NAME` | the Remote Control name the revived session gets |
 | `--from-machine M` | refused, and says so: every gate a revive turns on is a question about the machine the transcript is on. Run `csm --machine M revive <spec>` instead, which does the whole thing over there |
@@ -611,7 +611,7 @@ session has no registry row and often no title — and it answers two questions 
 csm revive https://claude.ai/code/session_01Ab... --dry-run   # why it stopped, and what reviving it would do
 csm revive https://claude.ai/code/session_01Ab...             # ...do it
 csm revive 7f3a --to auto --say "skip the card run, just write the findings up"
-csm revive 7f3a --new-link                                    # fork a dead server child onto a new link
+csm revive 7f3a --new-link                                    # fork a dead session onto a new link, fresh copy
 ```
 
 **When to use it, and when to just open the session and say *continue*.** If the session is a Remote Control one
@@ -634,12 +634,18 @@ because starting it would spend its first turn hitting the same wall.
 | 2 | the transcript holds no conversation (0 bytes, or no main-chain line — a Remote Control server pre-creates such sessions) | **refuses**: there is nothing to continue |
 | 3 | it is live and **busy** | **nothing to do** — it is working right now, and a message would join the turn it is in the middle of |
 | 4 | it stopped on a usage limit that is **still in force**, and no `--to` | **refuses**, with the reset in local time and the cures: wait until then and run it again, or `--to auto` now. For a monthly-spend, credits or model limit it says that waiting does not clear it at all |
-| 5 | it is live and **idle** (a lazy respawn, or you opened the link) | **wakes it**: nothing is started, the note is relayed in. ⚠️ A `--to` is *not* carried out here, and the output says so: a move copies a transcript and this one has a live writer, so stop it first |
+| 5 | it is live and **idle** (a lazy respawn, or you opened the link) | **wakes it**: nothing is started, the note is relayed in. ⚠️ A `--to`, a `--new-link` or a `--permission-mode` is *not* carried out here, and the output says so for each: a move or a fork copies a transcript and this one has a live writer, so stop it first, and a mode is applied to a process this row starts none of |
 | 6 | `--to ACCOUNT` or `--to auto` | **moves it** — an ordinary `csm move`, with its copy, its own move note and its printed cost — and then relays the revive note into the copy |
-| 7 | dead, a **self-hosted** Remote Control session (it wrote its own `bridge-session` line), same account | **resumes it in place, on the same claude.ai link**. Archived or ended from the app is refused unless `--unarchive` |
-| 8 | dead, a **terminal** session, same account | **resumes it in place** — and it gets a **new** claude.ai link, which the output says loudly: it was never a Remote Control session, so that is new exposure, not a restoration |
+| 7 | dead, a **self-hosted** Remote Control session (it wrote its own `bridge-session` line), same account, no `--new-link` | **resumes it in place, on the same claude.ai link**. Archived or ended from the app is refused unless `--unarchive` |
+| 8 | dead, a **terminal** session, same account, no `--new-link` | **resumes it in place** — and it gets a **new** claude.ai link, which the output says loudly: it was never a Remote Control session, so that is new exposure, not a restoration |
 | 9 | dead, a Remote Control **server child**, same account, no `--new-link` | **prints the one thing to tap** — open the link and say *continue* — plus whether that folder's server is up, and starts nothing and waits for nothing |
 | 10 | dead, a server child, same account, `--new-link` | **forks it**: `--resume <old> --fork-session --session-id <new uuid4>`, so a new id, a new link, the same past. The old transcript is left byte-identical and the old link still opens the **old** copy — archive it and do not type there |
+| 11 | dead, a **self-hosted** or **terminal** session, same account, `--new-link` | **forks it too**, by row 10's mechanics: `--new-link` asks for a fresh copy on a new link, whatever kind the dead session is. For a self-hosted one the link it had still opens the **old** copy; a terminal one never had a link, so the output warns about the old **copy** instead and names no link it cannot name |
+
+Rows 7–11 are mutually exclusive by kind and by `--new-link`, so their order among themselves is not
+what decides; everything that depends on the order is in rows 1–6. Row 11 is a row *number*, not a position in
+the walk — it is reached from inside the same two branches as rows 7 and 8, and was added rather than renumbered
+because the row number is in `--json`, in `revive.jsonl` and in every record already written.
 
 Which kind of session it is, is **proved, never guessed**: a server child's local transcript id *is*
 `uuid5` of its bridge session's API url, so the link, its registry row or an orphan `~/.claude/bridge-spawn/`
@@ -654,8 +660,18 @@ the link rather than printing one it cannot name. It must never take row 8: that
 the old local id, which a later lazy respawn of the old link shares.
 
 The `action` string in `--json` and in `revive.jsonl` is one of `refuse`, `nothing`, `wake`, `move`, `resume`,
-`resume-new-link` (row 8), `keep-link` (row 9) and `fork` (row 10) — see the mapping in
+`resume-new-link` (row 8), `keep-link` (row 9) and `fork` (rows 10 and 11) — see the mapping in
 [docs/design.md](docs/design.md#the-decide-table).
+
+**A flag that was not carried out says so**, in the second line and in `--json`'s `decision.dropped`: `--to` on a
+row that is not a move, `--say` on a row that sends no note, `--new-link` on a row that forks nothing, and
+`--permission-mode` on a row that starts no process. And `--json`'s `mode` block carries **`applied`**: `true`
+only on the rows that start a process (6, 7, 8, 10, 11), where the mode really is the one in that process's
+command line. On every other row the block reports the mode the session is **already in**, measured from its own
+command line and from the last `permissionMode` its transcript recorded, with `why` beginning `unchanged:`; when
+the two measurements disagree the **stronger** one is reported, because a Remote Control worker records `auto`
+while its server's argv says `bypassPermissions`, and a mode neither source names reads `unknown` — never
+`default`.
 
 ### The three-line answer
 
@@ -921,7 +937,7 @@ the machine can reach. Only move sessions between accounts you own.
 python3 tests/test_mover.py
 ```
 
-694 tests, fixtures only: fake homes and transcripts, a fake `claude` that records its argv and environment, a fake
+706 tests, fixtures only: fake homes and transcripts, a fake `claude` that records its argv and environment, a fake
 `tmux` that really runs the moved window's command on a private socket, a fake `ssh` that records the command line
 it was handed, and — for `find --on` and `--from-machine` — "the other machine" played by this process with `HOME`
 pointed at a fixture tree, so no test reaches a real host. No network, no account, no credential store, no real

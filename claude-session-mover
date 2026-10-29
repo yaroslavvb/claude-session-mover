@@ -2437,6 +2437,20 @@ def settings_mode(tgt: Account):
     return "", ""
 
 
+def check_mode(asked: str) -> str:
+    """`canon_mode(asked)`, or ONE refusal naming the modes this tool knows.
+
+    🛑 CHECKED ON EVERY ROW, not only the ones that start something — `check_say`'s own rule.
+    A typo'd `--permission-mode` is wrong whatever the session happens to be doing, and the
+    refusal has to come from the plan rather than from the row that happens to apply it.
+    """
+    m = canon_mode(asked)
+    if m and mode_rank(m) < 0:
+        die("'%s' is not a permission mode. The modes are: %s (and `manual`, the "
+            "settings schema's own alias for `default`)" % (asked, ", ".join(MODE_ORDER)))
+    return m
+
+
 def resolve_mode(s: Session, tgt: Account, asked: str):
     """`(mode, why)` — the permission mode is CHOSEN for the move, not copied.
 
@@ -2456,11 +2470,7 @@ def resolve_mode(s: Session, tgt: Account, asked: str):
       4. else the settings' mode, else `default`.
     """
     if asked:
-        m = canon_mode(asked)
-        if mode_rank(m) < 0:
-            die("'%s' is not a permission mode. The modes are: %s (and `manual`, the "
-                "settings schema's own alias for `default`)" % (asked, ", ".join(MODE_ORDER)))
-        return m, "from --permission-mode"
+        return check_mode(asked), "from --permission-mode"
     rec, (cfg, where) = canon_mode(s.perm), settings_mode(tgt)
     rec_rank = mode_rank(rec) if rec else -1
     if cfg and rec in RAISE_FROM and mode_rank(cfg) > rec_rank:
@@ -6803,7 +6813,7 @@ def revive_state(s: Session, bare: str = "") -> dict:
     is never "nothing is running".
     """
     out = {"state": "dead", "why": "", "status": s.status, "pid": s.pid, "proved": None,
-           "ps": [], "ps_asked": False}
+           "ps": [], "ps_asked": False, "cmd": "", "mode_launched": ""}
     rows = ps_table()
     out["ps_asked"] = rows is not None
     own = re.compile(r"--(?:resume|session-id)[= ]" + re.escape(s.local_id) + r"\b")
@@ -6843,6 +6853,16 @@ def revive_state(s: Session, bare: str = "") -> dict:
         out["proved"], out["why"] = ok, why
         if ok:
             out["state"] = "live-busy" if s.status == "busy" else "live-idle"
+            # 🛑 AND THE MODE IT IS REALLY IN, off the same sweep — `launch_mode`, the
+            # reading `csm modes` takes. A row that starts nothing has to report the mode the
+            # session is ALREADY in rather than one csm picked for a start that never happens
+            # (`unchanged_mode`). ⚠️ ONLY FOR A PROVED PROCESS: an unprovable row reads as
+            # dead here, and a reused pid's flag belongs to somebody else's session. The
+            # whole line is read for the flag and truncated after, because `--permission-mode`
+            # can sit past the 160 characters the record keeps.
+            if rows is not None and rows.get(s.pid):
+                out["cmd"] = rows[s.pid][:160]
+                out["mode_launched"] = launch_mode(rows[s.pid])
     if out["state"] == "dead" and out["ps"]:
         out["why"] += ("; but %d process(es) on this machine name it: %s"
                        % (len(out["ps"]), ", ".join("pid %d" % p["pid"]
@@ -7455,9 +7475,17 @@ def revive_note(s: Session, rec: dict, action: str, tgt: Account = None, say: st
                   "session: the link you had still opens this conversation.",
         "resume-new-link": "csm resumed it in place; it was not a Remote Control session before, "
                     "so it has a NEW claude.ai link and nothing opens the old one.",
-        "fork": "csm FORKED it: this copy is %s, forked from %s. The old link still opens "
-                "the OLD copy, which is a second conversation with the same past — do not "
-                "type there, and archive it." % (new_id[:8] or "a new session", s.short),
+        # ⚠️ THE OLD-LINK SENTENCE ONLY WHERE THERE IS AN OLD LINK. `--new-link` forks a
+        # dead TERMINAL session too (row 11), and that session never had a claude.ai link —
+        # so the sentence a server child's fork needs would be false in its note.
+        "fork": "csm FORKED it: this copy is %s, forked from %s. %s"
+                % (new_id[:8] or "a new session", s.short,
+                   "The old link still opens the OLD copy, which is a second conversation "
+                   "with the same past — do not type there, and archive it."
+                   if (rec.get("session") or {}).get("url") else
+                   "The conversation it was forked from had no claude.ai link of its own "
+                   "and is left byte-identical; this copy is a second conversation with "
+                   "the same past, and its link is new."),
         "move": "csm moved it from %s to %s, so every turn from here is spent on that "
                 "account's quota." % (s.account.email or s.account.label,
                                       tgt.email or tgt.label),
@@ -8028,25 +8056,47 @@ def revive_record(s: Session, rec: dict, dec: dict, result: dict) -> None:
 #: ⚠️ THE `action` STRINGS ARE A PUBLIC VOCABULARY: `--json` carries them and so does every
 #: line of `revive.jsonl`, which README documents as the machine-readable record. They are
 #: listed in docs/design.md beside the table, and row 8's was renamed for this build: it was
-#: `new-link`, which read like the `--new-link` FLAG while the flag takes row 10 (`fork`),
+#: `new-link`, which read like the `--new-link` FLAG while the flag takes row 10 or 11 (`fork`),
 #: so a caller filtering `action == "new-link"` matched a resume in place and never a fork.
+#: ⚠️ ROW 11 IS A ROW NUMBER, NOT A POSITION IN THE WALK: it is reached from inside the
+#: `self-hosted` and `terminal` branches, where rows 7 and 8 are, and the three are
+#: mutually exclusive by kind and by `--new-link`. Everything that decides the ORDER is in
+#: rows 1–6; 7–11 only sort one dead session in its own account by what it is. It was added
+#: rather than renumbered because the row number is in `--json`, in `revive.jsonl`, in the
+#: README and in five tests, and renumbering would silently re-label every old record.
 REVIVE_ROWS = {
     1: ("refuse", 2), 2: ("refuse", 2), 3: ("nothing", 0), 4: ("refuse", 2),
     5: ("wake", 0), 6: ("move", 0), 7: ("resume", 0), 8: ("resume-new-link", 0),
-    9: ("keep-link", 0), 10: ("fork", 0),
+    9: ("keep-link", 0), 10: ("fork", 0), 11: ("fork", 0),
 }
-#: Which rows deliver the revive note. Rows 1, 2 and 4 refuse, row 3 has nothing to say to
-#: a session that is working, and row 9 starts nothing — the one sentence to type is printed
-#: for the reader instead, because only he can open the link that makes the server respawn.
-REVIVE_ROWS_WITH_NOTE = (5, 6, 7, 8, 10)
+#: 🛑 THE ROWS THAT START A PROCESS, and therefore the only rows a `--permission-mode` is
+#: ever applied on: a window of csm's own (7, 8, 10, 11) or the move's (6). Every other row
+#: leaves the session's own mode exactly as it is — see `unchanged_mode`, and the live bug
+#: that function exists for.
+REVIVE_ROWS_THAT_START = (6, 7, 8, 10, 11)
+#: Which rows deliver the revive note: the rows that start something, plus the wake. Rows 1,
+#: 2 and 4 refuse, row 3 has nothing to say to a session that is working, and row 9 starts
+#: nothing — the one sentence to type is printed for the reader instead, because only he can
+#: open the link that makes the server respawn.
+REVIVE_ROWS_WITH_NOTE = (5,) + REVIVE_ROWS_THAT_START
+#: The rows `--new-link` is CARRIED OUT on: the fork of a server child, and the fork of a
+#: dead self-hosted or terminal session. On every other row the flag is reported as not
+#: carried out (`dropped`), never swallowed.
+REVIVE_ROWS_NEW_LINK = (10, 11)
+#: Why a `--to` is not carried out at a session that is still running, in the words row 5
+#: has used since it was written: a move copies a transcript, and this one has a live
+#: writer. `--new-link` is refused on those rows for the same reason, in its own words,
+#: because what it copies the transcript FOR is a fork.
+LIVE_WRITER = ": a move copies a transcript and this one has a live writer, so stop it first"
 
 
 def revive_decide(rec: dict, args, tgt: Account = None) -> dict:
     """WHICH ROW this session takes, what that row would do, and the one risk in doing it.
 
     Pure: it reads the diagnosis and the flags and touches nothing. Returns
-    `{"row", "action", "exit", "what", "risk", "cures", "refusal", "note"}`, where `what`
-    and `risk` are the second and third lines of the three-line answer.
+    `{"row", "action", "exit", "what", "risk", "cures", "refusal", "note", "dropped"}`,
+    where `what` and `risk` are the second and third lines of the three-line answer and
+    `dropped` is the flags this row does not carry out (already inside `what`).
     """
     st = (rec.get("state") or {}).get("state") or "dead"
     stop = rec.get("stop") or {}
@@ -8056,19 +8106,38 @@ def revive_decide(rec: dict, args, tgt: Account = None) -> dict:
     srv = rec.get("server") or {}
     to = (getattr(args, "to", "") or "").strip()
     out = {"row": 0, "action": "refuse", "exit": 2, "what": "", "risk": "",
-           "cures": [], "refusal": "", "note": False}
+           "cures": [], "refusal": "", "note": False, "dropped": ""}
+
+    new_link = bool(getattr(args, "new_link", False))
+    asked_mode = canon_mode(getattr(args, "permission_mode", "") or "")
 
     def dropped(row):
-        """🛑 A FLAG THAT WAS NOT CARRIED OUT SAYS SO. Row 5's author wrote this clause for
-        `--to` and rows 3 and 9 are the same case unapplied: `--say` is only rendered for
-        `REVIVE_ROWS_WITH_NOTE`, so on rows 3 and 9 it was never delivered and never
-        mentioned, and a `--to` typed at a live-busy session was dropped in silence too.
+        """🛑 A FLAG THAT WAS NOT CARRIED OUT SAYS SO, ON EVERY ROW. Row 5's author wrote
+        this clause for `--to`, and every other flag was the same case unapplied: `--say` is
+        only rendered for `REVIVE_ROWS_WITH_NOTE`, so on rows 3 and 9 it was never delivered
+        and never mentioned; `--permission-mode` was resolved and REPORTED on row 5, which
+        starts nothing, so a session running in bypassPermissions read as `mode plan (from
+        --permission-mode)`; and `--new-link` was read only at the row-9/row-10 split, so
+        `csm revive <dead self-hosted session> --new-link` took row 7 — a resume on the same
+        link — without a word about the flag (both measured live on CLI 2.1.312, Wed 28 Oct
+        2026). It is called for EVERY row now, refusals included, and not for two of them.
         """
         bits = []
         if to and row != 6:
-            bits.append("move it to %s" % (tgt.label if tgt else to))
+            bits.append("move it to %s%s" % (tgt.label if tgt else to, LIVE_WRITER
+                                             if row in (3, 5) else ""))
         if (getattr(args, "say", "") or "").strip() and row not in REVIVE_ROWS_WITH_NOTE:
             bits.append("pass on what you said (nothing is being sent a note on this row)")
+        if asked_mode and row not in REVIVE_ROWS_THAT_START:
+            bits.append("put it in %s: --permission-mode is applied to a process csm "
+                        "starts, and this row starts none" % asked_mode)
+        if new_link and row not in REVIVE_ROWS_NEW_LINK:
+            bits.append("carry out --new-link: %s"
+                        % ("a fork copies a transcript and this one has a live writer, so "
+                           "stop it first" if row in (3, 5) else
+                           "a move to another account comes up on a new link of its own, "
+                           "which is not the fork this flag means" if row == 6 else
+                           "nothing is started on this row"))
         return (", and NOT " + " or ".join(bits)) if bits else ""
 
     def take(row, what, risk="", refusal="", cures=()):
@@ -8076,8 +8145,10 @@ def revive_decide(rec: dict, args, tgt: Account = None) -> dict:
         out["action"], out["exit"] = REVIVE_ROWS[row]
         out["refusal"], out["cures"] = refusal, list(cures)
         out["note"] = row in REVIVE_ROWS_WITH_NOTE
-        if row in (3, 9):
-            out["what"] = what + dropped(row)
+        # In the decision, so `--json` carries the flags this row does not carry out as data
+        # and not only inside the sentence a person reads.
+        out["dropped"] = dropped(row)
+        out["what"] = what + out["dropped"]
         return out
 
     if own.get("owner"):
@@ -8114,12 +8185,11 @@ def revive_decide(rec: dict, args, tgt: Account = None) -> dict:
                     % (sess.get("short"), stop.get("class") or stop.get("window")
                        or "usage", clock(stop.get("resets_at") or 0)), cures)
     if st == "live-idle":
-        # ⚠️ A `--to` typed at a session that is STILL RUNNING is not carried out, because
-        # this row matches first: a move copies a transcript, and this one has a live
-        # writer. Say so, rather than leave the flag looking honoured.
-        return take(5, "wake it — relay this note to the session that is already running"
-                    + (", and NOT move it to %s: a move copies a transcript and this one "
-                       "has a live writer, so stop it first" % to if to else ""),
+        # ⚠️ EVERY FLAG THIS ROW DOES NOT CARRY OUT IS NAMED BY `dropped`, which this row's
+        # own `--to` clause used to do by hand: a move copies a transcript and this one has
+        # a live writer, a fork copies it for the same reason, and a `--permission-mode` is
+        # applied to a process — of which this row starts none.
+        return take(5, "wake it — relay this note to the session that is already running",
                     "the note arrives as a PEER message, which cannot authorise anything "
                     "— it is read, not obeyed")
     if to:
@@ -8136,14 +8206,30 @@ def revive_decide(rec: dict, args, tgt: Account = None) -> dict:
                        % (sess.get("short"), ENDED_REMOTELY))
             out["action"], out["exit"], out["note"] = "refuse", 2, False
             return out
+        if new_link:
+            # 🛑 `--new-link` MEANS A FRESH COPY ON A NEW LINK, on any dead session and not
+            # only on a server child. Measured live on CLI 2.1.312, Wed 28 Oct 2026: `csm
+            # revive <dead self-hosted session> --new-link` took row 7 and resumed it in
+            # place, on the link it already had, with no mention of the flag at all.
+            return take(11, "FORK it onto a NEW claude.ai link: a new session id, the same "
+                        "past — the link it had is left alone",
+                        "the link it had still opens the OLD copy — two conversations with "
+                        "one history, so archive the old one and do not type there; without "
+                        "--new-link this row resumes it on that same link instead")
         return take(7, "resume it in place, on the same claude.ai link",
                     "nothing else may be writing that transcript: two CLIs appending to "
                     "one file cannot be untangled")
     if kind == "terminal":
+        if new_link:
+            return take(11, "FORK it onto a NEW claude.ai link: a new session id, the same "
+                        "past — the conversation it forked from is left byte-identical",
+                        "it was never a Remote Control session, so the new link is a change "
+                        "of exposure, and the fork is a SECOND conversation with the same "
+                        "past; without --new-link this row continues the one it has")
         return take(8, "resume it in place — it gets a NEW claude.ai link",
                     "it was never a Remote Control session, so publishing it is a change "
                     "of exposure, not a restoration")
-    if kind == "server-child" and not getattr(args, "new_link", False):
+    if kind == "server-child" and not new_link:
         up = srv.get("up")
         srv_tail = ("" if up else " (and its server is %s)"
                     % ("down" if up is False else "unread"))
@@ -8166,8 +8252,9 @@ def revive_decide(rec: dict, args, tgt: Account = None) -> dict:
                     "history, so archive the old one and do not type there")
     out["refusal"] = ("revive has no action for a %s session in the same account: say where "
                       "to put it with `--to <account>`" % kind)
+    out["dropped"] = dropped(0)
     out["what"] = ("nothing to do: no row of the decide table matches a %s session "
-                   "here" % kind)
+                   "here" % kind + out["dropped"])
     out["risk"] = "nothing was read about how to bring this kind back"
     return out
 
@@ -8193,6 +8280,61 @@ def revive_risk(rec: dict, dec: dict) -> str:
                 % (lost["errors"], (": " + ", ".join(lost["labels"][:3]))
                    if lost.get("labels") else ""))
     return dec.get("risk") or "none that this tool can see"
+
+
+def unchanged_mode(rec: dict, action: str = ""):
+    """`(mode, why)` — THE MODE A ROW THAT STARTS NOTHING LEAVES ALONE, measured.
+
+    🛑 NOTHING IS CHOSEN HERE, because nothing is started. `resolve_mode` picks the mode for
+    a process csm is about to start; rows 3, 5, 9 and every refusal start none, so the only
+    true answer is the mode the session is ALREADY in — and a `--permission-mode` typed at
+    such a row does not change it. Measured live on CLI 2.1.312, Wed 28 Oct 2026: a session
+    running `--permission-mode bypassPermissions`, woken with `--permission-mode plan`, was
+    reported as `mode plan (from --permission-mode)` while it kept running in bypass. That is
+    the UNSAFE direction — the reader is told a live session is more restricted than it is —
+    and it is the whole reason this function exists.
+
+    Two measurements, each NAMED in the why: the live process's own command line
+    (`revive_state`'s `mode_launched`, off the same `ps` sweep `csm modes` reads) and the last
+    `permissionMode` the transcript recorded. When they disagree the STRONGER one is
+    reported, because a Remote Control worker records `auto` while its server's argv says
+    bypassPermissions (`resolve_mode` rule 2) and under-reporting what a live session may
+    already do is the direction that gets somebody hurt. A mode this tool does not know is
+    carried through untouched instead (`mode_rank`'s own rule: −1 is not "weakest"), and when
+    neither source says anything the answer is `("", <why nothing could be read>)` — never a
+    guess, and never `default`.
+    """
+    st, sess = rec.get("state") or {}, rec.get("session") or {}
+    seen = []
+    launched = canon_mode(st.get("mode_launched") or "")
+    recorded = canon_mode(sess.get("perm") or "")
+    if launched:
+        seen.append((launched, "its command line says --permission-mode " + launched))
+    if recorded:
+        seen.append((recorded, "its transcript last recorded " + recorded))
+    head = ("unchanged: a wake starts nothing" if action == "wake"
+            else "unchanged: this row starts nothing")
+    if not seen:
+        return "", (head + ", and nothing here records what mode it is in: its transcript "
+                    "names none and no command line of its own could be read")
+    unknown = [p for p in seen if mode_rank(p[0]) < 0]
+    best = unknown[0] if unknown else max(seen, key=lambda p: mode_rank(p[0]))
+    return best[0], "%s — %s" % (head, "; ".join(w for _m, w in seen))
+
+
+def revive_mode_doc(p: dict):
+    """`--json`'s `mode` block: the mode, the why, and WHETHER IT WAS APPLIED.
+
+    🛑 `applied` IS THE FIELD THAT WAS MISSING. The document used to carry
+    `{"mode": "plan", "why": "from --permission-mode"}` for a row that starts nothing, which
+    told an unattended caller that a session had been put into `plan` while it went on
+    running in bypassPermissions. `applied` is true only on the rows that start a process,
+    and on those the mode really is the one in that process's argv.
+    """
+    if not (p.get("perm") or p.get("why_perm")):
+        return None
+    return {"mode": p.get("perm") or "", "why": p.get("why_perm") or "",
+            "applied": bool(p.get("mode_applied"))}
 
 
 def render_revive(rec: dict, dec: dict, note: str, perm: str = "", why_perm: str = "",
@@ -8250,8 +8392,11 @@ def render_revive(rec: dict, dec: dict, note: str, perm: str = "", why_perm: str
     if sess.get("url"):
         rows.append(("link", sess["url"]))
     rows.append(("folder", sess.get("cwd") or "(none recorded)"))
-    if perm:
-        rows.append(("mode", "%s (%s)" % (perm, why_perm)))
+    # 🛑 AND A MODE NOTHING COULD MEASURE IS STILL A LINE, reading `unknown`: on a row that
+    # starts nothing this line is a measurement of the session, so its absence would be read
+    # as "no mode was asked for" when what happened is that none could be read.
+    if perm or why_perm:
+        rows.append(("mode", "%s (%s)" % (perm or "unknown", why_perm)))
     if rc_name:
         rows.append(("--name", rc_name))
     rows.append(("decide", "row %d — %s (exit %d if it ran)"
@@ -8385,6 +8530,10 @@ def revive_plan(s: Session, sp: Spec, args, accts: list) -> dict:
     before anything is written, picks the row, and builds the note that row would deliver.
     """
     check_say(args.say or "")
+    # ⚠️ ON EVERY ROW, like `--say`'s own check: a `--permission-mode` typo is wrong whatever
+    # row the session takes, and the rows that start nothing no longer run it through
+    # `resolve_mode` at all — so without this a typo reached a wake in silence.
+    check_mode(getattr(args, "permission_mode", "") or "")
     rec = diagnose(s, accts, sp)
     to = (args.to or "").strip()
     tgt = None
@@ -8401,22 +8550,30 @@ def revive_plan(s: Session, sp: Spec, args, accts: list) -> dict:
             gate = str(e)
     dec = revive_decide(rec, args, tgt)
     if gate and dec["row"] == 6:
+        # ⚠️ The dropped clause is carried onto the new sentence: a flag this row does not
+        # carry out does not become carried out by the row turning into a refusal.
         dec.update(action="refuse", exit=2, note=False, refusal=gate,
-                   what="nothing to do: it cannot be moved to %s" % tgt.label)
+                   what="nothing to do: it cannot be moved to %s%s"
+                        % (tgt.label, dec.get("dropped") or ""))
     # 🛑 AND THE HOME IT WOULD START IN HAS TO BE USABLE. Rows 5, 7, 8 and 10 all start or
     # message a session in the session's OWN home (row 6's target is gated above, row 9
     # starts nothing), and a home whose credential is gone takes the session up and then
     # fails at its first token refresh — which looks exactly like a successful revive.
-    if dec["row"] in (5, 7, 8, 10) and (rec["account"] or {}).get("usable") is False:
+    if dec["row"] in (5, 7, 8, 10, 11) and (rec["account"] or {}).get("usable") is False:
         dec.update(action="refuse", exit=2, note=False,
                    refusal=(rec["account"] or {}).get("why") or "that home cannot run it",
-                   what="nothing to do: %s cannot run it" % (rec["account"] or {}).get(
-                       "label"))
+                   what="nothing to do: %s cannot run it%s"
+                        % ((rec["account"] or {}).get("label"),
+                           dec.get("dropped") or ""))
     # The line that is really SHOWN as the one risk, kept in the decision so `--json` and
     # the three-line answer cannot disagree about it.
     dec["risk_line"] = revive_risk(rec, dec)
     note = perm = why_perm = rc_name = ""
-    if dec["note"]:
+    # 🛑 A MODE IS RESOLVED ONLY WHERE IT IS APPLIED, and every other row REPORTS the one the
+    # session is already in (`unchanged_mode`). Keyed on the row AND on the action, because a
+    # gate above can turn row 6 or row 7 into a refusal that starts nothing after all.
+    applied = dec["action"] != "refuse" and dec["row"] in REVIVE_ROWS_THAT_START
+    if applied:
         # ⚠️ The mode and the label are resolved for the rows that would START something,
         # so a typo in `--permission-mode` or a title that sanitises away is a refusal in
         # the dry run rather than a surprise in the real one.
@@ -8430,9 +8587,12 @@ def revive_plan(s: Session, sp: Spec, args, accts: list) -> dict:
             # tool uses.
             rc_name = rc_label(args.name or s.label,
                                "" if args.name else "revived by csm " + s.short)
+    else:
+        perm, why_perm = unchanged_mode(rec, dec["action"])
+    if dec["note"]:
         note = revive_note(s, rec, dec["action"], tgt=tgt, say=args.say or "")
     return {"rec": rec, "dec": dec, "tgt": tgt, "note": note, "perm": perm,
-            "why_perm": why_perm, "rc_name": rc_name}
+            "why_perm": why_perm, "rc_name": rc_name, "mode_applied": applied}
 
 
 def revive_refusal(dec: dict) -> str:
@@ -8621,7 +8781,14 @@ def revive_move(s: Session, args, accts: list, tgt: Account, note: str, out: dic
 
 def revive_fork(s: Session, rec: dict, args, accts: list, perm: str, rc_name: str,
                 p: dict, out: dict) -> int:
-    """Row 10: a Remote Control server child, onto a NEW session id and a new link.
+    """Rows 10 and 11: onto a NEW session id and a new link, leaving the old file alone.
+
+    Row 10 is a Remote Control server child, which cannot be resumed onto its own link at
+    all; row 11 is a dead self-hosted or terminal session the reader asked for a fresh copy
+    of with `--new-link`. The mechanics are one function on purpose — `--fork-session` plus
+    an id csm chose — and the only difference is what there is to warn about afterwards: a
+    server child and a self-hosted session leave an OLD LINK behind that still opens the old
+    copy, and a terminal session never had one.
 
     🛑 CSM CHOOSES THE ID. `--fork-session` alone mints a uuid this tool never learns, and
     then the window it opened is named for the OLD id while the session in it has another —
@@ -8670,9 +8837,18 @@ def revive_fork(s: Session, rec: dict, args, accts: list, perm: str, rc_name: st
     print("  new session   %s\n                %s" % (new_id, tilde(dest)))
     print("  window        %s — `csm stop %s` ends it and frees the window (the NEW id)"
           % (out["window"], new_id[:8]))
-    print("  🛑 OLD LINK    %s still opens the OLD copy, which is now a second conversation"
-          "\n                with the same past. Do not type there; archive it in the app."
-          % ((rec.get("session") or {}).get("url") or "the old link"))
+    old_url = (rec.get("session") or {}).get("url") or ""
+    if old_url:
+        print("  🛑 OLD LINK    %s still opens the OLD copy, which is now a second "
+              "conversation\n                with the same past. Do not type there; "
+              "archive it in the app." % old_url)
+    else:
+        # Row 11 on a terminal session: there is no old link to warn about, and inventing
+        # one would be the thing `revive_decide`'s row 9 refuses to do.
+        print("  🛑 OLD COPY    the conversation this forked from has no claude.ai link of "
+              "its own, so\n                nothing re-opens it — but it is now a second "
+              "conversation with the same\n                past, and this fork's link is "
+              "exposure it never had.")
     print("  old file      %s is untouched: a fork writes a new file and never edits the "
           "one it read" % tilde(s.transcript))
     return out["exit"]
@@ -8688,7 +8864,7 @@ def revive_json(rec: dict, dec: dict, note: str, p: dict, out: dict) -> dict:
     return {"dry_run": False, "record": rec, "decision": dec,
             "note": out.get("note") or note,
             "auto": AUTO_NOTE[0] if AUTO_NOTE else "",
-            "mode": {"mode": p["perm"], "why": p["why_perm"]} if p["perm"] else None,
+            "mode": revive_mode_doc(p),
             "result": {k: v for k, v in out.items() if k != "note"},
             "exit": out.get("exit")}
 
@@ -8827,7 +9003,7 @@ def revive_act(s: Session, sp: Spec, args, accts: list, p: dict) -> int:
                     print("  ⚠ new link    it was never a Remote Control session, so this "
                           "link is new exposure,\n                not a restoration: "
                           "nothing opens the way in it had before")
-        elif dec["action"] == "fork":                                       # row 10
+        elif dec["action"] == "fork":                                # rows 10 and 11
             out["exit"] = revive_fork(s, rec, args, accts, perm, rc_name, p, out)
         else:
             die(dec.get("refusal") or "revive has no action for this session")
@@ -8897,8 +9073,7 @@ def do_revive(args, accts: list) -> int:
         if args.as_json:
             print(json.dumps({"dry_run": True, "record": rec, "decision": dec,
                               "note": p["note"], "auto": AUTO_NOTE[0] if AUTO_NOTE else "",
-                              "mode": {"mode": p["perm"], "why": p["why_perm"]}
-                              if p["perm"] else None}, indent=1, default=str))
+                              "mode": revive_mode_doc(p)}, indent=1, default=str))
             return 0
         print(render_revive(rec, dec, p["note"], p["perm"], p["why_perm"], p["rc_name"]))
         if dec["action"] == "move" and p["tgt"] is not None:
@@ -10163,9 +10338,12 @@ def main(argv: list) -> int:
                          "from `csm accounts`. Only needed when a move has left copies of "
                          "one id in more than one home and none of them is running")
     pr.add_argument("--new-link", action="store_true", dest="new_link",
-                    help="for a Remote Control server child, which cannot be resumed onto "
-                         "its own link: FORK it to a new session id and a new link. The "
-                         "old link still opens the old copy")
+                    help="a fresh copy on a new link: FORK the dead session to a new "
+                         "session id and a new link, leaving its transcript untouched. The "
+                         "only way back for a Remote Control server child, which cannot be "
+                         "resumed onto its own link at all; on a dead self-hosted or "
+                         "terminal session it forks instead of resuming in place. The old "
+                         "link, where there was one, still opens the old copy")
     pr.add_argument("--from-machine", metavar="M", dest="from_machine",
                     help="the session is on that machine (not built yet: run `csm "
                          "--machine M revive … --dry-run` to plan it there)")

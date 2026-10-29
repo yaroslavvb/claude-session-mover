@@ -11357,8 +11357,9 @@ def main(argv: list) -> int:
                                "CSM_WAKE_MARGIN_S) has passed, or it was killed while "
                                "working and nothing is running it now. A session that is "
                                "busy, archived, empty, owned by a bot, owned by a scheduled "
-                               "pass and not live, or already revived for this same stop is "
-                               "never due, and the row says which.")
+                               "pass and not live, a one-shot `claude -p` run, one whose "
+                               "state could not be measured, or one already revived for this "
+                               "same stop is never due, and the row says which.")
     pt.add_argument("--since", type=float, metavar="HOURS",
                     help="how far back to look, by a transcript's own last write (default "
                          "%g)" % STALLED_SINCE_H)

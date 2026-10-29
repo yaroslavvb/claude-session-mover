@@ -9,6 +9,12 @@ Every fact below was measured against Claude Code 2.1.296–2.1.300 on macOS. Th
 state it reads is undocumented and can change in any CLI release; the tests pin every shape
 the tool depends on.
 
+## [Unreleased]
+
+- `csm stalled --help` names every case that is never due: its epilog had left out the one-shot
+  `claude -p` run (0.6.4) and the session whose state could not be measured (0.6.1). The README's list
+  already had all seven.
+
 ## [0.6.4] — 2026-10-29
 
 - **A one-shot `claude -p` run is never due.** The first real dry run of a watchdog over `csm stalled` found

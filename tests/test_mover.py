@@ -314,7 +314,7 @@ FAKE_TMUX = r'''#!@PY@
 runs (in the background, output to a pane file); capture-pane prints that file, or the next
 scripted screen when FAKE_TMUX_SCRIPT holds some. Windows carry ids (@1, @2, ...) as the
 real one does, and kill-window removes them: both are what `csm stop` depends on."""
-import json, os, shutil, subprocess, sys
+import json, os, shutil, signal, subprocess, sys
 st_path = os.environ["FAKE_TMUX_STATE"]
 calls = os.environ["FAKE_TMUX_CALLS"]
 args = sys.argv[1:]
@@ -371,20 +371,34 @@ if cmd == "list-windows":
 if cmd in ("new-session", "new-window"):
     sess = opt("-s") if cmd == "new-session" else target()[0]
     win, cwd, shell_cmd = opt("-n"), opt("-c"), args[-1]
-    pane = os.path.join(os.path.dirname(st_path), "pane-%s-%s.txt" % (sess, win))
-    st["sessions"].setdefault(sess, {})[win] = {"pane": pane, "id": "@%d" % st["next"]}
+    wid = "@%d" % st["next"]
+    # 🛑 One pane file per window ID, not per window NAME. A window opened again under the
+    # same name (a second move after `csm stop`) used to share its file with the first
+    # window's process, which could still write its "=== claude exited" trailer over the
+    # new link: `Stop.test_a_second_move_is_accepted_again_once_the_window_is_gone` failed
+    # that way on GitHub's runners (Sun 25 Oct and Wed 28 Oct 2026).
+    pane = os.path.join(os.path.dirname(st_path), "pane-%s-%s-%s.txt" % (sess, win, wid[1:]))
+    st["sessions"].setdefault(sess, {})[win] = {"pane": pane, "id": wid}
     st["next"] += 1
-    save()
     out = open(pane, "w")
-    subprocess.Popen(["/bin/sh", "-c", shell_cmd], cwd=cwd, stdout=out, stderr=subprocess.STDOUT,
-                     stdin=subprocess.DEVNULL, start_new_session=True)
+    p = subprocess.Popen(["/bin/sh", "-c", shell_cmd], cwd=cwd, stdout=out,
+                         stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                         start_new_session=True)
+    st["sessions"][sess][win]["pgid"] = p.pid
+    save()
     sys.exit(0)
 if cmd == "kill-window":
     sess, win = target()
     if win not in st["sessions"].get(sess, {}):
         sys.exit(1)
-    del st["sessions"][sess][win]
+    gone = st["sessions"][sess].pop(win)
     save()
+    # What the real tmux does to a pane's processes when its window is destroyed: SIGHUP.
+    if isinstance(gone, dict) and gone.get("pgid"):
+        try:
+            os.killpg(gone["pgid"], signal.SIGHUP)
+        except OSError:
+            pass
     sys.exit(0)
 if cmd == "capture-pane":
     sess, win = target()

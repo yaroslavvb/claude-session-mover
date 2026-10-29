@@ -13,9 +13,16 @@ jobs:
         python: ["3.9", "3.12", "3.14"]
         # The README promises Python 3.7, so one cell measures it. actions/setup-python no
         # longer serves 3.7 on ubuntu-latest, hence 22.04 for that one cell only.
+        # Nor 3.9 since ubuntu-latest became 26.04 ("The version '3.9' with architecture
+        # 'x64' was not found for Ubuntu 26.04", Wed 28 Oct 2026), so that cell runs on 24.04.
+        exclude:
+          - os: ubuntu-latest
+            python: "3.9"
         include:
           - os: ubuntu-22.04
             python: "3.7"
+          - os: ubuntu-24.04
+            python: "3.9"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

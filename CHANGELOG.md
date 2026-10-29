@@ -205,6 +205,14 @@ deliberate change to an existing contract.
 The first eleven entries are the review of this release's own commits, applied before it shipped.
 Each one has a test that fails without the fix.
 
+- **The suite no longer depends on the machine it runs on** (tests and CI only; the tool is
+  unchanged). The fake tmux keyed a pane file by window name, so a window reopened under the same
+  name shared a file with the old window's still-running process, whose exit trailer could land
+  over the new link; it now keys panes by window id and SIGHUPs a killed window's process group, as
+  the real tmux does. That was the flake behind `Stop.test_a_second_move_is_accepted_again_once_the_window_is_gone`,
+  which failed CI on 0.4.0. Three revive tests had assumed this machine's `ps` and temp-path
+  lengths. CI's Python 3.9 cell moved to ubuntu-24.04, because ubuntu-latest (26.04) no longer
+  serves 3.9.
 - **Line 2 for a dead server child no longer contradicts itself.** With no server in its folder it
   read "open the link and say continue — its server respawns it on open (and its server is down)";
   three fresh readers of the README each took it as a contradiction. Each server state now gets one

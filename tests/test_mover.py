@@ -225,7 +225,7 @@ if os.environ.get("FAKE_CLAUDE_REGISTER"):
     d = os.path.join(home(), "sessions")
     os.makedirs(d, exist_ok=True)
     name = ([a.split("=", 1)[1] for a in ARGV if a.startswith("--remote-control=")] or [""])[0]
-    child = subprocess.Popen([os.environ["FAKE_CLAUDE_PROCBIN"], "120"],
+    child = subprocess.Popen([os.environ["FAKE_CLAUDE_PROCBIN"], "-c", "sleep 120; exit 0"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     env = dict(os.environ)
     env["LC_ALL"], env["TZ"] = "C", "UTC"
@@ -595,7 +595,12 @@ class World:
         # interpreter instead. A symlink to /bin/sleep behaves the same on macOS and Linux.
         self.procbin = root / "procbin"
         self.procbin.mkdir()
-        os.symlink("/bin/sleep", str(self.procbin / "claude"))
+        # 🛑 A COPY OF /bin/sh, NOT A SYMLINK TO /bin/sleep (Wed 28 Oct 2026). On Ubuntu 26.04
+        # `sleep` is a multicall binary (Rust coreutils) that dispatches on the name it was run
+        # by, so a `claude` symlink to it exited 1 at once: 56 tests failed on GitHub's
+        # ubuntu-latest. A shell run as `claude -c 'sleep 120; exit 0'` keeps its own argv[0]
+        # whatever the coreutils are — the shape `spawn(argv_tail=…)` and `server()` use.
+        shutil.copy("/bin/sh", str(self.procbin / "claude"))
         self.procs = []
 
     # --- homes ------------------------------------------------------------
@@ -673,8 +678,10 @@ class World:
             shutil.copy("/bin/sh", str(exe))
             cmd = [str(exe), "-c", "sleep 120; exit 0"] + list(argv_tail)
         else:
-            exe = str(self.procbin / "claude") if name == "claude" else "/bin/sleep"
-            cmd = [exe, "120"]
+            if name == "claude":
+                cmd = [str(self.procbin / "claude"), "-c", "sleep 120; exit 0"]
+            else:
+                cmd = ["/bin/sleep", "120"]
         p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.procs.append(p)
         return p
@@ -3037,8 +3044,8 @@ class InProc(unittest.TestCase):
         pb = self.root / "procbin"
         if not pb.exists():
             pb.mkdir()
-            os.symlink("/bin/sleep", str(pb / "claude"))
-        p = subprocess.Popen([str(pb / "claude"), "120"])
+            shutil.copy("/bin/sh", str(pb / "claude"))   # see World's procbin
+        p = subprocess.Popen([str(pb / "claude"), "-c", "sleep 120; exit 0"])
         self.procs.append(p)
         return p
 

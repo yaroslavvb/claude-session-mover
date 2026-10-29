@@ -212,7 +212,10 @@ Each one has a test that fails without the fix.
   the real tmux does. That was the flake behind `Stop.test_a_second_move_is_accepted_again_once_the_window_is_gone`,
   which failed CI on 0.4.0. Three revive tests had assumed this machine's `ps` and temp-path
   lengths. CI's Python 3.9 cell moved to ubuntu-24.04, because ubuntu-latest (26.04) no longer
-  serves 3.9.
+  serves 3.9. And the stand-in for a running session is now a copy of `/bin/sh` run as
+  `claude -c 'sleep 120; exit 0'`, not a `claude` symlink to `/bin/sleep`: on Ubuntu 26.04
+  `sleep` is a multicall binary (Rust coreutils) that dispatches on its name, so the symlink exited
+  at once and 56 tests failed there.
 - **Line 2 for a dead server child no longer contradicts itself.** With no server in its folder it
   read "open the link and say continue — its server respawns it on open (and its server is down)";
   three fresh readers of the README each took it as a contradiction. Each server state now gets one

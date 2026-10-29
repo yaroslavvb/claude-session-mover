@@ -9,6 +9,38 @@ Every fact below was measured against Claude Code 2.1.296–2.1.300 on macOS. Th
 state it reads is undocumented and can change in any CLI release; the tests pin every shape
 the tool depends on.
 
+## [0.6.2] — 2026-10-29
+
+What a live end-to-end run of the waker on throwaway sessions found (CLI 2.1.312, the same day):
+the sweep covered only half of "killed while working". 761 tests (753 + 8).
+
+### Fixed
+
+- **An unanswered PROMPT is a mid-turn kill, like an unanswered tool call.** `revive_stop` read
+  `mid-turn` only from an assistant line whose `tool_use` no later `tool_result` answers — so the
+  shape a kill in the first seconds of a turn leaves read `unknown`: not due under any wake rule,
+  and carrying `uuid: ""`, so an at-most-once key could not have named that stop even if it had
+  been. Measured on a throwaway session SIGKILLed 1.5 s after Enter: the file ends on the user's
+  own line plus the `attachment` line 2.1.312 writes after it (`attachment.type:
+  "total_tokens_reminder"`, type `attachment` — a main-chain type that carries no `message`), and
+  there is no assistant line at all. A real prompt (not `isMeta`, not a `tool_result`) with no
+  main-chain assistant line after it is now `mid-turn`, with **that prompt line's uuid as the stop
+  event** and its timestamp as the stop. This is the machine-restart case for a session that was
+  between turns, which is most of what a Wednesday 02:30 restart leaves behind.
+  - `stop.tool` is what tells the two shapes apart, and the sentences that named a tool no longer
+    invent one: the risk line becomes *it was killed before it answered its last prompt, so nothing
+    on disk says whether it had started acting on it*, and the revive note says *it was killed
+    before it answered that prompt at all* instead of naming "a tool" at an unrecorded time.
+  - ⚠️ A LIVE session that is thinking leaves exactly the same bytes on disk, so nothing about
+    liveness moved: `stalled_due` still refuses every `mid-turn` stop whose process is not gone
+    (and every row whose `ps` could not be asked, 0.6.1), and `archived` still outranks the new
+    verdict — a prompt typed into a session somebody then closed from the app was a decision.
+  - The verdict needs a prompt IN the window: a bounded tail holding only tool results reports
+    `unknown` as before, rather than calling a turn it never saw cut off. And any assistant line
+    blocks it, the `<synthetic>` "No response requested." line included (L47) — reading its absence
+    as "nothing was written" would call a stop mid-turn on the strength of a line in the file.
+  - LESSONS **L56**; README *What is due, and what is not*.
+
 ## [0.6.1] — 2026-10-29
 
 What a review of 0.6.0's sweep found the same day, before the loop was anybody's: six fixes, all

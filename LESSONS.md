@@ -880,6 +880,33 @@ hours. Every one of these is **Beta**: it is behaviour and layout nobody documen
 - **Verified.** Read off this tool's own fork row, Thu 29 Oct 2026, and reproduced in the fleet
   caller's fixtures. **Stable** (it is a rule about what a result must state).
 
+### L56 · A kill in the first seconds of a turn leaves no assistant line at all
+
+- **Rule.** "Killed while working" has **two** shapes on disk, and a reader that knows only the
+  first misses the commonest restart case. One is an assistant line whose `tool_use` no later
+  `tool_result` answers. The other is a real prompt — not `isMeta`, not a `tool_result` — with **no
+  main-chain assistant line after it**: the process died before the session said anything. Read
+  both as mid-turn, and name the stop event after the line each was read from (for the second, the
+  prompt's own uuid).
+- **Why.** Measured on CLI 2.1.312, Thu 29 Oct 2026, on a throwaway session SIGKILLed 1.5 s after
+  Enter: the transcript ends on the `user` line plus the `attachment` line the CLI writes after it
+  (`attachment.type: "total_tokens_reminder"`, type `attachment`, no `message` key), and nothing
+  else. Only the first shape counted, so that file read `unknown` with `uuid: ""` — a stop no wake
+  rule covered, and one an at-most-once key could not even name, in exactly the case an unattended
+  wake exists for (a machine restart under a session that was between turns). ⚠️ A LIVE session
+  that is merely thinking leaves the same bytes, so the verdict is about the file and liveness stays
+  `revive_state`'s answer: no mid-turn stop is due while anything is running it. And `archived`
+  still outranks it — a prompt typed into a session somebody then closed was a decision.
+- **Check.** On a throwaway session: type a prompt, `kill -9` the process within a second or two,
+  then
+  ```sh
+  tail -2 ~/.claude-<name>/projects/<folder>/<id>.jsonl | jq -c '{type, isMeta, a: .attachment.type}'
+  csm revive <id> --dry-run | sed -n '2p;4p'      # "cut off mid-turn: the last prompt has no answer"
+  ```
+- **Verified.** 2.1.312 (measured end to end on a throwaway). **Beta** — the attachment line is
+  undocumented on-disk layout; the *absence of an assistant line* is the part that does not depend
+  on it.
+
 <a id="related"></a>
 
 ## Related tools

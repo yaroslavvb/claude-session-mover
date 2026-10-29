@@ -133,7 +133,7 @@ try:                                      # POSIX only; the tool is macOS/Linux 
 except ImportError:                       # pragma: no cover
     pwd = None
 
-__version__ = "0.6.1"
+__version__ = "0.6.2"
 PROG = "claude-session-mover"
 
 HOME = Path(os.path.expanduser("~"))
@@ -6977,12 +6977,29 @@ def revive_stop(path: Path, tail: int = 0) -> dict:
       3. `api-error` — an error that is not a limit (`kind` names it).
       4. `mid-turn` — the last main-chain assistant line holds a `tool_use` that no later
          `tool_result` answers: the turn was cut off while a tool was running, and what that
-         tool did is UNKNOWN.
+         tool did is UNKNOWN. `tool` names it.
       5. `archived` — a `code 4090` system line after the last `bridge_status`, i.e. the
          session was archived or ended from the app (`archived` is also its own flag, so a
          caller can see it whichever class won).
-      6. `finished` — a clean assistant line last: it answered and stopped.
-      7. `unknown` — nothing in the window says.
+      6. `mid-turn` AGAIN, with no `tool` — the last real prompt has NO main-chain assistant
+         line after it at all: the turn was cut off before the session said anything.
+      7. `finished` — a clean assistant line last: it answered and stopped.
+      8. `unknown` — nothing in the window says.
+
+    🛑 AN UNANSWERED PROMPT IS A MID-TURN KILL TOO (added Thu 29 Oct 2026, week 44). Until
+    that day only an unanswered `tool_use` counted, so the shape a kill in the first seconds
+    of a turn leaves — the user's line written, nothing of the session's after it — read
+    `unknown` with no uuid, and an unattended wake neither covered it nor could have keyed
+    one. Measured on CLI 2.1.312 that day, on a throwaway session SIGKILLed 1.5 s after
+    Enter: the file ends on the `user` line plus the `attachment` line 2.1.312 writes after
+    it (`attachment.type: "total_tokens_reminder"`, type `attachment`, which is a main-chain
+    type and carries no `message`), and nothing else. That is the restart case for a session
+    that was between turns, and the due rule's own words are "an unanswered tool call, or an
+    unanswered user prompt". ⚠️ A LIVE session that is thinking leaves the SAME shape, which
+    is why `stalled_due` still refuses every mid-turn stop whose process is not gone: the
+    verdict here is about the file, and liveness is `revive_state`'s answer, never this one's.
+    ⚠️ And an `archived` line outranks it: a prompt typed into a session somebody then closed
+    from the app was a decision, not a failure.
 
     🛑 PARSED, AND FROM THE LAST REAL PROMPT FORWARD. A text match on the tail answers
     "does this conversation mention a rate limit", which is true of any session that
@@ -7030,7 +7047,7 @@ def revive_stop(path: Path, tail: int = 0) -> dict:
             start, out["from_prompt"] = i, True
     window = rows[start:]
     quota, api_err, last_asst = {}, {}, {}
-    bridge_i = ended_i = clean_i = -1
+    bridge_i = ended_i = clean_i = asst_i = -1
     results, mtime, ended_uuid = set(), 0.0, ""
     main = False
     for i, d in enumerate(window):
@@ -7039,6 +7056,13 @@ def revive_stop(path: Path, tail: int = 0) -> dict:
             continue                         # a subagent's turn is not the session's
         if t in MAIN_TYPES:
             main = True
+        if t == "assistant":
+            # 🛑 ANY assistant line, not just one of the three the branches below keep. The
+            # unanswered-prompt verdict asks "did the session say ANYTHING after that
+            # prompt", and `last_asst` cannot answer it: a `<synthetic>` non-answer sets
+            # none of the three, and reading its absence as "nothing was written" would call
+            # a stop mid-turn on the strength of a line that is right there in the file.
+            asst_i = i
         if t == "system":
             txt = _text_of(d.get("message")) or str(d.get("content") or "")
             if d.get("subtype") == "bridge_status":
@@ -7133,6 +7157,17 @@ def revive_stop(path: Path, tail: int = 0) -> dict:
         out.update(stop="archived", at=mtime, uuid=ended_uuid)
         out["why"] = ("it was archived or ended from the app (%s after the last "
                       "/remote-control report)" % ENDED_REMOTELY)
+    elif out["from_prompt"] and asst_i < 0:
+        # 🛑 THE PROMPT ITSELF IS THE STOP EVENT, so its own uuid names it (the at-most-once
+        # key). `window[0]` IS that prompt: the window opens at the last real, non-`isMeta`,
+        # non-`tool_result` user line, and `from_prompt` is what says one was found in the
+        # window at all — without it a tail holding only tool results would report the stop
+        # of a turn whose prompt this read never saw. `tool` stays empty, and that is the one
+        # thing that tells the two mid-turn shapes apart downstream (`revive_risk`, the note).
+        p = window[0]
+        out.update(stop="mid-turn", at=_stamp(p), uuid=str(p.get("uuid") or ""))
+        out["why"] = ("it was cut off mid-turn: the last prompt has no answer of any kind "
+                      "after it, so it was killed before it said anything")
     elif last_asst:
         out.update(stop="finished", at=_stamp(last_asst),
                    uuid=str(last_asst.get("uuid") or ""))
@@ -7638,12 +7673,18 @@ def revive_note(s: Session, rec: dict, action: str, tgt: Account = None, say: st
     for key in reversed(REVIVE_NOTE_OPTIONAL):
         if key in opt:
             body.append(opt[key])
-    if stop.get("stop") == "mid-turn":
+    if stop.get("stop") == "mid-turn" and stop.get("tool"):
         body.append("Its last tool call (%s, %s) has no recorded result: check whether it "
                     "took effect before repeating it."
-                    % (stop.get("tool") or "a tool",
+                    % (stop["tool"],
                        time.strftime("%H:%M", time.localtime(stop["tool_at"]))
                        if stop.get("tool_at") else "time unrecorded"))
+    elif stop.get("stop") == "mid-turn":
+        # No `tool`: it was killed before it wrote anything of its own after the prompt, so
+        # there is no call to check — the prompt above this note is the work, unstarted as
+        # far as the file knows.
+        body.append("It was killed before it answered that prompt at all, so nothing it may "
+                    "have begun is recorded: read the folder before repeating anything.")
     # ⚠️ VERBATIM, inside the quotes, and the full stop is OUTSIDE them: the sentence has
     # to close, and nothing may be added to or taken from what he typed.
     # ⚠️ AND THE UNATTENDED SENTENCE NAMES THE INSTALLATION, NOT A PERSON: on an `--auto` run
@@ -8519,10 +8560,15 @@ def revive_risk(rec: dict, dec: dict) -> str:
     """
     stop = rec.get("stop") or {}
     lost = rec.get("lost_work") or {}
-    if stop.get("stop") == "mid-turn":
+    if stop.get("stop") == "mid-turn" and stop.get("tool"):
         return ("its last tool call (%s) has no recorded result — it may have fully "
                 "applied, partly applied or not run, and neither assumption is safe"
-                % (stop.get("tool") or "a tool"))
+                % stop["tool"])
+    if stop.get("stop") == "mid-turn":
+        # The other mid-turn shape: killed before it answered the prompt at all (no `tool`).
+        # Nothing it may have started is on disk, so the risk is the unread work, not a call.
+        return ("it was killed before it answered its last prompt, so nothing on disk says "
+                "whether it had started acting on it")
     if stop.get("archived") and dec.get("row") != 7:
         return ("it was archived or ended from the app (%s): somebody or the fleet's "
                 "7-day sweep closed it" % ENDED_REMOTELY)

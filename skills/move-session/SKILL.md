@@ -329,7 +329,9 @@ opens the OLD copy. Say that out loud when you use it, and tell them to archive 
   plugins, and across organizations a first turn that re-reads the whole conversation on the new account's quota.
 - **A mid-turn stop is the risky one.** When the tool reports that the last tool call has no recorded result, pass
   that on in those words: it may have fully applied, partly applied or not run, and the revived session is told
-  the same thing.
+  the same thing. The other mid-turn wording — *the last prompt has no answer of any kind after it* — is a kill a
+  few seconds earlier: there is no call to check, and nothing it may have begun is on disk. Say that instead of
+  inventing a tool; the user's own last message is the work.
 - **Lost agents.** When the diagnosis names errored agents of a workflow run, say how many and which — that work
   is outstanding whatever the run's own status file claims.
 - **It waits for nothing and signals nothing.** A limit still in force is a refusal carrying the local reset time,

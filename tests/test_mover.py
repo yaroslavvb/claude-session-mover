@@ -4522,6 +4522,25 @@ def tool_answer(cwd, sid, tid="tu_1", uuid="u9", parent="a9"):
     return d
 
 
+def tokens_reminder(cwd, sid, uuid="t9", parent="u1"):
+    """The line 2.1.312 writes straight after a user's prompt, so a transcript killed one
+    second into the turn does NOT end on the prompt itself.
+
+    🛑 THE MEASURED SHAPE (the config homes on this machine, Thu 29 Oct 2026, week 44):
+    `type: "attachment"` — a `MAIN_TYPES` member, so it makes the window non-empty — with
+    `attachment.type: "total_tokens_reminder"`, a `renderedRole` of `system`, its own uuid,
+    and NO `message` key at all. It is neither the prompt nor an answer to it, which is
+    exactly why the reader has to look past the last line to tell the two apart.
+    """
+    return {"type": "attachment", "cwd": cwd, "sessionId": sid, "isSidechain": False,
+            "attachment": {"type": "total_tokens_reminder",
+                           "text": "<total_tokens>15000000 tokens left</total_tokens>"},
+            "rendered": [{"content": "<system-reminder>\n<total_tokens>15000000 tokens "
+                                     "left</total_tokens>\n</system-reminder>"}],
+            "renderedRole": "system", "userType": "external", "entrypoint": "cli",
+            "uuid": uuid, "parentUuid": parent}
+
+
 class ReviveDiagnose(InProc):
     """🛑 WHY IT STOPPED, WHAT IT IS, AND WHETHER IT RUNS — the three answers every revive
     action is chosen from, so every one of them is pinned here rather than inferred.
@@ -4760,9 +4779,78 @@ class ReviveDiagnose(InProc):
         self.assertEqual(st["stop"], "empty")
         self.assertIn("nothing to continue", st["why"])
 
-    def test_a_prompt_nothing_answered_is_unknown_not_a_finish(self):
-        st = self.stop_of(self.go())
+    def stamped_go(self, stamp="2026-10-29T01:12:03.000Z"):
+        """The last real prompt, with a timestamp: for this stop the PROMPT is the event."""
+        d = self.go()
+        d["timestamp"] = stamp
+        return d
+
+    def test_an_unanswered_PROMPT_is_a_mid_turn_kill_and_names_itself(self):
+        """🛑 THE SHAPE A KILL IN THE FIRST SECONDS OF A TURN LEAVES (Thu 29 Oct 2026, wk 44).
+
+        Measured that day on a throwaway session SIGKILLed 1.5 s after Enter, CLI 2.1.312:
+        the file ends on the user's line plus the `total_tokens_reminder` attachment, and
+        there is no assistant line after it at all. Only an unanswered `tool_use` counted as
+        `mid-turn` until then, so this read `unknown` with `uuid: ""` — a stop no wake rule
+        covered and no at-most-once key could name, in the one case (a machine restart under
+        a session between turns) the unattended wake exists for.
+        """
+        go = self.stamped_go()
+        st = self.stop_of(go, tokens_reminder(self.cwd, SID_A))
+        self.assertEqual(st["stop"], "mid-turn")
+        self.assertIn("the last prompt has no answer of any kind", st["why"])
+        self.assertIn("killed before it said anything", st["why"])
+        # 🛑 THE PROMPT LINE IS THE STOP EVENT: its uuid is the at-most-once key, and its
+        # stamp is when the work stopped — not the file's mtime, which a later touch moves.
+        self.assertEqual(st["uuid"], "u1")
+        self.assertEqual(st["at"], self.mod._stamp(go))
+        self.assertTrue(st["from_prompt"])
+        # ⚠️ AND NO TOOL, which is what tells the two mid-turn shapes apart downstream:
+        # there is no call whose result might be missing, because nothing ran.
+        self.assertEqual((st["tool"], st["tool_at"]), ("", 0.0))
+
+    def test_the_prompt_alone_is_the_same_verdict_as_the_prompt_and_its_attachment(self):
+        """The attachment is 2.1.312's; a build that writes none, or a kill between the two
+        writes, leaves the prompt as the whole file — one stop, read the same way."""
+        for tail in ([], [tokens_reminder(self.cwd, SID_A)]):
+            st = self.stop_of(self.stamped_go(), *tail)
+            self.assertEqual((st["stop"], st["uuid"]), ("mid-turn", "u1"), tail)
+
+    def test_a_tail_with_no_prompt_in_it_reports_no_stop_of_its_own(self):
+        """🛑 `from_prompt` IS THE GUARD. A window that holds tool results and nothing else
+        never saw the prompt it belongs to, so it must not report that prompt's turn as cut
+        off: `revive_stop` reads a bounded tail, and the one honest answer there is
+        `unknown` (which the sweep's prefilter treats as "read this file properly")."""
+        st = self.stop_of(tool_answer(self.cwd, SID_A))
+        self.assertEqual((st["stop"], st["from_prompt"]), ("unknown", False))
+
+    def test_a_line_the_session_wrote_ITSELF_is_never_an_unanswered_prompt(self):
+        """🛑 ANY assistant line blocks this verdict, including the one that records a
+        NON-answer. `<synthetic>` "No response requested." is not the session answering —
+        `answered_here` refuses to count it — but it IS a line written after the prompt, so
+        reading its absence as "nothing was written" would call a stop mid-turn on the
+        strength of a line that is right there in the file."""
+        st = self.stop_of(self.stamped_go(),
+                          assistant("No response requested.", self.cwd, SID_A,
+                                    synthetic=True, uuid="a9", parent="u1"))
         self.assertEqual(st["stop"], "unknown")
+        # and a real answer is a finish, exactly as before
+        self.assertEqual(self.stop_of(self.stamped_go(), self.clean())["stop"], "finished")
+
+    def test_an_archive_outranks_an_unanswered_prompt(self):
+        """A prompt typed into a session somebody then closed from the app was a DECISION,
+        not a failure to repair — and `stalled_due` refuses every archived row anyway."""
+        st = self.stop_of(self.stamped_go(), STATUS_LINE, ENDED_LINE)
+        self.assertEqual(st["stop"], "archived")
+        self.assertIs(st["archived"], True)
+
+    def test_a_subagents_turn_is_not_an_answer_to_his_prompt(self):
+        """`isSidechain` lines are skipped everywhere else in this reader for the same
+        reason: a subagent's turn is not the session's own."""
+        side = assistant("working on it", self.cwd, SID_A, uuid="s1", parent="u1")
+        side["isSidechain"] = True
+        st = self.stop_of(self.stamped_go(), side)
+        self.assertEqual((st["stop"], st["uuid"]), ("mid-turn", "u1"))
 
     def test_the_window_opens_at_the_last_REAL_prompt(self):
         """A `tool_result` and an `isMeta` line are both `type: "user"` and neither is a
@@ -5234,6 +5322,16 @@ class ReviveNoteText(InProc):
         self.assertIn("has no recorded result: check whether it took effect before "
                       "repeating it.", n)
         self.assertNotIn("no recorded result", self.note())
+
+    def test_a_mid_turn_stop_with_no_tool_says_nothing_about_a_call(self):
+        """🛑 THE SECOND MID-TURN SHAPE (Thu 29 Oct 2026, week 44): killed before it answered
+        the prompt at all, so `tool` is empty. The sentence above would have named "a tool"
+        and a time nothing recorded — a claim about a call the file does not hold, in the one
+        message he reads."""
+        n = self.note(over={"stop": {"stop": "mid-turn", "tool": "", "tool_at": 0.0}})
+        self.assertIn("It was killed before it answered that prompt at all", n)
+        self.assertIn("read the folder before repeating anything.", n)
+        self.assertNotIn("tool call", n)
 
     def test_say_is_quoted_verbatim_and_attributed_to_him(self):
         n = self.note(say="  drop the camera half and finish the power model  ")
@@ -5835,6 +5933,16 @@ class ReviveDryRun(Base):
         out = self.ok(self.revive(SID_A))
         self.assertIn("3 risk: its last tool call (Bash) has no recorded result", out)
         self.assertIn("neither assumption is safe", out)
+
+    def test_the_other_mid_turn_shape_names_no_tool_it_cannot_see(self):
+        """🛑 A MID-TURN STOP WITH NO TOOL IS A KILL BEFORE THE FIRST WORD (Thu 29 Oct 2026).
+        The sentence used to say "its last tool call (a tool) has no recorded result" for it,
+        which invents a call the transcript does not hold — and the risk is the opposite one:
+        not whether a call took effect, but that nothing says how far it got."""
+        self.dead(lines=[self.go(), tokens_reminder(self.cwd, SID_A)])
+        out = self.ok(self.revive(SID_A))
+        self.assertIn("3 risk: it was killed before it answered its last prompt", out)
+        self.assertNotIn("(a tool)", out)
 
     def test_the_lost_agents_reach_the_three_line_answer(self):
         t = self.dead()
@@ -7397,6 +7505,31 @@ class Stalled(ReviveRun):
         by_id = dict((x["local_id"], x) for x in got["rows"])
         self.assertTrue(by_id[SID_A]["due"], by_id[SID_A]["why"])
         self.assertEqual(by_id[SID_A]["stop"]["stop"], "mid-turn")
+        self.assertIn("killed mid-turn", by_id[SID_A]["why"])
+        self.assertFalse(by_id[SID_B]["due"], by_id[SID_B]["why"])
+        self.assertEqual(by_id[SID_B]["why"], "it is working right now")
+
+    def test_a_session_killed_right_after_Enter_is_due_and_a_busy_one_never_is(self):
+        """🛑 THE WEDNESDAY-RESTART CASE THE SWEEP USED TO MISS (Thu 29 Oct 2026, week 44).
+
+        A session killed between turns has written the prompt and nothing of its own after
+        it — measured on 2.1.312, 1.5 s after Enter: the user line plus the
+        `total_tokens_reminder` attachment. That read `unknown`, so the row was not due and
+        carried no stop uuid to key a wake on; the brief's own due rule says "an unanswered
+        tool call, or an unanswered user prompt".
+
+        🛑 AND THE LIVE SESSION BESIDE IT IS THE REASON THE RULE IS NARROW: a session that is
+        THINKING leaves the same shape on disk, so what keeps it out is `revive_state`'s
+        answer and never the transcript's.
+        """
+        self.dead(lines=[self.go(), tokens_reminder(self.cwd, SID_A)])
+        self.alive(SID_B, status="busy",
+                   lines=[self.go(SID_B), tokens_reminder(self.cwd, SID_B)])
+        got, _r = self.doc()
+        by_id = dict((x["local_id"], x) for x in got["rows"])
+        self.assertTrue(by_id[SID_A]["due"], by_id[SID_A]["why"])
+        self.assertEqual(by_id[SID_A]["stop"]["stop"], "mid-turn")
+        self.assertEqual(by_id[SID_A]["stop"]["uuid"], "u1")
         self.assertIn("killed mid-turn", by_id[SID_A]["why"])
         self.assertFalse(by_id[SID_B]["due"], by_id[SID_B]["why"])
         self.assertEqual(by_id[SID_B]["why"], "it is working right now")

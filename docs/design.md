@@ -1,6 +1,6 @@
 # Claude Session Mover: design and implementation
 
-Version 0.6.1 · code **[github.com/yaroslavvb/claude-session-mover](https://github.com/yaroslavvb/claude-session-mover)**
+Version 0.6.2 · code **[github.com/yaroslavvb/claude-session-mover](https://github.com/yaroslavvb/claude-session-mover)**
 (MIT, one Python file, standard library only).
 
 Everything here is Claude Code's own **undocumented on-disk state**. It has already changed inside one minor
@@ -773,7 +773,7 @@ handed to the id-prefix or title rungs: a session whose first prompt *pasted* th
 |---|---|
 | `kind` | `server-child` (its local id *is* `uuid5` of a bridge id — from the link, the registry, or an orphan `~/.claude/bridge-spawn/cse_X-*` directory that derives to this transcript; **or, with none of those left, from the id's own uuid version** — see below), `self-hosted` (a `bridge-session` line or a `bridge_status` url it wrote itself), `terminal`, `desktop`. 🛑 Never the registry's `entrypoint`: that says how the process was started, and a fork or a resume rewrites it |
 | `state` | `live-busy` / `live-idle` (a registry row whose pid is proved by `procStart`) or `dead`, plus a machine-wide `ps` sweep for an argv naming `cse_<bare>` or the local id — a registry file survives the `SIGKILL` of its own process |
-| `stop` | `usage-limit` (class, window, `resetsAt`, still in force?), `api-error`, `mid-turn` (the last main-chain assistant line holds a `tool_use` no later `tool_result` answers), `archived` (a `code 4090` line after the last `bridge_status`), `finished`, `empty`, `unknown` — parsed as JSON lines over `CSM_REVIVE_TAIL` (1 MiB), from the last real prompt forward. It also carries `uuid`, the uuid of the line the verdict was read from: the **stop event's own name**, and half the at-most-once key of an unattended wake |
+| `stop` | `usage-limit` (class, window, `resetsAt`, still in force?), `api-error`, `mid-turn` (the last main-chain assistant line holds a `tool_use` no later `tool_result` answers — **or**, 0.6.2, the last real prompt has no main-chain assistant line after it at all: killed before it said anything, and `tool` is then empty), `archived` (a `code 4090` line after the last `bridge_status`), `finished`, `empty`, `unknown` — parsed as JSON lines over `CSM_REVIVE_TAIL` (1 MiB), from the last real prompt forward. It also carries `uuid`, the uuid of the line the verdict was read from: the **stop event's own name**, and half the at-most-once key of an unattended wake |
 | `lost_work` | the agents whose own `state` is `error` in the sibling directory's `workflows/wf_*.json`. 🛑 Never the file's top-level `status`, which reads `completed` on the incident where five agents died on the limit |
 | `account` | whether the session's own home can still run it, plus the meter — and the 5-hour instant comes from the transcript, never from the meter's seven-day `resets_at` |
 | `server` | whether a `claude remote-control` server is up with that folder as its cwd (`ps` plus `lsof -a -d cwd`), which is the one thing that decides whether opening the link brings a server child back by itself |
@@ -933,6 +933,12 @@ words nothing matched is not on the positive list either — an unread class is 
 stop is not due (it answered), nor is `api-error` (time does not fix it). And six states are never due whatever
 the stop: `live-busy`, bot-owned, owned by a scheduled pass that is not live-idle, **unmeasured**, `empty`, and
 archived. Every row carries its reason in `why`, so "not due" is never a silence.
+
+🛑 **And `mid-turn` has two shapes since 0.6.2.** The second is a real prompt with no main-chain assistant line
+after it — the file a kill in the first seconds of a turn leaves, measured on 2.1.312 as the user's line plus the
+`total_tokens_reminder` attachment and nothing else. Before 0.6.2 that read `unknown`: not due, and carrying no
+`uuid`, so the at-most-once key had no name for the stop. The prompt line itself is the stop event. ⚠️ A live
+session that is thinking leaves the same bytes, which is why the refusal below matters more, not less.
 
 🛑 **Unmeasured is the sixth, and it was added in 0.6.1.** A session is only called live by proving its registry
 row, and that proof needs `ps`; `ps_table` answers `None` when `ps` could not be *asked*, and `None` is never

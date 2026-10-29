@@ -200,6 +200,8 @@ mode, the row it took — and the note it would send.)
 Line **1** is why it stopped, read out of the transcript: `it answered and stopped` (a clean last turn — the
 ordinary shape of a session killed while idle), `it was cut off mid-turn: its last tool call (<tool>) has no
 recorded result, so what that call did is UNKNOWN` (a kill in the middle of work — read this one carefully),
+`it was cut off mid-turn: the last prompt has no answer of any kind after it, so it was killed before it said
+anything` (the same kill, a few seconds earlier — nothing it may have begun is on disk),
 `it hit a <kind> limit, which resets <time>` (with ` — that reset has passed` on the end when it has, which
 is why a limit in line 1 does not always decide line 2), `it was archived or ended from the app`, or
 `its last turn ended on <error>, which is not a limit`.
@@ -220,8 +222,9 @@ Line **2** is what a real run would do — one sentence per case, from the decid
 | `nothing to do: it was archived or ended from the app` | somebody, or a sweep, closed it on purpose | `csm revive <link> --unarchive` if you do mean to reopen it, which unarchives it |
 | `nothing to do: <owner> owns this session` | a supervisor, a bot or a scheduled pass keeps this session | that program's own command, which the refusal names |
 
-Line **3** is the one risk, worst first, and it outranks the mechanism: an unanswered tool call, an archive
-somebody made on purpose, or agents a frozen workflow run lost each change what you should do next.
+Line **3** is the one risk, worst first, and it outranks the mechanism: an unanswered tool call, a prompt it
+never answered, an archive somebody made on purpose, or agents a frozen workflow run lost each change what you
+should do next.
 
 **3. Do it.** The same command without `--dry-run`:
 
@@ -1077,8 +1080,9 @@ REVIVE  the refactor sweep   (work, bf974a77)
 its meter, whether a server is up in that folder, who else owns it, the link, the folder, the mode, the row it
 took — and then the note itself.)
 
-The risk line is worst-first and outranks the row's own mechanism: an unanswered tool call, an archive somebody
-made on purpose, and the agents a frozen workflow run lost each change what you should do next. Why it stopped
+The risk line is worst-first and outranks the row's own mechanism: an unanswered tool call (or a prompt it was
+killed before answering at all), an archive somebody made on purpose, and the agents a frozen workflow run lost
+each change what you should do next. Why it stopped
 is **parsed as JSON lines over the last 1 MiB** (`CSM_REVIVE_TAIL`), from the last real prompt forward, never
 grepped — a text match on the tail says "out of quota" about any session that merely discussed one, and the
 listing's 384 KiB window misses the limit lines of a long agentic session entirely.
@@ -1192,6 +1196,16 @@ row, and that proof needs `ps`; with `ps` unaskable every live session reads `de
 BUSY ends its transcript on an unanswered tool call, which is exactly the `mid-turn` shape above. So a row whose
 `state.ps_asked` is false is listed with that reason, counted in `coverage.unread`, and **not** due: resuming a
 session that is running puts two CLIs on one transcript, which `revive` itself refuses.
+
+**An unanswered PROMPT is a mid-turn kill too** (0.6.2). Both halves of "killed while working" are read out of
+the transcript: an assistant line whose `tool_use` no later `tool_result` answers, **and** a real prompt with no
+main-chain assistant line after it at all — the shape a kill in the first seconds of a turn leaves (measured on
+CLI 2.1.312: the user's line, then the `total_tokens_reminder` attachment, and nothing else). Until 0.6.2 the
+second read `unknown`, so a restart that landed between two turns was neither due nor nameable — the stop
+carried no uuid to key an at-most-once wake on. The stop event is the prompt line itself, and `stop.tool` is
+what tells the two shapes apart: empty means nothing it may have begun is recorded at all. A live session that
+is *thinking* leaves the same bytes on disk, which is why no mid-turn stop is ever due while something is
+running it.
 
 **One stop event is one wake, however many copies of the transcript exist** — see *At most once per stop* below.
 

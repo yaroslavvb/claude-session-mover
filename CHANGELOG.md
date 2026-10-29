@@ -9,6 +9,16 @@ Every fact below was measured against Claude Code 2.1.296–2.1.300 on macOS. Th
 state it reads is undocumented and can change in any CLI release; the tests pin every shape
 the tool depends on.
 
+## [0.6.4] — 2026-10-29
+
+- **A one-shot `claude -p` run is never due.** The first real dry run of a watchdog over `csm stalled` found
+  exactly one due session, and it was a script's `claude -p` research helper killed mid-run; reviving it would
+  have opened an interactive session on a new claude.ai link for a task whose caller had already given up on it.
+  `revive_stop` now records the `entrypoint` of the last main-chain line it read, and `stalled_due` declines a
+  terminal-kind session whose last writer was print mode (`sdk-cli`). A Remote Control server child also runs in
+  print mode, but it is told apart by its id, never by this field; and a one-shot run later resumed by hand
+  reads `cli` and is due again. `csm revive <id>` by hand still revives one.
+
 ## [0.6.3] — 2026-10-29
 
 What an adversarial review of 0.6.2 found the same day, by running both readers over every

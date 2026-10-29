@@ -133,7 +133,7 @@ try:                                      # POSIX only; the tool is macOS/Linux 
 except ImportError:                       # pragma: no cover
     pwd = None
 
-__version__ = "0.6.3"
+__version__ = "0.6.4"
 PROG = "claude-session-mover"
 
 HOME = Path(os.path.expanduser("~"))
@@ -7040,7 +7040,8 @@ def revive_stop(path: Path, tail: int = 0) -> dict:
     out = {"stop": "unknown", "why": "", "at": 0.0, "age": "", "read_bytes": 0,
            "lines": 0, "from_prompt": False, "archived": False, "uuid": "",
            "class": "", "clears_with_time": None, "window": "", "resets_at": 0.0,
-           "in_force": False, "message": "", "kind": "", "tool": "", "tool_at": 0.0}
+           "in_force": False, "message": "", "kind": "", "tool": "", "tool_at": 0.0,
+           "entrypoint": ""}
     want = int(tail or REVIVE_TAIL_BYTES)
     size = file_size(path)
     if size is None:
@@ -7078,6 +7079,8 @@ def revive_stop(path: Path, tail: int = 0) -> dict:
         t = d.get("type")
         if d.get("isSidechain"):
             continue                         # a subagent's turn is not the session's
+        if d.get("entrypoint"):
+            out["entrypoint"] = str(d["entrypoint"])   # the LAST writer's: see stalled_due
         if t in MAIN_TYPES:
             main = True
         if t == "assistant":
@@ -9687,6 +9690,20 @@ def stalled_due(rec: dict, handled: dict, now: float = 0.0) -> dict:
     if own.get("owner") and st != "live-idle":
         return no("%s owns it and it is %s, so its own supervisor is what puts it back"
                   % (own.get("owner"), st))
+    if ((rec.get("kind") or {}).get("kind") == "terminal"
+            and stop.get("entrypoint") == "sdk-cli"):
+        # 🛑 A ONE-SHOT `claude -p` RUN IS NOT A CONVERSATION (added Thu 29 Oct 2026, week 44).
+        # The first real dry run of a watchdog over this sweep found exactly one due session:
+        # a pipeline's `claude -p` research helper, killed mid-run at 05:11. Reviving it would
+        # have opened an interactive session on a new claude.ai link for a task whose caller
+        # had long since given up on it. Its lines were written in print mode (`entrypoint:
+        # sdk-cli`) and it has no Remote Control link, so whatever started it owns its outcome.
+        # ⚠️ The field is the LAST writer's, which is what makes it the right question here and
+        # the wrong one for `revive_kind`: a server child is also `--print`, but it is told
+        # apart by its id, and a one-shot run later resumed by hand reads `cli` and is due
+        # again. `csm revive <id>` by hand still revives it.
+        return no("it was a one-shot `claude -p` run (written in print mode, with no Remote "
+                  "Control link), so whatever started it owns its outcome")
     if st == "live-busy":
         return no("it is working right now")
     if not (rec.get("state") or {}).get("ps_asked"):

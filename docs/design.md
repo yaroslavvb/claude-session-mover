@@ -930,9 +930,9 @@ sweep.
 (`session`, `weekly`) once `resetsAt + CSM_WAKE_MARGIN_S` has passed; and a `mid-turn` stop whose process is gone,
 inside `CSM_WAKE_MAX_AGE_H`. `monthly-spend`, `credits` and `model` never clear by waiting, and a class whose own
 words nothing matched is not on the positive list either — an unread class is not a clearable one. A `finished`
-stop is not due (it answered), nor is `api-error` (time does not fix it). And six states are never due whatever
-the stop: `live-busy`, bot-owned, owned by a scheduled pass that is not live-idle, **unmeasured**, `empty`, and
-archived. Every row carries its reason in `why`, so "not due" is never a silence.
+stop is not due (it answered), nor is `api-error` (time does not fix it). And seven states are never due whatever
+the stop: `live-busy`, bot-owned, owned by a scheduled pass that is not live-idle, a **one-shot `claude -p` run**
+(terminal kind, last line written in print mode, since 0.6.4), **unmeasured**, `empty`, and archived. Every row carries its reason in `why`, so "not due" is never a silence.
 
 🛑 **And `mid-turn` has two shapes since 0.6.2.** The second is a real prompt with no main-chain assistant line
 after it — the file a kill in the first seconds of a turn leaves, measured on 2.1.312 as the user's line plus the

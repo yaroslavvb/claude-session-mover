@@ -7613,6 +7613,26 @@ class Stalled(ReviveRun):
         self.assertFalse(by_id[SID_B]["due"], by_id[SID_B]["why"])
         self.assertEqual(by_id[SID_B]["why"], "it is working right now")
 
+    def test_a_one_shot_print_mode_run_is_never_due_and_the_same_session_resumed_is(self):
+        """🛑 A pipeline's `claude -p` helper killed mid-run is not a conversation of his: the
+        first real dry run of the watchdog found one and would have opened it as a new
+        interactive session (Thu 29 Oct 2026). Its lines carry `entrypoint: sdk-cli`; the
+        same terminal session written interactively (`cli`) is due as before."""
+        def headless(d, ep):
+            d = dict(d)
+            d["entrypoint"] = ep
+            return d
+        self.dead(lines=[headless(self.go(), "sdk-cli"),
+                         headless(tool_call(self.cwd, SID_A), "sdk-cli")])
+        got, _doc, _r = self.row()
+        self.assertFalse(got["due"], got["why"])
+        self.assertIn("one-shot `claude -p` run", got["why"])
+        self.assertEqual(got["stop"]["stop"], "mid-turn")
+        self.dead(lines=[headless(self.go(), "sdk-cli"),
+                         headless(tool_call(self.cwd, SID_A), "cli")])
+        got, _doc, _r = self.row()
+        self.assertTrue(got["due"], got["why"])
+
     def test_a_mid_turn_kill_older_than_the_cap_is_listed_and_not_due(self):
         t = self.dead(lines=[self.go(), tool_call(self.cwd, SID_A)])
         old = time.time() - 50 * 3600

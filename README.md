@@ -1183,12 +1183,13 @@ into one spends its first turn hitting the same wall. Nor is a limit whose class
 an unread class is not a clearable one. A clean finish is not due either (it answered, and there is nothing to
 continue), and nor is an API error, which time does not fix.
 
-**And six things are never due, whatever their stop**: a session that is **working** right now (a message would
+**And seven things are never due, whatever their stop**: a session that is **working** right now (a message would
 join the turn it is in the middle of); one a **bot** owns (a relay into a bot's session surfaces as a message in
 the channel that bot answers); one a **scheduled pass** owns that is not live and idle (its own supervisor puts
-that one back); one whose **state could not be measured**; one with **no conversation** in it (a Remote Control
-server pre-creates those by the hundred); and one **archived or ended from the app**, which was somebody's
-decision and not a failure to repair. Every row `csm stalled` prints carries its reason in `why`, so "not due"
+that one back); a **one-shot `claude -p` run** with no Remote Control link (a script's helper: whatever started it
+owns its outcome, and reviving it would open an interactive session nobody asked for); one whose **state could not
+be measured**; one with **no conversation** in it (a Remote Control server pre-creates those by the hundred); and one
+**archived or ended from the app**, which was somebody's decision and not a failure to repair. Every row `csm stalled` prints carries its reason in `why`, so "not due"
 is never a silence.
 
 **An unmeasured state is never a dead one** (0.6.1). A session can only be called live by *proving* its registry

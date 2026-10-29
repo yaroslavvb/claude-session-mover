@@ -5296,6 +5296,18 @@ class ReviveNoteText(InProc):
         over = {"lost_work": {"errors": 9, "labels": ["label-%d" % i for i in range(6)]},
                 "stop": {"resets_at": time.time() - 600}}
         long_say = "please " + "x" * 380
+        self.mod.REVIVE_NOTE_MAX = 10 ** 6   # with room, every clause is there
+        full = self.mod.revive_note(self.s, self.rec(**over), "move", tgt=tgt, say=long_say,
+                                    when="Wed 11:00", boot=0.0)
+        self.assertIn("Auto memory", full)
+        self.assertIn("9 agent(s)", full)
+        self.assertIn("Since then:", full)
+        # 🛑 One character short of the whole note, so exactly the first clause in the drop
+        # order has to go. Set from the note's own length because that length includes this
+        # run's temporary paths: GitHub's `/tmp/tmpXXXX` is short enough that the default
+        # budget fitted every clause, and the test failed there while passing on a Mac with
+        # a long TMPDIR (Wed 28 Oct 2026).
+        self.mod.REVIVE_NOTE_MAX = len(full) - 1
         n = self.mod.revive_note(self.s, self.rec(**over), "move", tgt=tgt, say=long_say,
                                  when="Wed 11:00", boot=0.0)
         self.assertLessEqual(len(n), self.mod.REVIVE_NOTE_MAX)
@@ -5303,12 +5315,6 @@ class ReviveNoteText(InProc):
         self.assertIn(long_say, n, "his own words are never shortened")
         self.assertIn("csm moved it from", n)
         self.assertIn("Re-check anything time-sensitive", n)
-        self.mod.REVIVE_NOTE_MAX = 10 ** 6   # with room, every clause is there
-        n = self.mod.revive_note(self.s, self.rec(**over), "move", tgt=tgt, say=long_say,
-                                 when="Wed 11:00", boot=0.0)
-        self.assertIn("Auto memory", n)
-        self.assertIn("9 agent(s)", n)
-        self.assertIn("Since then:", n)
 
 
 class ReviveDryRun(Base):
@@ -5545,7 +5551,12 @@ class ReviveDryRun(Base):
                        lines=[self.go(LINK_SID), self.clean(LINK_SID)])
         dec = self.row_of(link_of(LINK_BARE))
         self.assertEqual((dec["row"], dec["action"], dec["exit"]), (9, "keep-link", 0))
-        self.assertIn("say continue", dec["what"])
+        # 🛑 NOT "say continue": whether that advice is given depends on whether a server
+        # runs in the folder, which this end-to-end run reads off the REAL machine's `ps`
+        # (a CI runner has none, a Remote Control Mac has dozens). Each server state's
+        # wording is pinned by the pure test below; this one pins the row.
+        self.assertIn("nothing is started", dec["what"])
+        self.assertIn(link_of(LINK_BARE), dec["what"])
         self.assertIn("--new-link", dec["risk"])
         self.assertFalse(dec["note"], "nothing is started, so nothing is told anything")
         out = self.ok(self.revive(link_of(LINK_BARE)))
@@ -5752,9 +5763,12 @@ class ReviveDryRun(Base):
         self.dead()
         got = self.rec(SID_A, "--say", "finish the power model")
         self.assertIn('He said: "finish the power model".', got["note"])
-        # the printed block wraps at the page width, so it is matched on one unbroken word
-        self.assertIn('He said: "finish',
-                      self.ok(self.revive(SID_A, "--say", "finish the power model")))
+        # The printed block wraps at the page width, and WHERE depends on how long this run's
+        # temporary paths are (they are in the note before his words; a short TMPDIR, or
+        # macOS turning /tmp into /private/tmp, moves the break). So the whitespace is folded
+        # before matching, and the whole quotation is matched.
+        out = self.ok(self.revive(SID_A, "--say", "finish the power model"))
+        self.assertIn('He said: "finish the power model".', " ".join(out.split()))
         self.refused(self.revive(SID_A, "--say", "/compact"), "runs a leading")
 
     def test_an_unknown_permission_mode_is_refused_in_the_dry_run(self):

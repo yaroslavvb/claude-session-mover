@@ -665,7 +665,7 @@ class World:
         self.procs.append(p)
         return p
 
-    def server(self, name="aifoundry"):
+    def server(self, name="myproject"):
         """A real process whose `ps` line reads `…/claude remote-control --name <name>` —
         the shape `RC_SERVER_RE` recognises as a Remote Control SERVER.
 
@@ -2122,7 +2122,7 @@ class CrossMachine(Base):
         """🛑 It used to exit 0 whatever it found, which reads as "asked and answered".
 
         The exit code was verified unused before it was changed: nothing under
-        `flush-util` — the one installation that drives csm from scheduled passes — runs
+        the wrapper — the one installation that drives csm from scheduled passes — runs
         `find` at all. A caller wanting rows counts `--json`, never the status.
         """
         r = self.csm("find", "no-such-session", "--on", "desktop")
@@ -2151,12 +2151,12 @@ class CrossMachine(Base):
         """A session as a dead Remote Control child leaves it on the other machine: the
         transcript's NAME is the only thing tying it to its claude.ai link."""
         cwd = str(self.w.work)
-        d = self.remote / ".claude-yvb2" / "projects" / (folder or slug_of(cwd))
+        d = self.remote / ".claude-work2" / "projects" / (folder or slug_of(cwd))
         d.mkdir(parents=True, exist_ok=True)
         (d / (sid + ".jsonl")).write_text(jl(*(lines or [
             user("the one that died over there", cwd, sid),
             assistant("working on it", cwd, sid)])))
-        (self.remote / ".claude-yvb2" / ".claude.json").write_text(json.dumps(
+        (self.remote / ".claude-work2" / ".claude.json").write_text(json.dumps(
             {"oauthAccount": {"emailAddress": "you@two.example",
                               "organizationUuid": "org-two"}}))
         return d / (sid + ".jsonl")
@@ -2181,7 +2181,7 @@ class CrossMachine(Base):
         sid = "77777777-aaaa-4aaa-8aaa-777777777777"
         self.dead_child_over_there(sid=sid, lines=[
             user("the live child", str(self.w.work), sid)])
-        sess = self.remote / ".claude-yvb2" / "sessions"
+        sess = self.remote / ".claude-work2" / "sessions"
         sess.mkdir(exist_ok=True)
         (sess / "4242.json").write_text(json.dumps(
             {"pid": 4242, "sessionId": sid, "cwd": str(self.w.work),
@@ -5017,12 +5017,12 @@ class ReviveDiagnose(InProc):
 
     def test_a_server_in_this_folder_is_found_and_one_elsewhere_is_not(self):
         exe = str(self.root / "procbin" / "claude")
-        self.fake_ps({4242: exe + " remote-control --name aifoundry --spawn=same-dir"})
+        self.fake_ps({4242: exe + " remote-control --name myproject --spawn=same-dir"})
         self.fake_lsof({4242: self.cwd})
         got = self.mod.server_in_folder(self.cwd)
         self.assertIs(got["up"], True)
         self.assertEqual(got["pids"], [4242])
-        self.assertIn("aifoundry", got["names"])
+        self.assertIn("myproject", got["names"])
         self.fake_lsof({4242: str(self.root / "elsewhere")})
         got = self.mod.server_in_folder(self.cwd)
         self.assertIs(got["up"], False)
@@ -5051,7 +5051,7 @@ class ReviveDiagnose(InProc):
         """The doctrine of the whole file: "could not look" is not a verdict. Here it
         decides whether anybody is told that opening the link brings the session back."""
         exe = str(self.root / "procbin" / "claude")
-        self.fake_ps({4242: exe + " remote-control --name aifoundry"})
+        self.fake_ps({4242: exe + " remote-control --name myproject"})
         self.fake_lsof({}, rc=9)
         got = self.mod.server_in_folder(self.cwd)
         self.assertIsNone(got["up"])
@@ -5580,12 +5580,44 @@ class ReviveDryRun(Base):
     def test_row_9_says_whether_the_server_that_would_respawn_it_is_up(self):
         self.w.session(self.work, LINK_SID, cwd=self.cwd,
                        lines=[self.go(LINK_SID), self.clean(LINK_SID)])
-        p = self.w.server("aifoundry")
+        p = self.w.server("myproject")
         self.w.lsof_map.write_text(json.dumps({str(p.pid): self.cwd}))
         out = self.ok(self.revive(link_of(LINK_BARE)))
-        self.assertIn("a server is up in this folder: pid %d (aifoundry)" % p.pid, out)
+        self.assertIn("a server is up in this folder: pid %d (myproject)" % p.pid, out)
         self.assertNotIn("its server is down", out)
         self.assertNotIn("its server is unread", out)
+        self.assertNotIn("could not be read here", out)
+
+    def test_row_9_says_one_coherent_thing_for_each_server_state(self):
+        """Opening the link respawns the child only while a server runs in its folder, and
+        a restart kills that server too. Line 2 once read "open it and say continue — its
+        server respawns it on open (and its server is down)", which three fresh readers of
+        the README each took as a contradiction (Wed 28 Oct 2026). Pure, on a real record
+        with only `server` changed, because whether a server is up here depends on the
+        machine the suite runs on (its real `claude remote-control` processes are in `ps`)."""
+        self.w.session(self.work, LINK_SID, cwd=self.cwd,
+                       lines=[self.go(LINK_SID), self.clean(LINK_SID)])
+        record = self.rec(link_of(LINK_BARE))["record"]
+        mod = load_tool()
+        args = types.SimpleNamespace(to="", say="", permission_mode="", new_link=False,
+                                     unarchive=False)
+
+        def line2(up):
+            dec = mod.revive_decide(dict(record, server={"up": up}), args)
+            self.assertEqual(dec["row"], 9)
+            return dec["what"]
+
+        up = line2(True)
+        self.assertIn("say continue — its server respawns it on open", up)
+        self.assertNotIn("down", up)
+        down = line2(False)
+        self.assertIn("its server is down, so opening", down)
+        self.assertIn("`--new-link` forks it onto a new link now", down)
+        self.assertNotIn("say continue", down)
+        self.assertNotIn("respawns it on open", down)
+        unread = line2(None)
+        self.assertIn("its server could not be read here", unread)
+        self.assertIn("`--new-link` forks it", unread)
 
     def test_row_10_a_server_child_forks_onto_a_new_link(self):
         self.w.session(self.work, LINK_SID, cwd=self.cwd,
@@ -6627,10 +6659,10 @@ class ReviveKeepLink(ReviveRun):
     def test_it_says_whether_the_server_that_would_respawn_it_is_up(self):
         self.w.session(self.work, LINK_SID, cwd=self.cwd,
                        lines=[self.go(LINK_SID), self.clean(LINK_SID)])
-        p = self.w.server("aifoundry")
+        p = self.w.server("myproject")
         self.w.lsof_map.write_text(json.dumps({str(p.pid): self.cwd}))
         out = self.ok(self.w.run("revive", link_of(LINK_BARE)))
-        self.assertIn("server        a server is up in this folder: pid %d (aifoundry)"
+        self.assertIn("server        a server is up in this folder: pid %d (myproject)"
                       % p.pid, out)
 
     def test_the_record_says_nothing_was_started(self):

@@ -263,7 +263,7 @@ BOT_FIX = os.environ.get("CSM_BOT_FIX") or ""
 #: Where a SCHEDULED-PASS supervisor records the session each of its passes runs as: one
 #: `<job>.session` file per job, of `key=value` lines, whose `uuid=` is the LOCAL session
 #: id (the last `uuid=` line wins — the file is appended to, not rewritten). The fleet this
-#: was written against keeps them in `~/drive.unsynced/rc-jobs` and has a `--revive` of its
+#: was written against keeps them in a state directory of its own and has a `--revive` of its
 #: own that puts the pass back on the SAME claude.ai link, so a session named here is
 #: revived by its owner and not by this tool: `revive` refuses it and says whose command it
 #: is. Same two readings as `CSM_BOTS_DIR` — absent means no such supervisor, unreadable is
@@ -8231,11 +8231,25 @@ def revive_decide(rec: dict, args, tgt: Account = None) -> dict:
                     "of exposure, not a restoration")
     if kind == "server-child" and not new_link:
         up = srv.get("up")
-        srv_tail = ("" if up else " (and its server is %s)"
-                    % ("down" if up is False else "unread"))
-        if sess.get("url"):
+        # 🛑 THE TAP NEEDS THE SERVER. Opening the link respawns the child only while a
+        # `claude remote-control` server runs in its folder, and a restart kills that server
+        # too. This line used to say "open it and say continue — its server respawns it on
+        # open (and its server is down)", which three fresh readers of the README each read
+        # as a contradiction (Wed 28 Oct 2026). So each server state gets its own sentence.
+        srv_tail = {True: "", False: "; its server is down, so for now only `--new-link` "
+                    "works"}.get(up, "; its server could not be read here")
+        url = sess.get("url")
+        if url and up:
             what = ("nothing is started: open %s and say continue — its server respawns "
-                    "it on open%s" % (sess["url"], srv_tail))
+                    "it on open" % url)
+        elif url and up is False:
+            what = ("nothing is started: its server is down, so opening %s will not bring "
+                    "it back until a server runs in its folder again — `--new-link` forks "
+                    "it onto a new link now" % url)
+        elif url:
+            what = ("nothing is started: open %s and say continue — its server respawns it "
+                    "on open, if one runs in its folder (its server could not be read here; "
+                    "if none does, `--new-link` forks it)" % url)
         else:
             # 🛑 NO LINK TO PRINT, so none is invented. The kind was proved from the id's
             # own uuid version and nothing here records which claude.ai session it is, so
@@ -10110,7 +10124,7 @@ def cmd_find(args, accts=None) -> int:
     🛑 EXIT 1 ON NO MATCH (added Wed 28 Oct 2026). It used to exit 0 whatever it found,
     which read as "asked and answered" to anything that checked a status — and the answer
     this command gives most often about a session somebody has lost is the empty one. The
-    exit code was verified to be unused first: nothing under `flush-util`, the one
+    exit code was verified to be unused first: nothing in the wrapper, the one
     installation that drives csm from scheduled passes, runs `find` at all, let alone
     branches on its status. ⚠️ A caller that wants rows still reads `--json` and counts
     them: 1 means "nothing matched", never "the search failed".

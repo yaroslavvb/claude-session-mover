@@ -205,6 +205,13 @@ deliberate change to an existing contract.
 The first eleven entries are the review of this release's own commits, applied before it shipped.
 Each one has a test that fails without the fix.
 
+- **Line 2 for a dead server child no longer contradicts itself.** With no server in its folder it
+  read "open the link and say continue — its server respawns it on open (and its server is down)";
+  three fresh readers of the README each took it as a contradiction. Each server state now gets one
+  sentence: up, "open it and say continue"; down, "its server is down, so opening it will not bring
+  it back … `--new-link` forks it onto a new link now"; unread, the first advice with "if one runs
+  in its folder". A pure test feeds all three states to `revive_decide`.
+
 - 🛑 **A dead server child named by its id or by part of its title was classified `terminal`
   and RESUMED IN PLACE on its own local id** — the two-writer start LESSONS.md L39 forbids,
   reachable by the ordinary spec a person types (`csm list` prints the id8 and the title, and
@@ -377,7 +384,7 @@ on CLI **2.1.312** (Wed 28 Oct 2026). Each has a test that fails without the fix
 - **`csm find` exits 1 when nothing matched** (it used to exit 0 whatever it found, which
   reads as "asked and answered" to anything checking a status — and the answer it gives most
   often about a session somebody has lost is the empty one). The exit code was verified unused
-  first: nothing under the `flush-util` installation that drives csm from scheduled passes
+  first: nothing in the wrapper installation that drives csm from scheduled passes
   runs `find` at all, let alone branches on its status. A caller that wants rows still reads
   `--json` and counts them; 1 means "nothing matched", never "the search failed", and with
   `--json` the hint goes to stderr so stdout stays parseable.

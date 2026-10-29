@@ -456,6 +456,30 @@ on CLI **2.1.312** (Wed 28 Oct 2026). Each has a test that fails without the fix
   deliberately alive, which is that row's own condition), so only the part that applies is built.
   README and SKILL.md gain `csm find`'s exit codes, `--account`, and the two refusals to pass on
   as they are written.
+- README: a **Start here** part at the top, written for somebody who has never seen this tool and
+  meant to be read in five minutes — the four jobs in a table, the one-command install and the one
+  config home per account it needs, and three things the page had nowhere before. **What do I give
+  csm?** sets every form of session reference side by side, because "is it the session ID?" has two
+  answers: the claude.ai link (the one that always works on a stopped session, since the transcript's
+  name is computed from it — for a server child by arithmetic, for the rest from the id its own
+  transcript records), the bare `session_…` / `cse_…` id that is the same id with the prefix swapped,
+  Claude Code's own local id (a uuid, the transcript's file name, which is what `csm list` and
+  `csm find` print, 4 characters of it being enough while unique), a spacesheep session page whose
+  uuid *is* that local id, a row number from the last `csm list` on this machine, and title words —
+  each with an example, where to find it in the app, in a browser and in a terminal, and when to
+  prefer it, plus the measured reason a title misses (11% of the sessions a Remote Control server
+  started carry a generated title against 64% of the others). **Restart a session that died** is the
+  recipe, in order: the app first and when that is the better answer, the `--dry-run`, how to read its
+  three lines, what each phrase line 2 can hold means for the command you should then type, what you
+  get back and what to do with the old link, `--to` when the account is out of quota, and `csm stop`.
+  Then short **Move** and **Find** recipes, **What csm will not do**, and a **Where to read more**
+  table into the reference sections. Every command, output phrase and refusal in it was checked
+  against the code — `revive --help`, `revive_decide`'s rows, `render_revive`, `revive_act`,
+  `pick` / `pick_resolved`, `derive_local_id`, `auto_target` — and the three-line example is a real
+  run of the fixtures, not an illustration. Nothing below moved or was renamed: every section and
+  anchor is as it was, *Quick start* keeps its heading and its command list with the install block it
+  now duplicated trimmed to the two variants, and the fungibility matrix says up front that it is
+  reference and can be skipped on a first read.
 
 ## [0.4.0] — 2026-10-25
 

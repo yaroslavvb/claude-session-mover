@@ -6083,9 +6083,13 @@ class ReviveRun(Base):
     def clean(self, sid=SID_A):
         return assistant("done", self.cwd, sid, uuid="a1", parent="u1")
 
-    def limit(self, resets, sid=SID_A, text="You've hit your session limit · resets 6:30pm"):
+    def limit(self, resets, sid=SID_A, text="You've hit your session limit · resets 6:30pm",
+              uuid="a2", parent="a1"):
+        """⚠️ `uuid` IS THE STOP EVENT'S OWN NAME, and it is a parameter because the
+        at-most-once key of an unattended wake is `(local id, that uuid)`: a test about a
+        session that stops TWICE has to be able to give the second stop a name of its own."""
         return assistant(text, self.cwd, sid, error="usage_limit_reached", resets=resets,
-                         shape="rate_limit", uuid="a2", parent="a1")
+                         shape="rate_limit", uuid=uuid, parent=parent)
 
     def dead(self, sid=SID_A, lines=None, home=None):
         return self.w.session(home if home is not None else self.work, sid, cwd=self.cwd,
@@ -7163,6 +7167,512 @@ class RevivePlumbing(InProc):
         self.assertTrue(self.mod.relay_name().startswith("csm revive ("))
         self.mod.RELAY_NAME = "   "
         self.assertEqual(self.mod.relay_name(), "csm revive")
+
+
+# ------------------------------------------------------------------- the unattended revive
+
+class ReviveAuto(ReviveRun):
+    """`csm revive --auto`: the same decide table, run for a caller nobody is watching.
+
+    🛑 `--auto` CHANGES TWO THINGS AND NOT ONE GATE. The note's ATTRIBUTION, because nobody
+    typed this run and the receiving session is about to act on the strength of that sentence;
+    and the row a dead Remote Control server child takes, because row 9's whole result is a
+    sentence for a person to act on and there is no unattended way back onto such a session's
+    own link. Every refusal — a bot, a dead scheduled pass, a limit still in force, a home
+    that holds no login — is untouched, and so are the exit codes.
+    """
+
+    def child(self):
+        """A dead Remote Control server child: a transcript named by uuid5 of a bridge id."""
+        return self.w.session(self.work, FORK_SID, cwd=self.cwd,
+                              lines=[self.go(FORK_SID), self.clean(FORK_SID)])
+
+    def jobs(self, sid=SID_A, job="daily"):
+        d = self.w.root / "rc-jobs"
+        d.mkdir(exist_ok=True)
+        (d / ("%s.session" % job)).write_text("uuid=%s\n" % sid)
+        return str(d)
+
+    def test_the_note_says_nobody_has_sent_a_message_and_never_that_he_asked(self):
+        self.alive()
+        got, r = self.rec(SID_A, "--auto")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("The user has not sent a message since it stopped; this installation "
+                      "continues stopped sessions automatically.", got["note"])
+        self.assertNotIn("He asked csm to revive", got["note"])
+        self.assertIs(got["unattended"], True)
+        # and it is the note that was really handed to the relay, not a second rendering
+        self.assertEqual(self.w.relay_calls()[0]["note"], got["note"])
+
+    def test_a_say_is_still_quoted_verbatim_beside_the_unattended_sentence(self):
+        """The text came from somebody; the RUN did not, and the note says both."""
+        self.alive()
+        got, _r = self.rec(SID_A, "--auto", "--say", "skip the card run")
+        self.assertIn('He said: "skip the card run". The user has not sent a message',
+                      got["note"])
+
+    def test_without_auto_the_note_still_says_he_asked_for_it(self):
+        self.alive()
+        got, _r = self.rec(SID_A)
+        self.assertIn("He asked csm to revive this session", got["note"])
+        self.assertNotIn("this installation continues stopped sessions", got["note"])
+        self.assertIs(got["unattended"], False)
+
+    def test_auto_forks_a_dead_server_child_and_names_the_OLD_bridge_id(self):
+        """🛑 THE ID THE CALLER HAS TO ARCHIVE. A fork leaves two conversations with one
+        history, and the only thing that stops the old link respawning a second actor is
+        archiving that old claude.ai session — which csm deliberately cannot do (it reads no
+        credential). So the id is reported rather than described.
+        """
+        self.child()
+        got, r = self.rec(link_of(FORK_BARE), "--auto")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual((got["decision"]["row"], got["decision"]["action"]), (10, "fork"))
+        self.assertIn("--auto: a server child has no unattended way back onto its own link",
+                      got["decision"]["what"])
+        res = got["result"]
+        self.assertEqual(res["old_bridge_id"], FORK_BARE)
+        self.assertEqual(res["old_url"], link_of(FORK_BARE))
+        self.assertIs(res["archive_old"], True)
+        self.assertTrue(res["new_id"] and res["new_id"] != FORK_SID, res)
+        # 🛑 and no sentence for a person to act on came out of it: row 9's own result
+        self.assertNotIn("and say continue", r.stdout + r.stderr)
+
+    def test_the_same_child_without_auto_is_row_9_and_starts_nothing(self):
+        """The pair is the point: `--auto` is what turns the printed tap into the fork."""
+        self.child()
+        got, r = self.rec(link_of(FORK_BARE))
+        self.assertEqual((got["decision"]["row"], got["decision"]["action"]),
+                         (9, "keep-link"))
+        self.assertIs(got["unattended"], False)
+        self.assertIn("and say continue", r.stderr)
+        self.assertNothingStarted(r)
+
+    def test_a_limit_still_in_force_is_refused_under_auto_too(self):
+        """🛑 A wake sent early is CONSUMED, not queued (LESSONS L40), and `--auto` is the
+        one caller that would never see the refusal — so nothing about row 4 moves."""
+        self.dead(lines=[self.go(), self.clean(), self.limit(time.time() + 3600)])
+        r = self.revive(SID_A, "--auto")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("still inside the session limit", r.stderr)
+        self.assertEqual(self.w.relay_calls(), [])
+        self.assertNothingStarted(r)
+
+    def test_a_scheduled_pass_that_is_live_and_idle_is_woken(self):
+        """🛑 THE NARROWING, and the whole reason for it: a wake starts nothing, so there is
+        no second copy of the pass to make — and a pass parked on a usage limit was the one
+        class of session nothing ever continued, because its supervisor revives a session that
+        DIED and does not handle a limit."""
+        self.alive(lines=[self.go(), self.clean(), self.limit(time.time() - 3600)])
+        got, r = self.rec(SID_A, "--auto", CSM_RC_JOBS_DIR=self.jobs())
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(got["decision"]["row"], 5)
+        self.assertIn("the scheduled pass `daily`", got["decision"]["what"])
+        self.assertIn("starts no second copy of the pass", got["decision"]["what"])
+        self.assertEqual(got["record"]["owner"]["kind"], "rc_job")
+        self.assertEqual(len(self.w.relay_calls()), 1, self.w.relay_calls())
+        # nothing was STARTED: a wake opens no window, which is what makes it safe here
+        self.assertEqual([c for c in self.w.tmux_log()
+                          if c[:1] in (["new-window"], ["new-session"])], [])
+
+    def test_a_scheduled_pass_that_is_DEAD_stays_its_own_supervisors(self):
+        self.dead()
+        r = self.revive(SID_A, "--auto", CSM_RC_JOBS_DIR=self.jobs())
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("rc_job daily --revive", r.stderr)
+        self.assertNothingStarted(r)
+        self.assertEqual(self.w.relay_calls(), [])
+
+    def test_a_bot_is_refused_even_when_it_is_live_and_idle(self):
+        """🛑 A relay into a bot's session surfaces as a message in the channel that bot
+        answers, which is not csm's to write in — so the bot refusal is not narrowed."""
+        self.alive()
+        d = self.w.root / "owners"
+        d.mkdir()
+        (d / "chatbot.json").write_text(json.dumps({"session_id": SID_A}))
+        r = self.revive(SID_A, "--auto", CSM_BOTS_DIR=str(d))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("chatbot", r.stderr)
+        self.assertEqual(self.w.relay_calls(), [])
+
+    def test_the_record_carries_the_stop_events_own_uuid(self):
+        """🛑 THE AT-MOST-ONCE KEY, written where `csm stalled` reads it back."""
+        self.alive(lines=[self.go(), self.clean(), self.limit(time.time() - 3600)])
+        self.ok(self.revive(SID_A, "--auto"))
+        rows = [json.loads(x) for x in
+                (self.w.state / "revive.jsonl").read_text().splitlines() if x.strip()]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["stop_uuid"], "a2")
+        self.assertEqual((rows[0]["row"], rows[0]["exit"]), (5, 0))
+        self.assertNotIn("not sent a message since", json.dumps(rows[0]))
+
+
+# ------------------------------------------------------------------------- csm stalled
+
+class Stalled(ReviveRun):
+    """`csm stalled`: every session that stopped, and which of them is ready to continue.
+
+    🛑 FIXTURES ONLY, AND THE COMMAND ITSELF ACTS ON NOTHING. Each test asserts the verdict in
+    the row AND that no window, no relay, no signal and no transcript write came out of the
+    sweep: what acts is `csm revive <id> --auto`, one session at a time.
+    """
+
+    def sweep(self, *extra, **env):
+        return self.w.run("stalled", *extra, **env)
+
+    def doc(self, *extra, **env):
+        r = self.sweep("--json", *extra, **env)
+        return json.loads(self.ok(r)), r
+
+    def row(self, sid=SID_A, *extra, **env):
+        got, r = self.doc(*extra, **env)
+        hits = [x for x in got["rows"] if x["local_id"] == sid]
+        self.assertEqual(len(hits), 1, got["rows"])
+        return hits[0], got, r
+
+    def logged(self, sid, stop_uuid, exit=0, **extra):
+        """One record in the revive log, in `revive_record`'s own shape."""
+        p = self.w.state / "revive.jsonl"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        d = {"at": time.time() - 60, "machine": "here", "local_id": sid, "bridge_id": "",
+             "bytes": None, "stop_uuid": stop_uuid, "account": "work", "row": 5,
+             "action": "wake", "exit": exit}
+        d.update(extra)
+        with p.open("a") as f:
+            f.write(json.dumps(d) + "\n")
+        return p
+
+    def parked(self, resets, sid=SID_A, at=None, **kw):
+        """A dead session parked on a usage limit.
+
+        ⚠️ `at` stamps the limit LINE, which is WHEN IT STOPPED — not `resets`, which is when
+        its limit lifts. The two are different facts and only one of them orders the table.
+        Without a stamp `revive_stop` falls back to the transcript's own mtime, and two
+        fixtures written in the same millisecond then have no order at all.
+        """
+        line = self.limit(resets, sid, **kw)
+        if at:
+            line["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(at))
+        return self.dead(sid, lines=[self.go(sid), self.clean(sid), line])
+
+    # --- what is due ------------------------------------------------------
+    def test_a_usage_limit_that_has_not_reset_yet_is_not_due(self):
+        self.parked(time.time() + 3600)
+        r, _got, run = self.row()
+        self.assertFalse(r["due"], r["why"])
+        self.assertIn("its session limit resets", r["why"])
+        self.assertIn("a wake waits 120s past that", r["why"])
+        self.assertNothingStarted(run)
+
+    def test_a_usage_limit_past_its_reset_and_the_margin_is_due(self):
+        self.parked(time.time() - 3600)
+        r, got, _run = self.row()
+        self.assertTrue(r["due"], r["why"])
+        self.assertIn("its session limit reset at", r["why"])
+        self.assertEqual(r["stop"]["stop"], "usage-limit")
+        self.assertEqual(r["stop"]["class"], "session")
+        self.assertEqual(got["due"], 1)
+
+    def test_a_reset_inside_the_margin_is_not_due_yet(self):
+        """🛑 THE MARGIN IS THE WHOLE OF "never before the reset": the `resetsAt` the
+        transcript recorded and this machine's clock are two readings."""
+        self.parked(time.time() - 10)
+        r, _got, _run = self.row()
+        self.assertFalse(r["due"], r["why"])
+        self.assertIn("a wake waits 120s past that", r["why"])
+
+    def test_a_monthly_spend_limit_is_never_due_however_long_it_waits(self):
+        self.parked(time.time() - 86400,
+                    text="You've hit your monthly spend limit · raise it at "
+                         "claude.ai/settings/usage")
+        r, _got, _run = self.row()
+        self.assertFalse(r["due"], r["why"])
+        self.assertIn("waiting does not clear a monthly-spend limit", r["why"])
+
+    def test_a_dead_session_killed_mid_turn_is_due_and_a_busy_one_never_is(self):
+        self.dead(lines=[self.go(), tool_call(self.cwd, SID_A)])
+        self.alive(SID_B, status="busy",
+                   lines=[self.go(SID_B), tool_call(self.cwd, SID_B)])
+        got, _r = self.doc()
+        by_id = dict((x["local_id"], x) for x in got["rows"])
+        self.assertTrue(by_id[SID_A]["due"], by_id[SID_A]["why"])
+        self.assertEqual(by_id[SID_A]["stop"]["stop"], "mid-turn")
+        self.assertIn("killed mid-turn", by_id[SID_A]["why"])
+        self.assertFalse(by_id[SID_B]["due"], by_id[SID_B]["why"])
+        self.assertEqual(by_id[SID_B]["why"], "it is working right now")
+
+    def test_a_mid_turn_kill_older_than_the_cap_is_listed_and_not_due(self):
+        t = self.dead(lines=[self.go(), tool_call(self.cwd, SID_A)])
+        old = time.time() - 50 * 3600
+        os.utime(str(t), (old, old))
+        r, _got, _run = self.row(CSM_STALLED_SINCE_H="96")
+        self.assertFalse(r["due"], r["why"])
+        self.assertIn("past the 24h an automatic wake covers", r["why"])
+
+    def test_a_clean_finish_and_an_api_error_are_not_even_candidates(self):
+        """🛑 NEITHER IS WAITING FOR ANYTHING. A clean finish answered and stopped, and an
+        error that is not a limit is not cured by time — so both are ruled out by the cheap
+        prefilter and never cost a `diagnose`."""
+        self.dead()                                      # answered, and sitting idle
+        self.dead(SID_B, lines=[self.go(SID_B),
+                                assistant("", self.cwd, SID_B, uuid="a2", parent="u1",
+                                          api_error_only="api_error_overloaded")])
+        got, _r = self.doc()
+        self.assertEqual(got["rows"], [])
+        self.assertEqual((got["scanned"], got["candidates"]), (2, 0))
+
+    def test_a_session_archived_after_its_limit_is_never_due(self):
+        """🛑 THE ARCHIVE GUARD, on the one shape that reaches it: a session that hit a limit
+        and was then archived or ended from the app is still read as `usage-limit` (the limit
+        is why it stopped), so it IS a candidate — and archiving it was somebody's decision,
+        not a failure to repair."""
+        self.parked(time.time() - 3600)
+        t = self.work / "projects"
+        tr = sorted(t.glob("*/%s.jsonl" % SID_A))[0]
+        with tr.open("a") as f:
+            f.write(jl(BRIDGE_LINE, STATUS_LINE, ENDED_LINE))
+        r, _got, _run = self.row()
+        self.assertEqual(r["stop"]["stop"], "usage-limit")
+        self.assertIs(r["stop"]["archived"], True)
+        self.assertFalse(r["due"], r["why"])
+        self.assertIn("archived or ended from the app", r["why"])
+
+    def test_a_bot_owned_session_is_never_due(self):
+        self.parked(time.time() - 3600)
+        d = self.w.root / "owners"
+        d.mkdir()
+        (d / "chatbot.json").write_text(json.dumps({"session_id": SID_A}))
+        r, _got, _run = self.row(CSM_BOTS_DIR=str(d))
+        self.assertFalse(r["due"], r["why"])
+        self.assertIn("chatbot owns it", r["why"])
+        self.assertIn("surfaces in the channel it answers", r["why"])
+
+    def test_a_scheduled_pass_is_due_while_it_is_idle_and_not_once_it_is_dead(self):
+        self.parked(time.time() - 3600, SID_A)                      # dead: its own to revive
+        self.alive(SID_B, lines=[self.go(SID_B), self.clean(SID_B),
+                                 self.limit(time.time() - 3600, SID_B)])
+        d = self.w.root / "rc-jobs"
+        d.mkdir()
+        (d / "daily.session").write_text("uuid=%s\n" % SID_A)
+        (d / "hourly.session").write_text("uuid=%s\n" % SID_B)
+        got, _r = self.doc(CSM_RC_JOBS_DIR=str(d))
+        by_id = dict((x["local_id"], x) for x in got["rows"])
+        self.assertFalse(by_id[SID_A]["due"], by_id[SID_A]["why"])
+        self.assertIn("daily owns it and it is dead", by_id[SID_A]["why"])
+        self.assertTrue(by_id[SID_B]["due"], by_id[SID_B]["why"])
+        self.assertEqual(by_id[SID_B]["action"], "wake")
+
+    # --- at most once -----------------------------------------------------
+    def test_a_handled_stop_is_not_due_again_but_a_NEW_stop_on_it_is(self):
+        """🛑 THE AT-MOST-ONCE KEY IS `(local id, stop event uuid)`. The id alone can only
+        say "this session was revived once", and a session that was woken, worked for an hour
+        and stopped again is a different stop — due again, or nothing ever continues it twice.
+        """
+        t = self.parked(time.time() - 3600)
+        self.logged(SID_A, "a2", exit=0)
+        r, _got, _run = self.row()
+        self.assertFalse(r["due"], r["why"])
+        self.assertIn("already revived for this stop", r["why"])
+        self.assertEqual(r["handled"]["attempts"], 1)
+        self.assertIs(r["handled"]["done"], True)
+        self.assertIn("stop event a2", r["handled"]["compared"])
+        # it ran again, and stopped again: a new stop event, with a uuid of its own
+        with t.open("a") as f:
+            f.write(jl(assistant("on it", self.cwd, SID_A, uuid="a3", parent="a2"),
+                       self.limit(time.time() - 600, uuid="a4", parent="a3")))
+        again, _got2, _run2 = self.row()
+        self.assertTrue(again["due"], again["why"])
+        self.assertEqual(again["stop"]["uuid"], "a4")
+        self.assertIs(again["handled"]["done"], False)
+        self.assertEqual(again["handled"]["attempts"], 0)
+
+    def test_a_record_for_another_session_never_marks_this_one_handled(self):
+        self.parked(time.time() - 3600)
+        self.logged(SID_B, "a2", exit=0)
+        r, _got, _run = self.row()
+        self.assertTrue(r["due"], r["why"])
+        self.assertEqual(r["handled"]["attempts"], 0)
+
+    def test_a_failed_wake_leaves_the_row_due_and_counts_the_attempt(self):
+        """🛑 `done` IS EXIT 0, NOT "A RECORD EXISTS". A non-zero exit means nothing was
+        delivered: the session is still sitting there and has to stay due."""
+        self.parked(time.time() - 3600)
+        self.logged(SID_A, "a2", exit=2)
+        r, got, _run = self.row()
+        self.assertTrue(r["due"], r["why"])
+        self.assertEqual((r["handled"]["failed"], r["handled"]["last_exit"]), (1, 2))
+        self.assertIn("FAILED", r["handled"]["why"])
+        self.assertEqual(got["failed"], 1)
+
+    # --- the cheap prefilter ----------------------------------------------
+    def test_the_prefilter_skips_a_clean_finish_and_an_empty_transcript(self):
+        """🛑 THE COST CONTROL: a `diagnose` is a 1 MiB parse plus a machine-wide `ps`, and a
+        Remote Control server pre-creates 0-byte sessions by the hundred."""
+        self.dead()                                      # a clean finish
+        empty = self.dead(SID_B, lines=[])
+        empty.write_text("")                             # a pre-created session
+        self.parked(time.time() - 3600, SID_C)
+        got, _r = self.doc()
+        self.assertEqual([x["local_id"] for x in got["rows"]], [SID_C])
+        self.assertEqual(got["scanned"], 3)
+        self.assertEqual(got["candidates"], 1)
+
+    def test_a_transcript_outside_the_window_is_not_even_scanned(self):
+        t = self.parked(time.time() - 3600)
+        old = time.time() - 72 * 3600
+        os.utime(str(t), (old, old))
+        got, _r = self.doc()
+        self.assertEqual(got["rows"], [])
+        self.assertEqual(got["scanned"], 0)
+        # ...and it is there when the window is widened to reach it
+        wide, _r2 = self.doc("--since", "96")
+        self.assertEqual([x["local_id"] for x in wide["rows"]], [SID_A])
+        self.assertEqual(wide["since_h"], 96.0)
+
+    def test_a_narrow_window_that_rules_nothing_out_is_still_diagnosed(self):
+        """🛑 AN EMPTY WINDOW IS NOT AN EMPTY FILE. With the prefilter's window set below the
+        padding below, its last bytes hold no main-chain line at all — which says nothing
+        about the stop, so the file is read properly rather than skipped."""
+        t = self.parked(time.time() - 3600)
+        with t.open("a") as f:
+            f.write(jl(*[{"type": "progress", "isSidechain": False, "pad": "x" * 200}
+                         for _ in range(40)]))
+        r, got, _run = self.row(CSM_STALLED_PREFILTER="2048")
+        self.assertTrue(r["due"], r["why"])
+        self.assertIn("rules nothing out", r["prefilter"])
+        self.assertEqual(got["candidates"], 1)
+
+    # --- the sweep acts on nothing ----------------------------------------
+    def test_the_sweep_starts_nothing_relays_nothing_and_writes_no_transcript(self):
+        t = self.parked(time.time() - 3600)
+        before = t.read_bytes()
+        r = self.sweep()
+        self.ok(r)
+        self.assertNothingStarted(r)
+        self.assertEqual(self.w.relay_calls(), [])
+        self.assertEqual(t.read_bytes(), before)
+        self.assertEqual(self.w.windows(), {})
+
+    def test_the_rows_are_due_first_and_then_oldest_stop_first(self):
+        """The order `--json` carries IS the order the caller wakes them in, so the row that
+        has been waiting longest goes first — a newer stop would otherwise keep jumping it."""
+        now = time.time()
+        self.parked(now - 7200, SID_A, at=now - 7200, uuid="aa")     # due, stopped 2h ago
+        self.parked(now - 600, SID_B, at=now - 600, uuid="bb")       # due, stopped 10m ago
+        self.parked(now + 3600, SID_C, at=now - 60, uuid="cc")       # not due: still in force
+        got, _r = self.doc()
+        self.assertEqual([x["local_id"] for x in got["rows"]], [SID_A, SID_B, SID_C])
+        self.assertEqual([x["due"] for x in got["rows"]], [True, True, False])
+
+    def test_the_action_reported_is_the_one_revive_auto_really_takes(self):
+        """🛑 THE SWEEP AND THE RUN MAY NEVER DISAGREE: a dead server child is `fork` here,
+        because `--auto` is the command this table is read for — row 9's printed tap is not."""
+        self.w.session(self.work, FORK_SID, cwd=self.cwd,
+                       lines=[self.go(FORK_SID), tool_call(self.cwd, FORK_SID)])
+        r, _got, _run = self.row(FORK_SID)
+        self.assertTrue(r["due"], r["why"])
+        self.assertEqual((r["kind"], r["row"], r["action"]), ("server-child", 10, "fork"))
+
+    def test_a_home_that_cannot_run_it_is_reported_and_never_called_due(self):
+        """A home whose login is gone takes a session up and then fails at its first token
+        refresh, which looks exactly like a successful revive — so revive refuses it, and a
+        row this sweep called due would send a watchdog at it every five minutes."""
+        spare = self.w.account("spare")
+        self.dead(SID_B, lines=[self.go(SID_B), self.clean(SID_B),
+                                self.limit(time.time() - 3600, SID_B)], home=spare)
+        r, _got, _run = self.row(SID_B)
+        self.assertFalse(r["due"], r["why"])
+        self.assertIn("revive would refuse it", r["why"])
+        self.assertIn("holds no login", r["why"])
+
+    # --- the table and the check line -------------------------------------
+    def test_the_table_names_what_revive_auto_would_do_and_how_to_do_it(self):
+        self.parked(time.time() - 3600)
+        out = self.ok(self.sweep())
+        self.assertIn("csm stalled —", out)
+        self.assertIn("DUE 1", out)
+        self.assertIn("revive --auto would: row 8", out)
+        self.assertIn("csm revive <session> --auto", out)
+        self.assertIn("ok: 1 session(s) due for a wake and none has failed", out)
+
+    def test_check_is_one_quiet_line_and_asks_no_credential_store(self):
+        """🛑 THE CONTRACT: one line on stdout, NOTHING on stderr. `CSM_LOGIN_PROBE` is set on
+        every run in this suite and announces itself on stderr whenever it is asked — so an
+        empty stderr is the proof that this path never asks it."""
+        self.parked(time.time() - 3600)
+        r = self.sweep("--check")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stderr, "", r.stderr)
+        self.assertEqual(len(r.stdout.strip().splitlines()), 1, r.stdout)
+        self.assertTrue(r.stdout.startswith("ok: 1 session(s) due for a wake"), r.stdout)
+
+    def test_check_FAULTS_only_once_a_wake_for_that_stop_has_failed(self):
+        """🛑 BEING DUE IS NOT A FAULT — it is the normal state between two passes. The fault
+        is a wake that was tried and failed, which nothing else in the loop reports."""
+        self.parked(time.time() - 3600)
+        ok = self.sweep("--check")
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        self.logged(SID_A, "a2", exit=1)
+        bad = self.sweep("--check")
+        self.assertEqual(bad.returncode, 1, bad.stdout + bad.stderr)
+        self.assertTrue(bad.stdout.startswith("FAULT: 1 due session(s) whose last wake "
+                                              "FAILED"), bad.stdout)
+        self.assertIn("1 attempt(s), last exit 1", bad.stdout)
+        self.assertEqual(bad.stderr, "", bad.stderr)
+
+    def test_a_revive_log_that_cannot_be_read_is_INCOMPLETE_and_not_a_quiet_ok(self):
+        """🛑 A LOG NOBODY CAN READ IS NOT AN EMPTY ONE: the sweep then cannot tell a stop it
+        has already acted on from one it has not, which is how a session is woken twice. (A
+        MISSING log is the state of every fresh install and is not a problem at all.)"""
+        self.parked(time.time() - 3600)
+        blocked = self.w.root / "revive-log-is-a-directory"
+        blocked.mkdir()
+        r = self.sweep("--check", CSM_REVIVE_LOG=str(blocked))
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertTrue(r.stdout.startswith("INCOMPLETE: no due session has a failed wake"),
+                        r.stdout)
+        self.assertIn("could not be read", r.stdout)
+        self.assertEqual(r.stderr, "", r.stderr)
+
+    def test_a_quiet_machine_says_so_and_exits_0(self):
+        self.dead()
+        r = self.sweep("--check")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(r.stdout.startswith("ok: nothing is due for a wake"), r.stdout)
+
+    def test_an_owner_directory_that_cannot_be_read_is_INCOMPLETE_not_an_exit_2(self):
+        """🛑 ONE SESSION'S REFUSAL IS NOT THE WHOLE SWEEP'S. `rc_job_owner` dies on a jobs
+        directory it cannot read, because answering "nobody owns it" there is how a second
+        copy of a scheduled pass gets started — right for `revive`, which is about to act,
+        and wrong for a whole-machine read, which would abort over one directory and leave
+        `--check` with an exit code outside its 0/1/3 contract."""
+        self.parked(time.time() - 3600)
+        blocked = self.w.root / "rc-jobs-is-a-file"
+        blocked.write_text("not a directory")
+        got, _r = self.doc(CSM_RC_JOBS_DIR=str(blocked))
+        self.assertEqual(got["rows"], [])
+        self.assertEqual(len(got["coverage"]["unread"]), 1, got["coverage"])
+        self.assertIn("not a directory", got["coverage"]["unread"][0]["reason"])
+        r = self.sweep("--check", CSM_RC_JOBS_DIR=str(blocked))
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertTrue(r.stdout.startswith("INCOMPLETE:"), r.stdout)
+        self.assertEqual(r.stderr, "", r.stderr)
+
+    def test_a_home_whose_projects_cannot_be_LISTED_is_reported_not_skipped(self):
+        """🛑 A HOME THAT CANNOT BE LISTED IS NOT AN EMPTY ONE. `transcripts_by_id` catches
+        the OSError and answers `{}`, which reads downstream exactly like "this home runs
+        nothing" — the one answer that is never true. So the sweep asks the directory itself
+        and the failure reaches the coverage channel and the `INCOMPLETE:` line."""
+        self.parked(time.time() - 3600)
+        shutil.rmtree(str(self.personal / "projects"))
+        (self.personal / "projects").write_text("not a directory at all")
+        got, _r = self.doc()
+        self.assertEqual([u["name"] for u in got["coverage"]["unread"]], ["personal"])
+        self.assertIn("could not be read", got["coverage"]["unread"][0]["reason"])
+        self.assertEqual([x["local_id"] for x in got["rows"]], [SID_A])
+        r = self.sweep("--check")
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertIn("1 not read (personal:", r.stdout)
 
 
 # -------------------------------------------------------- what the move says it will cost

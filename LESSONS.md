@@ -780,6 +780,67 @@ hours. Every one of these is **Beta**: it is behaviour and layout nobody documen
   `stat -f %m <lock dir>` during a long run and watch whether it moves.
 - **Verified.** Read off the engine's own knob definitions, Wed 28 Oct 2026. **Beta.**
 
+### L51 · An unattended wake needs a key per STOP, not per session
+
+- **Rule.** Record what was woken under `(local session id, the uuid of the transcript line the
+  stop was read from)`, and treat a stop as handled only on a record whose exit code was `0`.
+- **Why.** Both halves are failures that look like success. Key it on the **session id** and a
+  session is woken once and never again — the ordinary life of a long-running session is to stop,
+  continue, work for an hour and stop again, and that second stop is a different event that needs a
+  different answer. Leave the key out altogether and a pass that runs every five minutes relays the
+  same note into the same session twelve times an hour, each one a turn spent on the account's
+  quota. And counting a record with a **non-zero** exit as handled retires a session nothing ever
+  delivered a note to: exit 1 means something is up and unproved, exit 2 means nothing was started
+  at all, and in both cases the session is still sitting there. A line's `uuid` is written once and
+  never rewritten, which is what makes it a name for one stop; when a line carries none, the
+  transcript's **size** is the next best thing, because anything written since makes it a different
+  file state.
+- **Check.** Wake a throwaway session, then run the sweep twice: the row must read handled the
+  first time and stay handled. Then let it stop again and confirm the new stop's uuid differs from
+  the recorded one and the row is due once more.
+  ```sh
+  csm stalled --json | jq '.rows[] | {short, due, why, handled}'
+  jq -r '[.local_id[0:8], .stop_uuid, .exit] | @tsv' < ~/.local/state/claude-session-mover/revive.jsonl
+  ```
+- **Verified.** 2.1.312; the `uuid` field on every main-chain line is of the transcript format, not
+  of this tool. **Beta.**
+
+### L52 · A dead server child cannot be woken unattended: fork it, and archive the old session
+
+- **Rule.** With nobody at the keyboard, a dead Remote Control **server child** is forked onto a new
+  id and a new link — and the old claude.ai session is archived in the same breath, by whatever
+  holds the credential.
+- **Why.** Only the child's own server respawns it, lazily, when that claude.ai session next gets
+  **server-side activity** — opening the link in the app does it, and nothing local can. So the
+  answer that works for a person ("open this and say *continue*") has no unattended equivalent at
+  all, and a tool that printed it and exited `0` would be reporting work it did not do. The fork is
+  the only action that exists, and it is not free: it leaves two conversations with one history, and
+  the **old link still respawns the old one** on the next tap. Two actors with the same past, each
+  believing it is the session, is a worse outcome than a session that was never continued — so the
+  fork is only safe when the old session is archived, and the tool that forks must hand the old
+  bridge id to whoever can do that (`POST /v1/code/sessions/<cse_id>/archive`, with that account's
+  own token). Reviving such a child onto its *own* id instead is L39's two-writers failure.
+- **Check.** Fork a throwaway child, then open the old link and watch a second worker register:
+  `csm list` shows two live sessions whose transcripts share every line up to the fork.
+- **Verified.** 2.1.312. **Beta.**
+
+### L53 · A note a tool sent unasked must not say the user asked for it
+
+- **Rule.** When a scheduled pass continues a session, the note says that nobody has sent a message
+  since it stopped and that the installation continues stopped sessions automatically — not that
+  the user asked for this.
+- **Why.** The receiving session decides what to do next on the strength of that sentence, and
+  "they asked me to continue" and "nothing has been asked and a timer fired" license different
+  next steps: the first reads as a go-ahead for whatever was in flight, the second as a reason to
+  re-check before touching anything. It is the same failure as L42 one layer up — there the CLI
+  recorded a tool's prompt as the user's own typing, here the *text* would claim an instruction
+  nobody gave. Words the user really did type are still quoted verbatim, beside the fact that the
+  run was not theirs.
+- **Check.** Run the unattended revive of a throwaway session and read the message in the app: it
+  must carry the tool's stamp, the sender name, and no claim that anybody asked for it.
+- **Verified.** Read off this tool's own note builder, Thu 29 Oct 2026. **Stable** (it is a rule
+  about what to write, not a measurement of the CLI).
+
 <a id="related"></a>
 
 ## Related tools

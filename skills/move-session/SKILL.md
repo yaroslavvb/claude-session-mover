@@ -1,6 +1,6 @@
 ---
 name: move-session
-description: "Move a Claude Code session from one of the user's Claude accounts to another with claude-session-mover (csm), keeping the whole conversation. Use when the user says: move this session to another account; move my <title> session to <account>; I'm out of quota, move it to <account>; this account is rate limited, switch accounts; which of my sessions are out of quota; list my sessions across accounts; move it to whichever account has quota left (csm move --to auto). Also when they name an account next to a session, or paste a claude.ai/code/session_… link and ask to run it as another account. Use it too when a session has DIED (csm revive): revive it, restore it, bring it back, continue my dead session, my session died, the remote control disconnected or is offline, it stopped on a limit — a pasted link with nothing answering is a revive, not a move. Use it too to move a session BETWEEN MACHINES (move my session on the laptop to this machine, bring that desktop-app session over, continue this work on another computer) and to find a session anywhere by title or id (csm find, csm move --from-machine, --mirror-cwd). Use it for: stop the session you moved, close that moved window, clean up after the move; which permission mode is the moved session in, is anything still stuck in auto, did my permission settings take, restart the idle ones in the wrong mode (csm modes); and which of my accounts are set up the same / do my accounts share settings, skills, plugins, memory (csm matrix)."
+description: "Move a Claude Code session from one of the user's Claude accounts to another with claude-session-mover (csm), keeping the whole conversation. Use when the user says: move this session to another account; move my <title> session to <account>; I'm out of quota, move it to <account>; this account is rate limited, switch accounts; which of my sessions are out of quota; list my sessions across accounts; move it to whichever account has quota left (csm move --to auto). Also when they name an account next to a session, or paste a claude.ai/code/session_… link and ask to run it as another account. Use it too when a session has DIED (csm revive): revive it, restore it, bring it back, continue my dead session, my session died, the remote control disconnected or is offline, it stopped on a limit — a pasted link with nothing answering is a revive, not a move. Use it to SWEEP for them (csm stalled): what's stalled, what's parked, which sessions are stuck or out of quota, which stopped overnight, is anything waiting to be continued, wake everything that's ready, continue them all, did the wake run, is the watchdog running, why wasn't my session woken. Use it too to move a session BETWEEN MACHINES (move my session on the laptop to this machine, bring that desktop-app session over, continue this work on another computer) and to find a session anywhere by title or id (csm find, csm move --from-machine, --mirror-cwd). Use it for: stop the session you moved, close that moved window, clean up after the move; which permission mode is the moved session in, is anything still stuck in auto, did my permission settings take, restart the idle ones in the wrong mode (csm modes); and which of my accounts are set up the same / do my accounts share settings, skills, plugins, memory (csm matrix)."
 ---
 
 # Move a session to another account
@@ -33,7 +33,8 @@ csm move SESSION --to ACCOUNT|auto [--stop-source] [--dry-run] [--permission-mod
                               [--from-account ACCOUNT]
 csm revive SESSION [--dry-run] [--json] [--to ACCOUNT|auto] [--new-link] [--say TEXT]
                               [--permission-mode MODE] [--unarchive] [--name LABEL]
-                              [--account NAME]
+                              [--account NAME] [--auto]
+csm stalled [--since HOURS] [--json] [--check] # which stopped sessions are ready to continue
 csm stop SESSION [--dry-run]                  # end a session csm moved, free its window
 csm find TEXT [--on M] [--all] [--json]       # where is that session, on any machine
 csm modes [--account NAME] [--json] [--check] [--restart-idle [--apply]]
@@ -283,7 +284,7 @@ quota):
 | 6 | `--to ACCOUNT` or `--to auto` | moves it (an ordinary move, with its cost), then relays the note into the copy |
 | 7 | dead, a self-hosted Remote Control session, no `--new-link` | resumes it in place, on the **same** link. Archived needs `--unarchive` |
 | 8 | dead, a terminal session, no `--new-link` | resumes it in place — it gets a **new** link, which is new exposure, not a restoration |
-| 9 | dead, a Remote Control **server child**, no `--new-link` | prints the one thing to tap and starts nothing |
+| 9 | dead, a Remote Control **server child**, no `--new-link` and no `--auto` | prints the one thing to tap and starts nothing. With `--auto` it takes row 10 instead, because nobody is reading it |
 | 10 | dead, a server child, `--new-link` | forks it: new id, new link, same past; the old link still opens the old copy |
 | 11 | dead, a self-hosted or terminal session, `--new-link` | forks it the same way: `--new-link` means a fresh copy on a new link whatever kind it is. A self-hosted session's old link still opens the old copy; a terminal one never had a link, so the warning is about the old **copy** |
 
@@ -334,6 +335,49 @@ opens the OLD copy. Say that out loud when you use it, and tell them to archive 
 - **It waits for nothing and signals nothing.** A limit still in force is a refusal carrying the local reset time,
   not a wait; `revive` has no stop of any kind; and `--unarchive` is the only way a session that was archived or
   ended from the app is reopened.
+
+## "What's stalled?" and waking them: `csm stalled`, `csm revive --auto`
+
+`csm stalled` is the sweep: every session in every account home here whose transcript was written in the last
+48 h, why each stopped, whether it is **due** to be continued, what `csm revive --auto` would do about it, and
+whether that has already been done. Reach for it when the user asks what is stalled or parked, which sessions are
+stuck or out of quota, which stopped overnight, whether anything is waiting, or whether the thing that wakes them
+is working. **It acts on nothing** — no window, no message, no signal.
+
+```
+csm stalled                              # the table, with a reason for every row
+csm stalled --json                       # the rows, `due` with its reason, and `handled`
+csm stalled --check                      # one line: ok: / FAULT: / INCOMPLETE:, exit 0/1/3
+csm revive <id> --auto                   # continue ONE of them, as an unattended caller
+```
+
+1. **Run `csm stalled` and read the rows out, not the count.** Each row says what stopped it, whether it is due
+   and **why or why not** — "waiting does not clear a monthly-spend limit", "daily owns it and it is dead", "it is
+   working right now". That sentence is the answer; a bare "3 sessions are stalled" is not.
+2. **Due means exactly two things.** A usage limit of a class a reset clears (`session`, `weekly`) whose reset
+   plus a margin has passed; or a session killed while working whose process is gone, within 24 h. A
+   monthly-spend, credits or model limit is **never** due — waiting does not clear it, so say so and offer
+   `csm revive <id> --to auto`, which is the cure. A clean finish is not due either: it answered.
+3. **Wake them one at a time, with `csm revive <id> --auto`**, oldest stop first, which is the order `--json`
+   gives. Never loop over every due row at once: a sweep that wakes a dozen sessions spends a dozen first turns
+   on one account's quota. Say how many you woke and how many you left.
+4. **`--auto` changes the note's attribution**, which matters when the user asks what their session was told: it
+   says nobody has sent a message since it stopped and that this installation continues stopped sessions
+   automatically — **not** that the user asked. `--say TEXT` is still quoted verbatim beside it, when they do
+   have something to pass on.
+5. 🛑 **`--auto` FORKS a dead Remote Control server child**, where a plain revive would print "open the link and
+   say continue" (row 9). There is no unattended way back onto such a session's own link. The fork leaves **two
+   conversations with one history**, so `--json`'s `result.old_bridge_id` names the old claude.ai session, which
+   has to be **archived** — csm cannot do that itself. Tell the user plainly when this happens: the old link
+   still opens the old copy, archive it, do not type there.
+6. **`handled` is per STOP, not per session.** A stop already revived (a record with exit 0) is not due again; a
+   session that stopped, was woken and stopped **again** is a new stop and is due. A row whose `handled.failed`
+   is non-zero is a wake that was tried and **failed** — that is what `--check` reports as `FAULT:`, and it is
+   worth raising on its own, because the next pass will just try again.
+7. **`csm stalled --check` answers "is the waking working?"** `ok:` while nothing has failed, `FAULT:` for a due
+   session whose last wake failed, `INCOMPLETE:` when something could not be read. ⚠️ A session merely **being**
+   due is not a fault: that is the normal state between two passes, so do not report `ok: 2 session(s) due` as a
+   problem.
 
 ## "Is anything running in the wrong mode?" `csm modes`
 
@@ -467,7 +511,11 @@ away / 🛑 per account by design` is the legend.
   command over there instead; `--from-machine M` is what brings a session here.
 - Move only the session the user asked about, one per request unless they said otherwise. The same for a revive:
   one session per request, and never revive a session the user did not name — a revived session starts spending
-  quota and may act on work they have moved on from.
+  quota and may act on work they have moved on from. `csm stalled` names them all, which is a reading and not a
+  mandate: when they ask you to wake "everything that's ready", wake a handful and say what you left.
+- `--auto` is for a run with **nobody watching**. Typing it yourself while they are reading your answer puts a
+  sentence in their session that says nobody asked — so use it only when they want the unattended behaviour
+  (a scheduled pass, or forking a dead server child without being asked for the tap).
 - `revive` never stops, signals or archives anything, and never writes into a transcript. If something has to be
   ended, that is `csm stop` on a window csm opened, and it is a separate request.
 - Never stop a process or close a window csm did not start. `--stop-source` and `csm stop` are

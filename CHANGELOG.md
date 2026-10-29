@@ -9,6 +9,105 @@ Every fact below was measured against Claude Code 2.1.296–2.1.300 on macOS. Th
 state it reads is undocumented and can change in any CLI release; the tests pin every shape
 the tool depends on.
 
+## [0.6.0] — 2026-10-29
+
+Continuing a stopped session **without anybody asking**. 0.5.0 could revive one session a person
+named; this release adds the two pieces an unattended loop needs — `csm stalled`, which says which
+sessions are ready, and `csm revive --auto`, which continues one honestly — plus the at-most-once
+key that stops the same stop being acted on twice. Measured against Claude Code **2.1.312** on
+macOS.
+
+708 tests became **745**, on Python 3.12 and on the 3.7 floor the README promises. `move`, `stop`,
+`list`, `modes`, `matrix` and `find` are untouched; `revive` without `--auto` takes the same row,
+sends the same note and exits the same way as in 0.5.0.
+
+### Added
+
+- **`csm stalled [--since HOURS] [--json] [--check]`** — every session in every config home here
+  whose transcript was written inside the window (default 48 h), why each stopped, whether it is
+  **due** for a wake, what `csm revive --auto` would do about it, and whether that has already been
+  done. Read-only: it starts nothing, messages nothing, signals nothing and writes nothing outside
+  csm's own log. What acts is `csm revive <id> --auto`, one session at a time, so every refusal in
+  the decide table is asked once per wake and not once per sweep.
+  - **DUE is exactly two stops.** A usage limit of a class a reset clears (`session`, `weekly`)
+    whose reset plus `CSM_WAKE_MARGIN_S` has passed; or a session killed while it was working (an
+    unanswered tool call or prompt) whose process is gone, inside `CSM_WAKE_MAX_AGE_H`. A clean
+    finish is not due — it answered — and neither is an API error, which waiting does not fix. A
+    `monthly-spend`, `credits` or `model` limit is **never** due, and nor is a limit whose class its
+    own words did not name: an unread class is not a clearable one.
+  - **Five things are never due, whatever their stop**: a session that is working right now, one a
+    bot owns, one a scheduled pass owns that is not live and idle, one with no conversation in it
+    (a Remote Control server pre-creates those), and one archived or ended from the app — which was
+    somebody's decision and not a failure to repair. Every row carries the reason in `why`.
+  - **A cheap prefilter, and it is `revive_stop` on a smaller window.** The question asked of every
+    transcript is whether the *last* thing that happened there is a stop a wake covers, and that
+    line is at the end of the file. So the last `CSM_STALLED_PREFILTER` (64 KiB) is parsed first and
+    the full 1 MiB diagnosis runs only for candidates. It is over-inclusive on purpose: a window
+    that held no main-chain line is *inconclusive*, not empty, so a narrow window can cost a second
+    read and never a missed session. Running the same parser is what keeps the prefilter and the
+    diagnosis from drifting apart.
+  - **`--json` is the contract** a scheduled caller reads: the rows (due first, then **oldest stop
+    first** — the order a caller wakes them in), `due` with its reason, `row`/`action`/`what` from
+    the decide table, `handled`, and a `coverage` block naming everything that could not be read.
+  - **`--check`** prints one line and exits `0` (`ok:`), `1` (`FAULT:`) or `3` (`INCOMPLETE:`), the
+    same contract as `modes --check`. **A due session is not a fault** — being due is the normal
+    state between one pass and the next. The fault is a wake that was *tried and failed* for that
+    same stop, which nothing else in the loop reports. On that path the credential probe is never
+    asked at all: it prints a line of its own whenever `CSM_LOGIN_PROBE` is set, and on macOS it can
+    raise a Keychain dialog, which is the one shape an unattended run may never produce. ⚠️ The
+    consequence, documented rather than hidden: its *count* of due sessions can run one or two above
+    `--json`'s, because a home whose login is gone is a refusal `--json` sees and `--check` does not.
+    The queue is `--json`; that line is a reading, and it never turns the difference into a fault.
+  - A refusal from one session's diagnosis (an unreadable `CSM_RC_JOBS_DIR`, say, which
+    `rc_job_owner` dies on rather than answer "nobody owns it") drops **that row** into `coverage`
+    and carries on: in `revive` it is right to abort, because it is about to act, and here it would
+    abandon a whole-machine read over one directory and leave `--check` with an exit code outside
+    its own contract.
+- **`csm revive --auto`** — unattended mode. It changes two things and not one gate:
+  - **The note's attribution.** The default sentence says the user asked for this revive, which is
+    false of a run a scheduled pass made, and the receiving session is about to decide what to do
+    next on the strength of it. `--auto` says instead: *"The user has not sent a message since it
+    stopped; this installation continues stopped sessions automatically."* A `--say` is still quoted
+    verbatim beside it — the text came from somebody, the run did not.
+  - **A dead Remote Control server child is FORKED** (row 10, as if `--new-link`) rather than
+    answered with row 9's printed tap: only its own server respawns it, and only on activity that
+    cannot be given from here, so the fork is the only action that exists. `--json`'s `result` then
+    names `old_bridge_id`, `old_url` and `archive_old`, because the one thing that stops the old
+    link respawning a second actor with the same history is **archiving that old claude.ai
+    session** — which csm deliberately cannot do, since it reads no credential.
+  - Every refusal is untouched: a bot, a dead scheduled pass, a limit still in force (a wake sent
+    early is *consumed*, not queued — LESSONS L40), an empty transcript, a home that holds no login.
+    The exit codes are unchanged. `--json` reports the mode as `unattended` — not under `auto`,
+    which has meant `--to auto`'s own note since 0.3.0.
+- **The at-most-once key `(local id, stop event uuid)`.** `revive_stop` now reports the `uuid` of
+  the transcript line its verdict was read from, and every record in `CSM_REVIVE_LOG` carries it as
+  `stop_uuid`. The id alone can only answer "was this session ever revived"; a session that stopped,
+  was woken, worked for an hour and stopped again is a **new** stop and is due again. `csm stalled`
+  reads the log back and treats a stop as handled only on a record with **exit 0** — a non-zero exit
+  is a wake that was attempted and failed, so the row stays due and the attempt is counted. Where a
+  stop line carries no uuid (an older build's transcript, or a verdict read off the file's mtime),
+  the readers fall back to 0.5.0's own `(local id, transcript size)` rather than matching on the id.
+- **Knobs**: `CSM_WAKE_MARGIN_S` (120), `CSM_WAKE_MAX_AGE_H` (24), `CSM_STALLED_SINCE_H` (48),
+  `CSM_STALLED_PREFILTER` (64 KiB). All documented in the README's Environment table.
+
+### Changed
+
+- **The owner refusal is narrowed, and only for a wake.** An `CSM_RC_JOBS_DIR`-owned session that is
+  **live and idle** may now be woken: row 5 starts nothing — it relays a message into the process
+  that is already running — so there is no second copy of the pass to make, which is the whole thing
+  that refusal guards. A **dead** pass is still its supervisor's, because reviving that one does
+  start a process. A **bot** is refused whatever its state: a relay into a bot's session surfaces as
+  a message in the channel that bot answers. Row 5's sentence names the pass when there is one.
+  - *Why it mattered*: a scheduled-pass supervisor revives a session that **died** and does not
+    handle a usage limit, so a parked pass was the one class of session nothing ever continued.
+- **`revive_home_gate`** is the home-usable gate lifted out of `revive_plan` into a function of its
+  own, so the sweep and the run cannot disagree about whether a row would be refused. Zero
+  behaviour change for `revive`. `diagnose(..., probe=False)` and `revive_account(..., probe=False)`
+  leave the credential store unasked, for `--check`; `usable` is then `None` ("not asked"), which is
+  never read as "cannot run it".
+- `revive_fork` reports `old_bridge_id` / `old_url` / `archive_old` on **every** fork, not only an
+  `--auto` one: it is a fact about the action, and the old link is left behind either way.
+
 ## [0.5.0] — 2026-10-28
 
 `csm revive`: resolution that reaches a session nothing is running, a stop reason that is right
@@ -1143,6 +1242,7 @@ Initial public release.
 - Fixture-only tests (fake homes, fake `claude`, fake tmux; no network, no account) and CI on
   ubuntu and macOS × Python 3.9 and 3.12.
 
+[0.6.0]: https://github.com/yaroslavvb/claude-session-mover/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/yaroslavvb/claude-session-mover/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/yaroslavvb/claude-session-mover/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/yaroslavvb/claude-session-mover/compare/v0.3.0...v0.3.1

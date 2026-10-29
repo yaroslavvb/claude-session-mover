@@ -10,6 +10,10 @@
     csm move "refactor" --to auto          # ...to whichever account has the most room left
     csm move https://claude.ai/code/session_01Ab... --to work
     csm revive https://claude.ai/code/session_01Ab... --dry-run   # it stopped: why, and what now
+    csm revive 7f3a --auto                 # ...unattended: no instructions for a person, ever
+    csm stalled                            # every session that stopped and is ready to continue
+    csm stalled --json                     # ...the rows a watchdog reads, `due` and `handled`
+    csm stalled --check                    # ...as a check: one line, exit 1 when a wake failed
     csm stop 3                             # end a session csm moved, and free its window
     csm find "refactor"                    # find a session by id, link or title, in EVERY home
     csm find 7f3a --on desktop             # ...on another machine, the desktop app's own titles too
@@ -128,7 +132,7 @@ try:                                      # POSIX only; the tool is macOS/Linux 
 except ImportError:                       # pragma: no cover
     pwd = None
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 PROG = "claude-session-mover"
 
 HOME = Path(os.path.expanduser("~"))
@@ -6938,9 +6942,18 @@ def revive_stop(path: Path, tail: int = 0) -> dict:
     starts at the last non-`isMeta`, non-`tool_result` USER line because that is where this
     attempt began: a limit from a turn two prompts ago was waited out and is not why the
     session is sitting still now.
+
+    🛑 `uuid` IS THE STOP EVENT'S OWN NAME — the `uuid` of the transcript line this verdict
+    was read from (the limit line, the error line, the unanswered assistant line, the
+    archive line). Added Thu 29 Oct 2026 for the at-most-once key of an unattended wake
+    (`revive_record`, `revive_handled`): the local id is the same before and after a stop,
+    so it cannot say WHICH stop was already acted on, while the line a stop was read from is
+    written once and never rewritten. It is `""` when that line carries no uuid (an older
+    build's transcript, or a verdict read from the file's mtime rather than a line), and the
+    readers fall back to the size triple there rather than treating two stops as one.
     """
     out = {"stop": "unknown", "why": "", "at": 0.0, "age": "", "read_bytes": 0,
-           "lines": 0, "from_prompt": False, "archived": False,
+           "lines": 0, "from_prompt": False, "archived": False, "uuid": "",
            "class": "", "clears_with_time": None, "window": "", "resets_at": 0.0,
            "in_force": False, "message": "", "kind": "", "tool": "", "tool_at": 0.0}
     want = int(tail or REVIVE_TAIL_BYTES)
@@ -6969,7 +6982,7 @@ def revive_stop(path: Path, tail: int = 0) -> dict:
     window = rows[start:]
     quota, api_err, last_asst = {}, {}, {}
     bridge_i = ended_i = clean_i = -1
-    results, mtime = set(), 0.0
+    results, mtime, ended_uuid = set(), 0.0, ""
     main = False
     for i, d in enumerate(window):
         t = d.get("type")
@@ -6984,6 +6997,7 @@ def revive_stop(path: Path, tail: int = 0) -> dict:
             if ENDED_REMOTELY in txt:
                 ended_i = i
                 mtime = _stamp(d) or mtime
+                ended_uuid = str(d.get("uuid") or "")
         if t == "user":
             results |= set(x for x in _tool_results(d) if x)
         if t != "assistant" or not isinstance(d.get("message"), dict):
@@ -7013,11 +7027,13 @@ def revive_stop(path: Path, tail: int = 0) -> dict:
             klass, clears = limit_class(txt)
             quota = {"i": i, "window": kind, "resets_at": resets, "class": klass,
                      "clears_with_time": clears, "message": tidy(txt, 120),
-                     "error": err or str(d.get("error") or ""), "at": _stamp(d)}
+                     "error": err or str(d.get("error") or ""), "at": _stamp(d),
+                     "uuid": str(d.get("uuid") or "")}
         elif err or d.get("isApiErrorMessage"):
             last_asst = d
             api_err = {"i": i, "kind": str(err or d.get("error") or "an error"),
-                       "message": tidy(_text_of(m), 120), "at": _stamp(d)}
+                       "message": tidy(_text_of(m), 120), "at": _stamp(d),
+                       "uuid": str(d.get("uuid") or "")}
         elif answered_here(d, m):
             # 🛑 A CLEAN LINE AFTER THE ERROR MEANS IT RECOVERED. One prompt's turn can hit
             # a limit, wait, and answer anyway (2.1.312 auto-continues at a usage limit when
@@ -7048,6 +7064,7 @@ def revive_stop(path: Path, tail: int = 0) -> dict:
         out["in_force"] = quota["resets_at"] > now
         out["stop"] = "usage-limit"
         out["at"] = quota["at"]
+        out["uuid"] = quota["uuid"]
         out["why"] = ("it hit a %s limit%s%s"
                       % (quota["class"] or quota["window"] or "usage",
                          (", which resets %s" % clock(quota["resets_at"]))
@@ -7055,19 +7072,21 @@ def revive_stop(path: Path, tail: int = 0) -> dict:
                          "" if out["in_force"] else " — that reset has passed"))
     elif api_err and api_err["i"] > clean_i:
         out.update(stop="api-error", kind=api_err["kind"], message=api_err["message"],
-                   at=api_err["at"])
+                   at=api_err["at"], uuid=api_err["uuid"])
         out["why"] = "its last turn ended on %s, which is not a limit" % api_err["kind"]
     elif pending:
         out.update(stop="mid-turn", tool=pending[0][1] or "a tool",
-                   tool_at=_stamp(last_asst), at=_stamp(last_asst))
+                   tool_at=_stamp(last_asst), at=_stamp(last_asst),
+                   uuid=str(last_asst.get("uuid") or ""))
         out["why"] = ("it was cut off mid-turn: its last tool call (%s) has no recorded "
                       "result, so what that call did is UNKNOWN" % out["tool"])
     elif archived:
-        out.update(stop="archived", at=mtime)
+        out.update(stop="archived", at=mtime, uuid=ended_uuid)
         out["why"] = ("it was archived or ended from the app (%s after the last "
                       "/remote-control report)" % ENDED_REMOTELY)
     elif last_asst:
-        out.update(stop="finished", at=_stamp(last_asst))
+        out.update(stop="finished", at=_stamp(last_asst),
+                   uuid=str(last_asst.get("uuid") or ""))
         out["why"] = "it answered and stopped: the last line is a clean assistant turn"
     if not out["at"]:
         # The file's own mtime is the fallback: a line with no `timestamp` is normal in
@@ -7116,11 +7135,19 @@ def revive_lost_work(s: Session) -> dict:
     return out
 
 
-def revive_account(s: Session, accts: list) -> dict:
+def revive_account(s: Session, accts: list, probe: bool = True) -> dict:
     """Can the session's OWN home still run it, and how much quota does that account have?
 
     `usable` is `check_home_usable`'s verdict, caught rather than raised: a diagnosis says
     what is wrong, and the refusal belongs to whatever decides to act.
+
+    🛑 `probe=False` IS FOR THE QUIET SWEEP, and it does not mean "assume it is fine": it
+    means the home was NOT ASKED, so `usable` stays `None` and the reason says so. The one
+    caller is `csm stalled --check`, whose whole contract is one line and nothing else on
+    either stream — and `check_home_usable` ends in the credential probe, which announces
+    itself on stderr whenever `CSM_LOGIN_PROBE` is set and on macOS can raise a Keychain
+    dialog. Nothing is started on that path, so the question does not have to be asked; the
+    run that DOES start something (`revive`) asks it with its own gate.
 
     🛑 THE 5-HOUR INSTANT NEVER COMES FROM THE METER. A meter reading carries percentages
     and a `resets_at` that is the SEVEN-DAY window's, so using it as "when the limit lifts"
@@ -7132,10 +7159,14 @@ def revive_account(s: Session, accts: list) -> dict:
     out = {"label": a.label, "email": a.email, "home": tilde(a.home), "usable": None,
            "why": "", "meter": "unread", "meter_text": meter_text(None),
            "five_hour": None, "seven_day": None, "seven_day_resets_at": ""}
-    try:
-        out["usable"], out["why"] = True, check_home_usable(a, accts)
-    except Refusal as e:
-        out["usable"], out["why"] = False, str(e)
+    if not probe:
+        out["why"] = ("not asked: this sweep starts nothing, so the credential store and "
+                      "the home's gates were left alone")
+    else:
+        try:
+            out["usable"], out["why"] = True, check_home_usable(a, accts)
+        except Refusal as e:
+            out["usable"], out["why"] = False, str(e)
     m = meter_of(meters(), a)
     if m:
         out["meter"] = "stale" if m["age_s"] > METER_MAX_AGE_S else "fresh"
@@ -7290,6 +7321,15 @@ def revive_owner(local_id: str) -> dict:
     FOR; csm starting a second copy gives you one nobody is talking to while the first keeps
     answering. Two kinds are asked about: a bot (`CSM_BOTS_DIR`) and a scheduled pass
     (`CSM_RC_JOBS_DIR`).
+
+    🛑 THE OWNER IS REPORTED HERE AND WEIGHED IN `revive_decide`, which is where the one
+    narrowing lives (Thu 29 Oct 2026): an rc_job-owned session that is LIVE and IDLE may be
+    woken, because a wake relays a message into the process that is already running and
+    starts no second copy of the pass — and a scheduled-pass supervisor that puts its pass
+    back on the same link does not handle a usage limit, so without this its parked passes
+    were the one class of session nothing ever continued. A DEAD one stays its supervisor's,
+    and a BOT is refused however it is: a relay into a bot's session surfaces as a message in
+    whatever channel the bot answers.
     """
     out = {"owner": "", "kind": "", "fix": ""}
     bot = owner_of(local_id)
@@ -7310,13 +7350,16 @@ def revive_owner(local_id: str) -> dict:
     return out
 
 
-def diagnose(s: Session, accts: list, sp: Spec = None) -> dict:
+def diagnose(s: Session, accts: list, sp: Spec = None, probe: bool = True) -> dict:
     """ONE RECORD about one session: what it is, whether it runs, why it stopped, what it
     would cost to continue it, and who else is in charge of it.
 
     Read-only and offline: it starts nothing, signals nothing and writes nothing. Every
     field that could not be measured says so rather than guessing, because the decide table
     above `revive` keys on these words.
+
+    `probe=False` leaves the account's credential store unasked (`revive_account`): for the
+    one caller whose contract is a single line of output.
     """
     bare = (sp.bare if sp else "") or ""
     kind = revive_kind(s, bare)
@@ -7337,7 +7380,7 @@ def diagnose(s: Session, accts: list, sp: Spec = None) -> dict:
         "state": revive_state(s, kind["bridge_id"]),
         "stop": revive_stop(s.transcript),
         "lost_work": revive_lost_work(s),
-        "account": revive_account(s, accts),
+        "account": revive_account(s, accts, probe=probe),
         "server": server_in_folder(s.cwd),
         "owner": revive_owner(s.local_id),
         "spec": spec_notes(sp) if sp else [],
@@ -7417,7 +7460,8 @@ def check_say(say: str) -> None:
 
 
 def revive_note(s: Session, rec: dict, action: str, tgt: Account = None, say: str = "",
-                new_id: str = "", when: str = "", boot: float = None) -> str:
+                new_id: str = "", when: str = "", boot: float = None,
+                auto: bool = False) -> str:
     """THE REVIVE NOTE: what a revived session is told, as its next user turn.
 
     🛑 FACTS, STAMPED, AND NOT A WORD THE USER DID NOT SAY. It opens with the stamp because
@@ -7433,6 +7477,14 @@ def revive_note(s: Session, rec: dict, action: str, tgt: Account = None, say: st
     already done" is right after a limit — the turn demonstrably did not run — and is the
     most dangerous thing to say after a SIGKILL mid-`Edit`, where the tool call's outcome is
     unknown. So the unknown is stated instead, and only for that class.
+
+    🛑 `auto` CHANGES ONE SENTENCE, AND IT IS THE ATTRIBUTION (Thu 29 Oct 2026). The default
+    request sentence says the user asked for this revive, which is true of a `csm revive` a
+    person typed and FALSE of one a scheduled pass ran — and the receiving session is about
+    to decide what to do next on the strength of it. So an unattended run says that nobody
+    has sent a message since the stop and that this installation continues stopped sessions
+    automatically. A `--say` is still quoted verbatim beside it: the text came from somebody,
+    the run did not.
     """
     tgt = tgt or s.account
     when = when or _local_clock()
@@ -7521,8 +7573,15 @@ def revive_note(s: Session, rec: dict, action: str, tgt: Account = None, say: st
                        if stop.get("tool_at") else "time unrecorded"))
     # ⚠️ VERBATIM, inside the quotes, and the full stop is OUTSIDE them: the sentence has
     # to close, and nothing may be added to or taken from what he typed.
+    # ⚠️ AND THE UNATTENDED SENTENCE NAMES THE INSTALLATION, NOT A PERSON: on an `--auto` run
+    # nobody typed anything, so the only honest attribution is the standing arrangement that
+    # continues stopped sessions. A `--say` keeps its own quoted sentence in front of it.
+    unattended = ("The user has not sent a message since it stopped; this installation "
+                  "continues stopped sessions automatically.")
     ask = ('He said: "%s".' % say if say else
            "He asked csm to revive this session and continue where it stopped.")
+    if auto:
+        ask = ('He said: "%s". %s' % (say, unattended)) if say else unattended
     close = ("Re-check anything time-sensitive (running jobs, locks, claims, hardware "
              "state) before acting on it; do not repeat work that is already done.")
     def joined(keep: list) -> str:
@@ -7610,7 +7669,8 @@ REVIVE_CLAIM_STALE_S = (3 * CONNECT_WAIT_S + RELAY_TIMEOUT_S + REVIVE_PROVE_S
 #: note: the note is conversation text, and this file is a record of actions. The at-most-once
 #: triple `(local id, bridge id, transcript size at diagnosis)` is in every record, because
 #: the id alone is the same before and after a lazy respawn and the SIZE is the part that says
-#: whether the file csm acted on is still the file it diagnosed.
+#: whether the file csm acted on is still the file it diagnosed. Every record also carries
+#: `stop_uuid`, which is what `csm stalled` reads to say a STOP has already been acted on.
 REVIVE_LOG = _env_path("CSM_REVIVE_LOG", STATE_DIR / "revive.jsonl")
 #: The lines the note is wrapped in inside the relay's instruction, so "send this verbatim"
 #: names something with edges. Nothing parses them back: they are for the relay's reading.
@@ -8059,6 +8119,15 @@ def revive_record(s: Session, rec: dict, dec: dict, result: dict) -> None:
         # the bridge id and the SIZE are what say which file this acted on.
         "local_id": s.local_id, "bridge_id": kind.get("bridge_id") or "",
         "bytes": sess.get("bytes"),
+        # 🛑 AND THE AT-MOST-ONCE KEY FOR AN UNATTENDED WAKE: `(local_id, stop_uuid)`, the
+        # uuid of the transcript line the stop was read from (`revive_stop`). Added Thu 29
+        # Oct 2026, when a scheduled pass began waking every stopped session: the triple
+        # above answers "is this still the file I diagnosed", which is a question about one
+        # run, and the question a watchdog asks is "has this STOP already been acted on" —
+        # a session that stopped, was woken, ran for an hour and stopped again has a new
+        # stop event and a new uuid, and is due again. `""` where the line carried none, and
+        # `revive_handled` then falls back to the triple rather than guessing.
+        "stop_uuid": (rec.get("stop") or {}).get("uuid") or "",
         "account": s.account.name, "kind": kind.get("kind"),
         "state": (rec.get("state") or {}).get("state"),
         "stop": (rec.get("stop") or {}).get("stop"),
@@ -8142,6 +8211,7 @@ def revive_decide(rec: dict, args, tgt: Account = None) -> dict:
            "cures": [], "refusal": "", "note": False, "dropped": ""}
 
     new_link = bool(getattr(args, "new_link", False))
+    auto = bool(getattr(args, "auto", False))
     asked_mode = canon_mode(getattr(args, "permission_mode", "") or "")
 
     def dropped(row):
@@ -8184,7 +8254,17 @@ def revive_decide(rec: dict, args, tgt: Account = None) -> dict:
         out["what"] = what + out["dropped"]
         return out
 
-    if own.get("owner"):
+    # 🛑 THE OWNER REFUSAL, NARROWED TO WHAT IT WAS FOR (Thu 29 Oct 2026). What it guards is
+    # a SECOND COPY: a supervisor putting its own session back while csm starts another beside
+    # it. Row 5 starts nothing — it relays a message into the process that is already running
+    # — so for a scheduled pass that is live and idle there is no second copy to make, and
+    # refusing there left a whole class of session (a pass parked on a usage limit, which an
+    # rc_job supervisor does not handle) as the only one nothing ever continued. A DEAD pass
+    # is still its supervisor's, because reviving that one does start a process. A BOT is
+    # refused whatever its state: a relay into a bot's session surfaces as a message in the
+    # channel the bot answers, which is not csm's to write in.
+    wakeable_owner = own.get("kind") == "rc_job" and st == "live-idle"
+    if own.get("owner") and not wakeable_owner:
         return take(1, "nothing to do: %s owns this session" % own["owner"],
                     "a copy started here answers nobody while %s keeps answering"
                     % own["owner"],
@@ -8222,7 +8302,13 @@ def revive_decide(rec: dict, args, tgt: Account = None) -> dict:
         # own `--to` clause used to do by hand: a move copies a transcript and this one has
         # a live writer, a fork copies it for the same reason, and a `--permission-mode` is
         # applied to a process — of which this row starts none.
-        return take(5, "wake it — relay this note to the session that is already running",
+        # ⚠️ AND THE OWNER IS NAMED WHEN THERE IS ONE: this is the one row an owned session
+        # ever reaches (see `wakeable_owner`), and a reader who was told elsewhere that such
+        # a session is its supervisor's has to be told here why waking it is not a copy.
+        return take(5, "wake it — relay this note to the session that is already running"
+                    + (", which is the scheduled pass `%s`: a relay sends it a message and "
+                       "starts no second copy of the pass" % own["owner"]
+                       if own.get("owner") else ""),
                     "the note arrives as a PEER message, which cannot authorise anything "
                     "— it is read, not obeyed")
     if to:
@@ -8262,7 +8348,14 @@ def revive_decide(rec: dict, args, tgt: Account = None) -> dict:
         return take(8, "resume it in place — it gets a NEW claude.ai link",
                     "it was never a Remote Control session, so publishing it is a change "
                     "of exposure, not a restoration")
-    if kind == "server-child" and not new_link:
+    # 🛑 `--auto` TAKES THE FORK ROW HERE, because row 9's whole result is a sentence for a
+    # person to act on (open the link; its server respawns the child) and nobody is reading
+    # it on an unattended run. There is no unattended way back onto a server child's own link
+    # — only its own server respawns it, and only on activity it cannot be given from here —
+    # so the fork is the only action that exists, and `--auto` says so rather than printing a
+    # tap and exiting 0 as though something had been done. The OLD claude.ai session is then
+    # the caller's to archive, which is why the fork reports `old_bridge_id` (`revive_fork`).
+    if kind == "server-child" and not (new_link or auto):
         up = srv.get("up")
         # 🛑 THE TAP NEEDS THE SERVER. Opening the link respawns the child only while a
         # `claude remote-control` server runs in its folder, and a restart kills that server
@@ -8294,7 +8387,10 @@ def revive_decide(rec: dict, args, tgt: Account = None) -> dict:
                     "a server child cannot be resumed onto its own link; the cure that "
                     "does not need you is `--new-link`, which forks")
     if kind == "server-child":
-        return take(10, "FORK it: a new session id, a new link, the same past",
+        return take(10, "FORK it: a new session id, a new link, the same past"
+                    + (" (--auto: a server child has no unattended way back onto its own "
+                       "link, so the fork is the only action there is)" if auto and not
+                       new_link else ""),
                     "the OLD link still opens the OLD copy — two conversations with one "
                     "history, so archive the old one and do not type there")
     out["refusal"] = ("revive has no action for a %s session in the same account: say where "
@@ -8304,6 +8400,30 @@ def revive_decide(rec: dict, args, tgt: Account = None) -> dict:
                    "here" % kind + out["dropped"])
     out["risk"] = "nothing was read about how to bring this kind back"
     return out
+
+
+def revive_home_gate(rec: dict, dec: dict) -> dict:
+    """🛑 AND THE HOME IT WOULD START IN HAS TO BE USABLE — the one gate applied after the
+    row is picked. Returns the same decision, turned into a refusal when it is not.
+
+    Rows 5, 7, 8, 10 and 11 all start or message a session in the session's OWN home (row
+    6's target is gated by `check_target` instead, row 9 starts nothing), and a home whose
+    credential is gone takes the session up and then fails at its first token refresh —
+    which looks exactly like a successful revive.
+
+    It is its own function so that the SWEEP and the RUN cannot disagree: `csm stalled`
+    reports the action `csm revive` would take, and a row it called `resume` while revive
+    would refuse it is a table that sends a watchdog at a session nothing can start.
+    ⚠️ `usable is False`, never falsy: `None` means the home was not asked (`revive_account`'s
+    `probe=False`, the quiet sweep), and "not asked" is not "cannot run it".
+    """
+    if dec["row"] in (5, 7, 8, 10, 11) and (rec.get("account") or {}).get("usable") is False:
+        dec.update(action="refuse", exit=2, note=False,
+                   refusal=(rec["account"] or {}).get("why") or "that home cannot run it",
+                   what="nothing to do: %s cannot run it%s"
+                        % ((rec["account"] or {}).get("label"),
+                           dec.get("dropped") or ""))
+    return dec
 
 
 def revive_risk(rec: dict, dec: dict) -> str:
@@ -8602,16 +8722,7 @@ def revive_plan(s: Session, sp: Spec, args, accts: list) -> dict:
         dec.update(action="refuse", exit=2, note=False, refusal=gate,
                    what="nothing to do: it cannot be moved to %s%s"
                         % (tgt.label, dec.get("dropped") or ""))
-    # 🛑 AND THE HOME IT WOULD START IN HAS TO BE USABLE. Rows 5, 7, 8 and 10 all start or
-    # message a session in the session's OWN home (row 6's target is gated above, row 9
-    # starts nothing), and a home whose credential is gone takes the session up and then
-    # fails at its first token refresh — which looks exactly like a successful revive.
-    if dec["row"] in (5, 7, 8, 10, 11) and (rec["account"] or {}).get("usable") is False:
-        dec.update(action="refuse", exit=2, note=False,
-                   refusal=(rec["account"] or {}).get("why") or "that home cannot run it",
-                   what="nothing to do: %s cannot run it%s"
-                        % ((rec["account"] or {}).get("label"),
-                           dec.get("dropped") or ""))
+    dec = revive_home_gate(rec, dec)
     # The line that is really SHOWN as the one risk, kept in the decision so `--json` and
     # the three-line answer cannot disagree about it.
     dec["risk_line"] = revive_risk(rec, dec)
@@ -8637,9 +8748,11 @@ def revive_plan(s: Session, sp: Spec, args, accts: list) -> dict:
     else:
         perm, why_perm = unchanged_mode(rec, dec["action"])
     if dec["note"]:
-        note = revive_note(s, rec, dec["action"], tgt=tgt, say=args.say or "")
+        note = revive_note(s, rec, dec["action"], tgt=tgt, say=args.say or "",
+                           auto=bool(getattr(args, "auto", False)))
     return {"rec": rec, "dec": dec, "tgt": tgt, "note": note, "perm": perm,
-            "why_perm": why_perm, "rc_name": rc_name, "mode_applied": applied}
+            "why_perm": why_perm, "rc_name": rc_name, "mode_applied": applied,
+            "auto": bool(getattr(args, "auto", False))}
 
 
 def revive_refusal(dec: dict) -> str:
@@ -8860,8 +8973,19 @@ def revive_fork(s: Session, rec: dict, args, accts: list, perm: str, rc_name: st
     # has no id to name and says "a new session" rather than inventing one. It goes in `out`
     # under the one key `revive_record` drops, so `--json` reports the note that was SENT
     # while the log still holds no note text.
-    note = revive_note(s, rec, "fork", tgt=p["tgt"], say=args.say or "", new_id=new_id)
+    note = revive_note(s, rec, "fork", tgt=p["tgt"], say=args.say or "", new_id=new_id,
+                       auto=bool(p.get("auto")))
     out["note"] = note
+    # 🛑 THE OLD CLAUDE.AI SESSION, NAMED IN THE RESULT. A fork leaves two conversations with
+    # one history, and the only thing that stops the old link respawning a second actor is
+    # ARCHIVING it — which this tool deliberately cannot do (it reads no credential). So the
+    # id the caller needs is reported rather than described: the bare bridge id, which the
+    # API spells `cse_<id>`. Added Thu 29 Oct 2026 for the unattended wake, where `--auto`
+    # takes this row for a dead server child and the caller archives the old session next.
+    old_url = (rec.get("session") or {}).get("url") or ""
+    out["old_bridge_id"] = (rec.get("kind") or {}).get("bridge_id") or ""
+    out["old_url"] = old_url
+    out["archive_old"] = bool(out["old_bridge_id"])
     print("  fork          %s → %s: a new session id, a new link, the same past"
           % (s.short, new_id[:8]))
     link, pane, win = revive_start(s, rec, accts, perm, rc_name, out, new_id=new_id)
@@ -8884,7 +9008,6 @@ def revive_fork(s: Session, rec: dict, args, accts: list, perm: str, rc_name: st
     print("  new session   %s\n                %s" % (new_id, tilde(dest)))
     print("  window        %s — `csm stop %s` ends it and frees the window (the NEW id)"
           % (out["window"], new_id[:8]))
-    old_url = (rec.get("session") or {}).get("url") or ""
     if old_url:
         print("  🛑 OLD LINK    %s still opens the OLD copy, which is now a second "
               "conversation\n                with the same past. Do not type there; "
@@ -8908,9 +9031,14 @@ def revive_json(rec: dict, dec: dict, note: str, p: dict, out: dict) -> dict:
     rebuilds it to name its own new id, and `out` carries that under the same key the record
     drops.
     """
+    # ⚠️ `unattended`, NOT `auto`: this document's `auto` key is older and means something
+    # else — the sentence `auto_target` printed about which account `--to auto` picked. Two
+    # meanings under one key in a document a watchdog parses is how a caller ends up reading
+    # "an account was chosen" as "this was an unattended run".
     return {"dry_run": False, "record": rec, "decision": dec,
             "note": out.get("note") or note,
             "auto": AUTO_NOTE[0] if AUTO_NOTE else "",
+            "unattended": bool(p.get("auto")),
             "mode": revive_mode_doc(p),
             "result": {k: v for k, v in out.items() if k != "note"},
             "exit": out.get("exit")}
@@ -9120,6 +9248,7 @@ def do_revive(args, accts: list) -> int:
         if args.as_json:
             print(json.dumps({"dry_run": True, "record": rec, "decision": dec,
                               "note": p["note"], "auto": AUTO_NOTE[0] if AUTO_NOTE else "",
+                              "unattended": bool(p.get("auto")),
                               "mode": revive_mode_doc(p)}, indent=1, default=str))
             return 0
         print(render_revive(rec, dec, p["note"], p["perm"], p["why_perm"], p["rc_name"]))
@@ -9142,6 +9271,542 @@ def do_revive(args, accts: list) -> int:
                 "%ds" % (s.short, tilde(Path(str(claim) + ".lock")),
                          int(REVIVE_CLAIM_STALE_S)))
         return revive_act(s, sp, args, accts, revive_plan(s, sp, args, accts))
+
+
+# ---------------------------------------------------------------------------- the sweep
+#
+# 🛑 WHICH STOPPED SESSIONS ARE READY TO CONTINUE, AND WHICH HAVE ALREADY BEEN DEALT WITH.
+# `revive` answers about ONE session somebody named; this answers about every session in
+# every home, for a caller nobody is watching. It starts nothing, messages nothing and writes
+# nothing — the acting is still `csm revive <id> --auto`, one session at a time, so that every
+# refusal in the decide table applies to every wake.
+#
+# 🛑 AND THE TWO RULES IT EXISTS TO KEEP ARE: never before the reset, and never twice for one
+# stop. The first is `WAKE_MARGIN_S`; the second is the at-most-once key in the revive log
+# (`revive_record`'s `stop_uuid`, read back by `revive_handled`) — a pass that runs every five
+# minutes would otherwise relay the same note into the same session twelve times an hour.
+
+#: 🛑 HOW LONG AFTER A LIMIT'S OWN RESET A WAKE MAY BE SENT. A wake sent early is CONSUMED,
+#: not queued: measured on the incident this was written for (Tue 27 Oct 2026), a heartbeat
+#: that fired 45 minutes inside the five-hour window spent its turn on a second 429 and
+#: nothing re-fired after the reset — the session sat dead until morning (LESSONS L40). The
+#: margin is for the clock, not for the limit: the `resetsAt` a transcript recorded and this
+#: machine's own clock are two readings, and two minutes is cheap beside losing the wake.
+WAKE_MARGIN_S = _env_num("CSM_WAKE_MARGIN_S", 120.0, float)
+#: How old a mid-turn kill may be and still be woken without anybody asking. The case this
+#: covers is a machine restart under a working session, which is answered within the day or
+#: not at all: a week later the folder has moved on and "continue where you left off" is the
+#: wrong instruction. An older one is still LISTED, with its age as the reason it is not due.
+WAKE_MAX_AGE_H = _env_num("CSM_WAKE_MAX_AGE_H", 24.0, float)
+#: 🛑 THE LIMIT CLASSES A RESET REALLY CLEARS, as a POSITIVE list. `monthly-spend`, `credits`
+#: and `model` never clear by waiting at all (`LIMIT_CLASSES`), and a class whose own words
+#: nothing matched is not on this list either: an unread class is not a clearable one, and a
+#: session woken into a wall spends its first turn hitting it.
+WAKE_LIMIT_CLASSES = ("session", "weekly")
+#: How far back the sweep looks, in hours, by a transcript's own mtime. Wide enough for a
+#: weekend, narrow enough that a home holding thousands of transcripts is not re-read from the
+#: beginning every five minutes.
+STALLED_SINCE_H = _env_num("CSM_STALLED_SINCE_H", 48.0, float)
+#: 🛑 THE CHEAP PREFILTER'S WINDOW, deliberately far smaller than `REVIVE_TAIL_BYTES`. What
+#: the sweep asks of every transcript is whether the LAST thing that happened there is a stop
+#: a wake could cover, and the line that answers that is at the END of the file: a session
+#: that stopped wrote nothing after the stop. The 1 MiB window `revive` reads is for finding
+#: the last real PROMPT, which only matters once something is going to act. A window that held
+#: no main-chain line is treated as INCONCLUSIVE rather than empty (`stalled_prefilter`), so a
+#: narrow window can cost a second, full read and never a missed session.
+STALLED_PREFILTER_BYTES = _env_num("CSM_STALLED_PREFILTER", 64 * 1024)
+#: The stop verdicts a SMALL window may not be trusted to rule out: the two a wake covers,
+#: plus `unknown` — a tail that is all tool results says nothing about the turn it belongs to.
+STALLED_SHAPES = ("usage-limit", "mid-turn", "unknown")
+#: How much of the revive log is read back to answer "has this stop been acted on". A record
+#: is a few hundred bytes, so this is tens of thousands of them, and a log older than that has
+#: nothing to say about a stop inside the sweep's own window. Not a knob: no installation
+#: tunes it, and a value too small here would silently wake sessions a second time.
+STALLED_LOG_TAIL = 4 << 20
+
+
+def stalled_args():
+    """The flags the sweep reports an action FOR: an unattended run, with nothing else asked.
+
+    🛑 `auto=True`, because the command a reader of this table runs is `csm revive <id>
+    --auto`, and `--auto` changes which row a dead server child takes (row 9's printed tap
+    becomes row 10's fork). A sweep that reported `keep-link` would be describing a command
+    nobody is going to run. A fresh namespace per call: `revive_decide` only reads it, but a
+    shared mutable default is one edit away from a flag leaking from one row into the next.
+    """
+    return argparse.Namespace(to="", new_link=False, permission_mode="", say="",
+                              unarchive=False, auto=True, name=None)
+
+
+def stalled_prefilter(path: Path, tail: int = 0) -> dict:
+    """IS THIS TRANSCRIPT WORTH A FULL `diagnose`? `{"candidate", "stop", "why", …}`.
+
+    🛑 OVER-INCLUSIVE ON PURPOSE. A false candidate costs one `diagnose`; a false skip is a
+    session nobody ever continues, which is the whole failure this command exists to prevent.
+    So the three verdicts a small window cannot be trusted to rule out are all candidates
+    (`STALLED_SHAPES`), and so is a window that held no line of the main conversation while
+    the file itself is bigger than the window.
+
+    🛑 AND IT IS `revive_stop`, NOT A SECOND READER. Running the same parser over a smaller
+    window is what makes the prefilter agree with the diagnosis by construction: a hand-rolled
+    "does this look like a limit" test is exactly the text-match this tool refuses to make
+    (see `revive_stop`'s own 🛑), and it would drift the first time either rule changed.
+    """
+    want = int(tail or STALLED_PREFILTER_BYTES)
+    size = file_size(path)
+    out = {"candidate": False, "stop": "", "why": "", "read_bytes": 0, "blind": False,
+           "unread": size is None}
+    if size is None:
+        # Unreadable is not empty, and it is not a skip either: it reaches the coverage
+        # channel, because a sweep that silently drops files reports a quiet machine.
+        out["why"] = "%s could not be read" % tilde(path)
+        return out
+    pre = revive_stop(path, tail=want)
+    out["stop"] = pre.get("stop") or "unknown"
+    out["read_bytes"] = pre.get("read_bytes") or 0
+    # 🛑 AN EMPTY WINDOW IS NOT AN EMPTY FILE. `revive_stop` answers `empty` both for a
+    # transcript with no conversation in it — a Remote Control server pre-creates those by the
+    # hundred, and one is never due — and for a window that happened to hold no main-chain
+    # line, which a long burst of subagent lines at the end of a big file produces. The first
+    # is the cheapest skip there is; the second has to be read properly.
+    out["blind"] = out["stop"] == "empty" and size > want
+    out["candidate"] = out["stop"] in STALLED_SHAPES or out["blind"]
+    shown = human_bytes(out["read_bytes"])
+    if out["blind"]:
+        out["why"] = ("the last %s of it holds no line of the main conversation, so this "
+                      "window rules nothing out" % shown)
+    else:
+        out["why"] = ("the last %s of it reads as `%s`%s"
+                      % (shown, out["stop"],
+                         "" if out["candidate"] else ", which no wake rule covers"))
+    return out
+
+
+def revive_log_records(path: Path = None, tail: int = 0) -> dict:
+    """What the revive log already says was done. `{"records", "read_bytes", "unread", "path"}`.
+
+    🛑 A MISSING LOG IS "NOTHING HAS BEEN REVIVED HERE"; AN UNREADABLE ONE IS NOT. The first
+    is the state of every fresh install. The second means the sweep cannot tell a stop it has
+    already acted on from one it has not — which is how a session gets woken twice — so the
+    two come back differently and `unread` reaches the `INCOMPLETE:` line.
+    """
+    p = Path(path) if path else REVIVE_LOG
+    want = int(tail or STALLED_LOG_TAIL)
+    out = {"records": [], "read_bytes": 0, "unread": "", "path": tilde(p)}
+    try:
+        size = p.stat().st_size
+    except FileNotFoundError:
+        return out
+    except OSError as e:
+        out["unread"] = "%s could not be read (%s)" % (tilde(p), e)
+        return out
+    try:
+        with p.open("rb") as f:
+            f.seek(max(0, size - want))
+            blob = f.read()
+    except OSError as e:
+        out["unread"] = "%s could not be read (%s)" % (tilde(p), e)
+        return out
+    out["read_bytes"] = len(blob)
+    out["records"] = list(_iter_json_lines(blob, drop_first=size > want))
+    return out
+
+
+def revive_handled(local_id: str, stop: dict, records: list, size=None) -> dict:
+    """HAS THIS STOP ALREADY BEEN ACTED ON? `{"done", "attempts", "failed", "why", …}`.
+
+    🛑 THE KEY IS `(local id, stop event uuid)`, and the uuid is the point. The id is the same
+    before and after a stop, so it can only answer "was this session ever revived" — and a
+    session that stopped, was woken, worked for an hour and stopped again is a NEW stop and is
+    due again. The uuid of the line the stop was read from is written once and never
+    rewritten, so it names one stop and nothing else (`revive_stop`'s `uuid`).
+
+    🛑 AND `done` IS EXIT 0, NOT "A RECORD EXISTS". A record with a non-zero exit is a wake
+    that was ATTEMPTED AND FAILED: nothing was delivered, the session is still sitting there,
+    and it has to stay due or it is never woken at all. Those attempts are counted instead
+    (`failed`), which is what `--check` turns into its one FAULT line.
+    """
+    key = str((stop or {}).get("uuid") or "")
+    mine = [d for d in records
+            if str(d.get("local_id") or "").lower() == str(local_id or "").lower()]
+    out = {"done": False, "attempts": 0, "failed": 0, "last_exit": None, "at": 0.0,
+           "key": key, "compared": "", "why": ""}
+    if key:
+        hits = [d for d in mine if str(d.get("stop_uuid") or "") == key]
+        out["compared"] = "stop event %s" % key[:8]
+    elif size is not None:
+        # 🛑 THE FALLBACK IS 0.5.0's OWN TRIPLE, never a looser match on the id. A stop line
+        # with no `uuid` (a record written before Thu 29 Oct 2026, a transcript from an older
+        # build, or a verdict read off the file's mtime because no line carried a stamp)
+        # cannot name itself — and matching on the id alone would read "this session was
+        # revived last week" as "this stop is handled" and never wake it again. The SIZE is
+        # the part that moves: anything written since the record makes it a different file
+        # state, and the row is due once more.
+        hits = [d for d in mine if d.get("bytes") == size]
+        out["compared"] = "transcript size %s" % human_bytes(size)
+    else:
+        hits = []
+        out["compared"] = "nothing: the stop carries no uuid and its size is unknown"
+    out["attempts"] = len(hits)
+    ok = [d for d in hits if d.get("exit") == 0]
+    bad = [d for d in hits if d.get("exit") is not None and d.get("exit") != 0]
+    out["failed"], out["done"] = len(bad), bool(ok)
+    if hits:
+        out["last_exit"] = hits[-1].get("exit")
+        out["at"] = float(hits[-1].get("at") or 0.0)
+    if out["done"]:
+        out["why"] = ("already revived for this stop at %s (matched on %s)"
+                      % (clock(float(ok[-1].get("at") or 0.0)), out["compared"]))
+    elif bad:
+        out["why"] = ("%d wake(s) for this stop FAILED, the last with exit %s at %s (matched "
+                      "on %s), so it is still due"
+                      % (len(bad), out["last_exit"], clock(out["at"]), out["compared"]))
+    else:
+        out["why"] = "no record of a wake for this stop"
+    return out
+
+
+def stalled_due(rec: dict, handled: dict, now: float = 0.0) -> dict:
+    """IS THIS SESSION READY TO BE CONTINUED WITHOUT ANYBODY ASKING? `{"due", "why"}`.
+
+    🛑 TWO STOPS ARE DUE AND NOTHING ELSE IS. A usage limit of a class a reset clears, once
+    that reset plus `WAKE_MARGIN_S` has passed; and a session killed while it was working (an
+    unanswered tool call or prompt) whose process is gone, inside `WAKE_MAX_AGE_H`. A clean
+    finish is not due — it answered, and there is nothing to continue — and neither is an API
+    error, which waiting does not fix.
+
+    🛑 AND FIVE THINGS ARE NEVER DUE, whatever their stop: a session that is working right
+    now (a message would join the turn it is in the middle of), one a bot owns (a relay would
+    surface in the channel that bot answers), one a scheduled pass owns that is not live and
+    idle (its own supervisor puts that one back), one with no conversation in it, and one
+    archived or ended from the app, which was somebody's decision and not a failure.
+    """
+    now = now or time.time()
+    st = (rec.get("state") or {}).get("state") or "dead"
+    stop = rec.get("stop") or {}
+    own = rec.get("owner") or {}
+
+    def no(why):
+        return {"due": False, "why": why}
+
+    if own.get("kind") == "bot":
+        return no("%s owns it: a relay into a bot's session surfaces in the channel it "
+                  "answers" % own.get("owner"))
+    if own.get("owner") and st != "live-idle":
+        return no("%s owns it and it is %s, so its own supervisor is what puts it back"
+                  % (own.get("owner"), st))
+    if st == "live-busy":
+        return no("it is working right now")
+    if stop.get("stop") == "empty":
+        return no("there is no conversation to continue")
+    if stop.get("archived"):
+        return no("it was archived or ended from the app, which was a decision and not a "
+                  "failure")
+    if handled.get("done"):
+        return no(handled.get("why") or "it has already been revived for this stop")
+    if stop.get("stop") == "usage-limit":
+        klass = stop.get("class") or ""
+        if klass not in WAKE_LIMIT_CLASSES:
+            return no("waiting does not clear %s"
+                      % ("a %s limit" % klass if klass else
+                         "a limit whose class its own words did not name"))
+        if not stop.get("resets_at"):
+            return no("its %s limit records no reset time, so nothing here can say that "
+                      "reset has passed" % klass)
+        ready = float(stop["resets_at"]) + WAKE_MARGIN_S
+        if ready > now:
+            return no("its %s limit resets %s, and a wake waits %gs past that"
+                      % (klass, clock(stop["resets_at"]), WAKE_MARGIN_S))
+        return {"due": True,
+                "why": "its %s limit reset at %s, %s ago"
+                       % (klass, clock(stop["resets_at"]), human_age(ready))}
+    if stop.get("stop") == "mid-turn":
+        if st != "dead":
+            return no("it was cut off mid-turn, but something is running it now (%s)" % st)
+        if not stop.get("at"):
+            return no("nothing records when it was cut off, so its age cannot be checked")
+        if (now - float(stop["at"])) > WAKE_MAX_AGE_H * 3600.0:
+            return no("it was cut off %s ago, past the %gh an automatic wake covers"
+                      % (stop.get("age") or "?", WAKE_MAX_AGE_H))
+        return {"due": True,
+                "why": "it was killed mid-turn %s ago and nothing is running it"
+                       % (stop.get("age") or "?")}
+    return no("its stop reads `%s`, which no wake rule covers"
+              % (stop.get("stop") or "unknown"))
+
+
+def stalled_scan(accts: list, since_h: float, unread: list, read: list):
+    """`(sessions, prefilters, scanned)` — every transcript in the window, prefiltered.
+
+    🛑 THE PREFILTER IS THE WHOLE COST CONTROL. A `diagnose` is a 1 MiB parse plus a
+    machine-wide `ps`; this is one seek and one small parse, and on the homes this was written
+    against it skips all but a handful of the files in the window.
+
+    🛑 AND ONE ROW PER FILE, by `dedupe_shared`'s rule: when two homes' `projects/` resolve to
+    one directory the same transcript is seen once per home, and diagnosing it twice would put
+    two rows in the table for one session — which a caller reading `due` acts on twice.
+    """
+    cut = time.time() - max(0.0, since_h) * 3600.0
+    rows, pres, scanned = [], {}, 0
+    for a in accts:
+        if not a.home.is_dir():
+            continue
+        try:
+            os.listdir(str(a.projects))
+        except FileNotFoundError:
+            read.append(a.label)             # a home that has run nothing yet, not a problem
+            continue
+        except OSError as e:
+            # 🛑 A HOME THAT CANNOT BE LISTED IS NOT AN EMPTY ONE — `live_rows`' own rule, and
+            # the reason this listdir is here at all: `transcripts_by_id` catches the OSError
+            # and answers `{}`, which reads downstream exactly like "this home runs nothing".
+            unread.append({"name": a.label,
+                           "reason": "%s could not be read (%s)" % (tilde(a.projects), e)})
+            continue
+        read.append(a.label)
+        live = live_rows(a)
+        for sid, found in sorted(transcripts_by_id(a, None).items()):
+            m, p = found
+            if m < cut:
+                continue
+            scanned += 1
+            pre = stalled_prefilter(p)
+            if pre["unread"]:
+                # `a.label`, not `a.handle`: an installation with no accounts file has no
+                # handles, and every other sentence in this tool names an account by its
+                # label for exactly that reason.
+                unread.append({"name": "%s %s" % (a.label, sid[:8]), "reason": pre["why"]})
+                continue
+            if not pre["candidate"]:
+                continue
+            s = session_of(a, p, m, live.get(sid), subagent_rule=False)
+            if s is None:
+                continue                     # unreachable with the subagent rule off; cheap
+            rows.append(s)
+            try:
+                pres[os.path.realpath(str(p))] = pre
+            except OSError:
+                pres[str(p)] = pre
+    return dedupe_shared(rows), pres, scanned
+
+
+def stalled_report(accts: list, since_h: float = 0.0, probe: bool = True) -> dict:
+    """THE WHOLE SWEEP, as one document. Read-only: it starts and messages nothing.
+
+    `probe=False` leaves every account's credential store unasked, for `--check`, whose
+    contract is one line and nothing else on either stream.
+    """
+    since_h = float(since_h) if since_h else STALLED_SINCE_H
+    unread, read = [], []
+    found, pres, scanned = stalled_scan(accts, since_h, unread, read)
+    seen = revive_log_records()
+    if seen["unread"]:
+        unread.append({"name": "the revive log", "reason": seen["unread"]})
+    rows = []
+    for s in found:
+        try:
+            rec = diagnose(s, accts, None, probe=probe)
+            dec = revive_home_gate(rec, revive_decide(rec, stalled_args()))
+        except Refusal as e:
+            # 🛑 ONE SESSION'S REFUSAL IS NOT THE WHOLE SWEEP'S, AND IT IS NOT A SILENCE
+            # EITHER. Parts of the diagnosis refuse rather than guess — `rc_job_owner` dies
+            # on a `CSM_RC_JOBS_DIR` it cannot read, because answering "nobody owns it" there
+            # is how a second copy of a scheduled pass gets started. In `revive` that is
+            # exactly right: it is about to act. Here it would abort a whole-machine read
+            # over one directory and come out of `--check` as an exit code outside the 0/1/3
+            # contract, so the row is dropped and the reason goes to the coverage channel,
+            # where it becomes `INCOMPLETE:` — nothing is due that could not be read.
+            unread.append({"name": "%s %s" % (s.handle, s.short), "reason": str(e)})
+            continue
+        sess, stop = rec["session"], rec["stop"]
+        handled = revive_handled(s.local_id, stop, seen["records"], sess.get("bytes"))
+        due = stalled_due(rec, handled)
+        if due["due"] and dec["action"] == "refuse":
+            # 🛑 THE SWEEP AND THE RUN MAY NEVER DISAGREE. These rules are read off the same
+            # record, but they are two pieces of code, and a row called due that `csm revive`
+            # would refuse sends a watchdog at a session nothing can start — once every five
+            # minutes, for ever. The decide table wins, and says so in the why.
+            due = {"due": False,
+                   "why": "revive would refuse it: %s" % (dec.get("refusal")
+                                                          or dec.get("what") or "no row")}
+        if not (rec["state"] or {}).get("ps_asked"):
+            unread.append({"name": "%s %s" % (s.handle, s.short),
+                           "reason": "`ps` could not be asked, so nothing here can say "
+                                     "whether a process is running it"})
+        try:
+            pre = pres.get(os.path.realpath(str(s.transcript))) or {}
+        except OSError:
+            pre = pres.get(str(s.transcript)) or {}
+        rows.append({
+            "local_id": s.local_id, "short": s.short, "account": s.account.name,
+            "handle": s.handle, "title": s.label, "cwd": s.cwd,
+            "kind": (rec["kind"] or {}).get("kind"), "state": (rec["state"] or {}).get("state"),
+            "bridge_id": sess.get("bridge_id"), "url": sess.get("url"),
+            "bytes": sess.get("bytes"), "mtime": s.mtime, "age": sess.get("age"),
+            "is_self": s.is_self,
+            "stop": {k: stop.get(k) for k in ("stop", "class", "window", "resets_at",
+                                              "in_force", "at", "age", "uuid", "archived",
+                                              "why")},
+            "owner": {"owner": (rec["owner"] or {}).get("owner"),
+                      "kind": (rec["owner"] or {}).get("kind")},
+            "due": bool(due["due"]), "why": due["why"],
+            "row": dec.get("row"), "action": dec.get("action"), "exit": dec.get("exit"),
+            "what": dec.get("what"), "handled": handled,
+            "prefilter": pre.get("why") or "",
+        })
+    # 🛑 DUE FIRST, OLDEST STOP FIRST. The caller takes these rows in order and wakes at most
+    # a few per run, and the one that has been waiting longest is the one to wake first —
+    # a newer stop would otherwise keep jumping the queue on every pass.
+    rows.sort(key=lambda r: (not r["due"], float((r["stop"] or {}).get("at") or 0.0)))
+    return {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "machine": machine(),
+            "version": __version__, "since_h": since_h, "margin_s": WAKE_MARGIN_S,
+            "max_age_h": WAKE_MAX_AGE_H, "classes": list(WAKE_LIMIT_CLASSES),
+            "probed": bool(probe), "scanned": scanned, "candidates": len(rows),
+            "due": sum(1 for r in rows if r["due"]),
+            "failed": sum(1 for r in rows if r["due"] and (r["handled"] or {}).get("failed")),
+            "rows": rows,
+            "log": {k: seen[k] for k in ("path", "read_bytes", "unread")},
+            "records": len(seen["records"]),
+            "coverage": {"read": read, "unread": unread}}
+
+
+def stalled_check_line(rep: dict):
+    """The ONE line and the exit code: `ok:` 0 · `FAULT:` 1 · `INCOMPLETE:` 3.
+
+    🛑 THE SAME CONTRACT AS `modes --check`, and the same reason: a scheduled caller captures
+    both streams, deletes the newlines and matches the PREFIX, so one stray byte anywhere in
+    the output turns `ok:` into a fault report about the tool instead of a reading of the
+    machine. `do_stalled` is what keeps the path quiet — no credential probe, nothing else
+    printed; this function is what keeps the wording stable.
+
+    🛑 A DUE SESSION IS NOT A FAULT. Being due is the normal state between one pass and the
+    next: something stopped, its reset has come, and the thing that wakes it runs every few
+    minutes. The fault is a wake that was TRIED AND FAILED for that same stop — the one state
+    nothing else in the loop reports, because the next pass finds the row still due and tries
+    again. Incomplete outranks nothing and a fault outranks incomplete.
+    """
+    unread = rep["coverage"]["unread"]
+    due = [r for r in rep["rows"] if r["due"]]
+    failed = [r for r in due if (r["handled"] or {}).get("failed")]
+    tail = ("%d due of %d diagnosed, %d transcript(s) scanned in the last %gh on %s"
+            % (len(due), rep["candidates"], rep["scanned"], rep["since_h"], rep["machine"]))
+    if unread:
+        tail += ("; %d not read (%s: %s)"
+                 % (len(unread), unread[0]["name"], unread[0]["reason"]))
+    if failed:
+        who = ", ".join("%s %s (%d attempt(s), last exit %s)"
+                        % (r["handle"], r["short"], (r["handled"] or {}).get("attempts") or 0,
+                           (r["handled"] or {}).get("last_exit"))
+                        for r in failed)
+        return ("FAULT: %d due session(s) whose last wake FAILED: %s — %s"
+                % (len(failed), who, tail)), 1
+    if unread:
+        return ("INCOMPLETE: no due session has a failed wake, but %d thing(s) could not be "
+                "read — %s" % (len(unread), tail)), 3
+    if due:
+        who = ", ".join("%s %s (%s)" % (r["handle"], r["short"], r["action"]) for r in due[:4])
+        return ("ok: %d session(s) due for a wake and none has failed: %s%s — %s"
+                % (len(due), who, ", +%d more" % (len(due) - 4) if len(due) > 4 else "",
+                   tail)), 0
+    return ("ok: nothing is due for a wake — %s" % tail), 0
+
+
+def render_stalled(rep: dict) -> str:
+    """The table a person reads: what stopped, what is ready, and what was already done.
+
+    The rows are in `--json`'s own order — due first, oldest stop first — because the table
+    and the document are one answer, and a caller that read them differently would wake a
+    different session than the one the reader was shown.
+    """
+    out = ["csm stalled — %s, %s" % (rep["machine"], rep["at"].replace("T", " ")),
+           "window: written in the last %gh · a limit's wake waits %gs past its reset · a "
+           "mid-turn kill is woken for %gh"
+           % (rep["since_h"], rep["margin_s"], rep["max_age_h"]),
+           "scanned %d transcript(s) in %d home(s), diagnosed %d, DUE %d"
+           % (rep["scanned"], len(rep["coverage"]["read"]), rep["candidates"], rep["due"]),
+           "revive log: %s — %d record(s) read%s"
+           % (rep["log"]["path"], rep["records"],
+              ", NOT READ: %s" % rep["log"]["unread"] if rep["log"]["unread"] else "")]
+    rows = rep["rows"]
+    if rows:
+        out.append("")
+        w = min(max([18] + [len(r["title"] or "") for r in rows]), ROW_TITLE)
+        aw = min(max([6] + [len(r["handle"] or "") for r in rows]), 16)
+        # ⚠️ 19 for the stop column, not 14: `usage-limit session` is the commonest value
+        # there and the widest, and a column that cut it to `usage-limit se` was truncating
+        # the one word that says whether waiting is the cure.
+        out.append("due  %-9s %-*s %-13s %-9s %-19s %-8s %-*s"
+                   % ("session", aw, "acct", "kind", "state", "stop", "handled", w, "title"))
+        for r in rows:
+            h = r["handled"] or {}
+            held = ("yes" if h.get("done") else
+                    "%d FAILED" % h.get("failed") if h.get("failed") else "no")
+            st = r["stop"] or {}
+            out.append("%-4s %-9s %-*s %-13s %-9s %-19s %-8s %-*s"
+                       % ("YES" if r["due"] else "-", r["short"], aw, dcut(r["handle"], aw),
+                          r["kind"] or "?", r["state"] or "?",
+                          dcut(" ".join([x for x in (st.get("stop"), st.get("class"))
+                                         if x]), 19),
+                          held, w, tidy(r["title"] or "", w))
+                       + ("  ← this session" if r["is_self"] else ""))
+        for r in rows:
+            out.append("")
+            out.append("   %s %s %s — %s"
+                       % ("DUE " if r["due"] else "not due:", r["handle"], r["short"],
+                          r["why"]))
+            out.append("     stopped %s (%s ago): %s"
+                       % (time.strftime("%a %d %b %H:%M",
+                                        time.localtime((r["stop"] or {}).get("at") or 0))
+                          if (r["stop"] or {}).get("at") else "at an unrecorded time",
+                          (r["stop"] or {}).get("age") or "?",
+                          (r["stop"] or {}).get("why") or "nothing says why"))
+            out.append("     revive --auto would: row %s, %s" % (r["row"], r["what"]))
+            if (r["handled"] or {}).get("attempts"):
+                out.append("     log: %s" % (r["handled"] or {}).get("why"))
+    else:
+        out.append("\nnothing in the window stopped in a way a wake covers.")
+    for u in rep["coverage"]["unread"]:
+        out.append("   NOT READ: %s — %s" % (u["name"], u["reason"]))
+    if not rep["probed"]:
+        out.append("   (the accounts' credential stores were not asked: this sweep starts "
+                   "nothing)")
+    line, _ = stalled_check_line(rep)
+    out += ["", line, "",
+            "to continue the due ones, one at a time:  csm revive <session> --auto"]
+    return "\n".join(out)
+
+
+def do_stalled(args, accts: list) -> int:
+    """`csm stalled` — every session that stopped, and which of them is ready to continue.
+
+    🛑 IT ACTS ON NOTHING. The whole command is a read: no window, no relay, no signal, no
+    write outside csm's own log. What acts is `csm revive <id> --auto`, per session, so that
+    the decide table's refusals are asked once per wake and not once per sweep.
+
+    🛑 ON THE `--check` PATH: exactly one line on stdout and NOTHING on stderr (see
+    `stalled_check_line`), and the credential probe is never asked at all — it prints a line
+    of its own whenever `CSM_LOGIN_PROBE` is set, and on macOS it can raise a Keychain dialog,
+    which is the one shape an unattended run may never produce.
+    """
+    rep = stalled_report(accts, getattr(args, "since", None) or 0.0,
+                         probe=not args.check)
+    line, code = stalled_check_line(rep)
+    if args.check:
+        if args.as_json:
+            rep["check"] = {"line": line, "exit": code}
+            print(json.dumps(rep, indent=1, default=str))
+        else:
+            print(line)
+        log("stalled --check: rc=%d — %s" % (code, line))
+        return code
+    if args.as_json:
+        print(json.dumps(rep, indent=1, default=str))
+    else:
+        print(render_stalled(rep))
+    log("stalled: %d scanned, %d diagnosed, %d due, %d with a failed wake, %d unread"
+        % (rep["scanned"], rep["candidates"], rep["due"], rep["failed"],
+           len(rep["coverage"]["unread"])))
+    return 0
 
 
 # --------------------------------------------------------------------------- the matrix
@@ -10406,6 +11071,46 @@ def main(argv: list) -> int:
                     help="resume a session that was archived or ended from the app, which "
                          "unarchives it. Refused without this flag")
     pr.add_argument("--name", help="the --remote-control name the revived session gets")
+    pr.add_argument("--auto", action="store_true",
+                    help="UNATTENDED: nobody typed this run and nobody is reading its "
+                         "output. The note says so instead of saying the user asked for it, "
+                         "and no row ends in a sentence for a person to act on — a dead "
+                         "Remote Control server child is FORKED (there is no unattended way "
+                         "back onto its own link), and `--json`'s result then names the OLD "
+                         "bridge id, which is the session the caller has to archive so the "
+                         "old link can never respawn a second actor. Every refusal, every "
+                         "limit still in force and every gate is unchanged, and so are the "
+                         "exit codes. `csm stalled` says which sessions this is for")
+
+    pt = sub.add_parser("stalled", help="every session that stopped, and which of them is "
+                                        "ready to continue",
+                        description="The sweep: every session in every config home here "
+                                    "whose transcript was written inside the window, why "
+                                    "each stopped, whether it is DUE for a wake, what `csm "
+                                    "revive --auto` would do about it, and whether that has "
+                                    "already been done. Read-only: it starts nothing, "
+                                    "messages nothing and signals nothing — what acts is "
+                                    "`csm revive <session> --auto`, one session at a time.",
+                        epilog="DUE means one of exactly two things: it stopped on a usage "
+                               "limit of a class a reset clears and that reset (plus "
+                               "CSM_WAKE_MARGIN_S) has passed, or it was killed while "
+                               "working and nothing is running it now. A session that is "
+                               "busy, archived, empty, owned by a bot, owned by a scheduled "
+                               "pass and not live, or already revived for this same stop is "
+                               "never due, and the row says which.")
+    pt.add_argument("--since", type=float, metavar="HOURS",
+                    help="how far back to look, by a transcript's own last write (default "
+                         "%g)" % STALLED_SINCE_H)
+    pt.add_argument("--json", action="store_true", dest="as_json",
+                    help="the whole sweep as JSON: the rows, `due` with its reason, the "
+                         "action revive would take, and `handled`. This is the contract a "
+                         "scheduled caller reads")
+    pt.add_argument("--check", action="store_true",
+                    help="print ONE line and exit 0 (`ok:`), 1 (`FAULT:` — a due session "
+                         "whose last wake failed) or 3 (`INCOMPLETE:` — nothing failed, but "
+                         "something could not be read). A session merely being due is not a "
+                         "fault: that is the normal state between two passes. Nothing else "
+                         "is written, on either stream, and no credential store is asked")
 
     pf = sub.add_parser("find", help="sessions matching an id, a link or title text, on "
                                      "this machine or another",
@@ -10563,6 +11268,8 @@ def main(argv: list) -> int:
             return do_move(args, accts)
         if args.cmd == "revive":
             return do_revive(args, accts)
+        if args.cmd == "stalled":
+            return do_stalled(args, accts)
         if args.cmd == "stop":
             return do_stop(args, accts)
         if args.cmd == "modes":

@@ -1,6 +1,6 @@
 # Claude Session Mover: design and implementation
 
-Version 0.5.0 · code **[github.com/yaroslavvb/claude-session-mover](https://github.com/yaroslavvb/claude-session-mover)**
+Version 0.6.0 · code **[github.com/yaroslavvb/claude-session-mover](https://github.com/yaroslavvb/claude-session-mover)**
 (MIT, one Python file, standard library only).
 
 Everything here is Claude Code's own **undocumented on-disk state**. It has already changed inside one minor
@@ -46,6 +46,7 @@ different flags involve a second machine, and mixing them up is the common mista
 - [Auto-memory is never copied](#memory)
 - [What a move costs](#cost)
 - [Revive: bringing back a session that stopped](#revive)
+- [`csm stalled`: the unattended sweep](#stalled)
 - [`csm stop`: ending what csm started](#stop)
 - [`csm matrix`: measuring your own setup](#matrix)
 - [What is on disk: the formats it reads](#formats)
@@ -772,7 +773,7 @@ handed to the id-prefix or title rungs: a session whose first prompt *pasted* th
 |---|---|
 | `kind` | `server-child` (its local id *is* `uuid5` of a bridge id — from the link, the registry, or an orphan `~/.claude/bridge-spawn/cse_X-*` directory that derives to this transcript; **or, with none of those left, from the id's own uuid version** — see below), `self-hosted` (a `bridge-session` line or a `bridge_status` url it wrote itself), `terminal`, `desktop`. 🛑 Never the registry's `entrypoint`: that says how the process was started, and a fork or a resume rewrites it |
 | `state` | `live-busy` / `live-idle` (a registry row whose pid is proved by `procStart`) or `dead`, plus a machine-wide `ps` sweep for an argv naming `cse_<bare>` or the local id — a registry file survives the `SIGKILL` of its own process |
-| `stop` | `usage-limit` (class, window, `resetsAt`, still in force?), `api-error`, `mid-turn` (the last main-chain assistant line holds a `tool_use` no later `tool_result` answers), `archived` (a `code 4090` line after the last `bridge_status`), `finished`, `empty`, `unknown` — parsed as JSON lines over `CSM_REVIVE_TAIL` (1 MiB), from the last real prompt forward |
+| `stop` | `usage-limit` (class, window, `resetsAt`, still in force?), `api-error`, `mid-turn` (the last main-chain assistant line holds a `tool_use` no later `tool_result` answers), `archived` (a `code 4090` line after the last `bridge_status`), `finished`, `empty`, `unknown` — parsed as JSON lines over `CSM_REVIVE_TAIL` (1 MiB), from the last real prompt forward. It also carries `uuid`, the uuid of the line the verdict was read from: the **stop event's own name**, and half the at-most-once key of an unattended wake |
 | `lost_work` | the agents whose own `state` is `error` in the sibling directory's `workflows/wf_*.json`. 🛑 Never the file's top-level `status`, which reads `completed` on the incident where five agents died on the limit |
 | `account` | whether the session's own home can still run it, plus the meter — and the 5-hour instant comes from the transcript, never from the meter's seven-day `resets_at` |
 | `server` | whether a `claude remote-control` server is up with that folder as its cwd (`ps` plus `lsof -a -d cwd`), which is the one thing that decides whether opening the link brings a server child back by itself |
@@ -786,7 +787,7 @@ row 7 cannot be followed by a run that takes row 10.
 
 | # | condition | action |
 |---|---|---|
-| 1 | a bot or a scheduled pass owns it | refuse, naming that owner's own command |
+| 1 | a bot owns it, or a scheduled pass owns it and it is not live-idle | refuse, naming that owner's own command. ⚠️ An `CSM_RC_JOBS_DIR`-owned session that is **live and idle** falls through to row 5: a wake relays a message into the process already running and starts no second copy of the pass, which is the whole thing this refusal guards. A bot is refused whatever its state |
 | 2 | `stop == empty` | refuse: nothing to continue |
 | 3 | `live-busy` | nothing to do |
 | 4 | a usage limit still in force, no `--to` | refuse, with the reset and the cures |
@@ -794,7 +795,7 @@ row 7 cannot be followed by a run that takes row 10.
 | 6 | `--to ACCOUNT\|auto` | `do_move` unchanged, then relay the note into the copy |
 | 7 | dead, `self-hosted`, no `--new-link` | resume in place on the same link (archived refuses without `--unarchive`) |
 | 8 | dead, `terminal`, no `--new-link` | resume in place; it gets a new link, and is told so |
-| 9 | dead, `server-child`, no `--new-link` | print the one tap; start nothing, wait for nothing |
+| 9 | dead, `server-child`, no `--new-link` and no `--auto` | print the one tap; start nothing, wait for nothing. With `--auto` it takes row 10 instead: row 9's whole result is a sentence for a person, and nobody is reading it |
 | 10 | dead, `server-child`, `--new-link` | fork: `--resume <old> --fork-session --session-id <new uuid4>` |
 | 11 | dead, `self-hosted` or `terminal`, `--new-link` | fork, by row 10's mechanics: `--new-link` is a fresh copy on a new link whatever the kind |
 
@@ -896,7 +897,8 @@ clears itself. The claim is held and because a lazy respawn has the
 before anything starts: a child that appeared while csm was deciding is a refusal, not a second writer. Each
 revive appends a JSON record to `CSM_REVIVE_LOG` (0600) carrying the at-most-once triple — local id, bridge id,
 transcript size at diagnosis — the row, the action, what was started, what was proved and the exit code. Never
-the note: that is conversation text.
+the note: that is conversation text. Since 0.6.0 it also carries `stop_uuid`, the at-most-once key of an
+unattended wake, which `csm stalled` reads back (below).
 
 **What it will not do.** It cannot make a server respawn a dead child (row 9 prints the tap, and does not poll for
 a person). It will not wake a session by writing to its peer socket, because a hand-rolled frame is *held* for a
@@ -913,6 +915,58 @@ for the no-window rows. Neither is built. `--from-machine` is *refused* instead,
 that is deliberately alive, which is that row's own condition. What is left of it and does apply is built — row 5
 checks that the CLI is on PATH before it claims it will relay anything, and the folder and twin gates still run on
 every row that starts a window.
+
+<a id="stalled"></a>
+
+## `csm stalled`: the unattended sweep
+
+0.5.0 could revive one session a person named. 0.6.0 adds the two pieces an unattended loop needs, and
+deliberately not the loop: **`csm stalled`** says which sessions are ready, **`csm revive <id> --auto`** continues
+one of them, and a scheduled pass of your own joins them. The acting stays one session per command on purpose —
+that way every row of the decide table, and every refusal in it, is asked once per wake rather than once per
+sweep.
+
+**Due is a property of the stop, and there are two of them.** A usage limit of a class a *reset* clears
+(`session`, `weekly`) once `resetsAt + CSM_WAKE_MARGIN_S` has passed; and a `mid-turn` stop whose process is gone,
+inside `CSM_WAKE_MAX_AGE_H`. `monthly-spend`, `credits` and `model` never clear by waiting, and a class whose own
+words nothing matched is not on the positive list either — an unread class is not a clearable one. A `finished`
+stop is not due (it answered), nor is `api-error` (time does not fix it). And five states are never due whatever
+the stop: `live-busy`, bot-owned, owned by a scheduled pass that is not live-idle, `empty`, and archived. Every
+row carries its reason in `why`, so "not due" is never a silence.
+
+**The prefilter is `revive_stop` on a smaller window.** A `diagnose` is a 1 MiB parse plus a machine-wide `ps`,
+and a home holds thousands of transcripts. So the last `CSM_STALLED_PREFILTER` (64 KiB) is parsed first, and only
+the three verdicts a small window cannot be trusted to rule out — `usage-limit`, `mid-turn`, `unknown` — reach the
+full diagnosis. 🛑 The line that says what stopped a session is at the **end** of its file (a session that stopped
+wrote nothing after the stop); the 1 MiB window exists to find the last real *prompt*, which only matters once
+something is going to act. 🛑 And an empty **window** is not an empty **file**: when the window held no main-chain
+line and the file is larger than the window, the verdict is *inconclusive* and the file is read properly. Running
+the same parser rather than a second "does this look like a limit" test is what keeps the two from drifting —
+a text match on a tail is the thing `revive_stop` exists not to be.
+
+**At most once per stop, keyed on the stop and not on the session.** `revive_stop` reports the `uuid` of the line
+its verdict was read from; `revive_record` writes it as `stop_uuid`; `revive_handled` reads the log's tail back and
+matches `(local id, stop_uuid)`. A session that stopped, was woken, worked for an hour and stopped again has a new
+uuid and is due again — which is the whole point, because a key per *session* would wake it once and never more,
+and no key at all would relay the same note twelve times an hour. Handled means a record with **exit 0**: a
+non-zero exit is a wake that was attempted and failed, so the row stays due and the attempt is counted
+(`handled.failed`), which is what `--check` reports as its one `FAULT:`. Where a stop line carries no `uuid`, the
+fallback is 0.5.0's own `(local id, transcript size)` — never the id alone.
+
+**`--auto` changes two things and no gate.** The note's *attribution*, because nobody typed the run and the
+receiving session decides what to do next on the strength of that sentence; and row 9, which becomes row 10's
+fork, because a dead server child has no unattended way back onto its own link. A fork leaves two conversations
+with one history, so `--json`'s `result` names `old_bridge_id` / `old_url` / `archive_old`: the old claude.ai
+session has to be archived, and csm cannot do that itself — it reads no credential, and archiving is an
+authenticated call. Every refusal, the limit still in force above all, is untouched.
+
+**`--check` is `modes --check`'s contract, with one difference worth naming: being due is not a fault.** It is the
+normal state between one pass and the next. The fault is a wake that was tried and failed for the same stop, which
+nothing else in the loop reports — the next pass just finds the row due and tries again. `INCOMPLETE:` covers what
+could not be read, the revive log included: a log nobody can read is not an empty one, because the sweep then
+cannot tell a stop it has acted on from one it has not. On that path the credential probe is never asked at all
+(`diagnose(..., probe=False)`): it prints a line of its own whenever `CSM_LOGIN_PROBE` is set, and on macOS it can
+raise a Keychain dialog — the one shape an unattended run may never produce.
 
 <a id="stop"></a>
 
@@ -1176,7 +1230,9 @@ a test or a one-off can point any of them somewhere else.
 | `CSM_REVIVE_PROVE_S` | how long to wait for proof that the revived session read the note — its registry row going `busy`, or an `assistant` line past the offset taken before the relay (default 90). Passing it without proof is exit 1, never 0 |
 | `CSM_REVIVE_TAIL` | how much of a transcript `revive` reads to say why a session stopped (default 1 MiB), deliberately not `CSM_TAIL_BYTES`: on the incident transcript the limit lines are in the last 512 KiB and *not* in the last 384 KiB |
 | `CSM_REVIVE_NOTE_MAX`, `CSM_REVIVE_SAY_MAX` | the note's character budget (default 1500; optional clauses are dropped in a documented order, never sentences cut) and the longest `--say` (default 400; longer is refused, because it is quoted verbatim) |
-| `CSM_REVIVE_LOG` | one JSON record per revive, 0600 (default `<state dir>/revive.jsonl`): the at-most-once triple, the row, the action, what was proved, the exit code — and never the note |
+| `CSM_REVIVE_LOG` | one JSON record per revive, 0600 (default `<state dir>/revive.jsonl`): the at-most-once triple, the row, the action, what was proved, the exit code — and never the note , plus `stop_uuid`, the key `csm stalled` reads back to fill `handled`. A pass that wakes sessions must point this somewhere that survives a restart |
+| `CSM_WAKE_MARGIN_S`, `CSM_WAKE_MAX_AGE_H` | when a stopped session is **due**: how long after a limit's own reset a wake may be sent (default 120 s — a wake sent early is *consumed*, not queued), and how old a mid-turn kill may be and still be woken without anybody asking (default 24 h) |
+| `CSM_STALLED_SINCE_H`, `CSM_STALLED_PREFILTER` | the sweep's window by a transcript's own mtime (default 48 h, `--since` overrides it), and the cheap prefilter's byte window (default 64 KiB), deliberately far smaller than `CSM_REVIVE_TAIL`: the line that says what stopped a session is at the END of its file |
 | `CSM_LSOF` | how `lsof` is invoked. Only `revive` asks it, for the one question that is in no argv: which folder a Remote Control server is serving |
 | `CSM_CANARY_CHUNK` | the read size of the once-per-CLI-version scan that checks the uuid5 namespace constant is really in the installed bundle (~290 MB, 0.22 s, read in chunks with a needle-sized overlap; the verdict is cached in the state dir against the bundle's path, size and mtime) |
 | `CSM_LIMIT`, `CSM_ALL_LIMIT`, `CSM_ROW_TITLE` | the default row count (20), the `--all` ceiling (300), and the title width in a row (44) |
@@ -1267,7 +1323,7 @@ More of them, grouped and generalised: [docs/lessons.md](lessons.md).
 | [`docs/lessons.md`](lessons.md) | the generic lessons behind the rules |
 | `docs/design.md` | this page |
 
-The tests — 706 of them — run the real script against fake homes and transcripts, a fake `claude` that records its
+The tests — 745 of them — run the real script against fake homes and transcripts, a fake `claude` that records its
 argv and environment, and a fake `tmux` that really runs the moved window's command, alongside in-process unit
 tests of the pure parts (the dialog answerer, the mode chooser, the memory resolver, the meter arithmetic, folder
 translation, the matrix cells). Anything that would reach another machine runs against `CSM_REMOTE_LOCAL`, with

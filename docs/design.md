@@ -770,7 +770,7 @@ handed to the id-prefix or title rungs: a session whose first prompt *pasted* th
 
 | field | what it answers, and from what |
 |---|---|
-| `kind` | `server-child` (its local id *is* `uuid5` of a bridge id — from the link, the registry, or an orphan `~/.claude/bridge-spawn/cse_X-*` directory that derives to this transcript), `self-hosted` (a `bridge-session` line or a `bridge_status` url it wrote itself), `terminal`, `desktop`. 🛑 Never the registry's `entrypoint`: that says how the process was started, and a fork or a resume rewrites it |
+| `kind` | `server-child` (its local id *is* `uuid5` of a bridge id — from the link, the registry, or an orphan `~/.claude/bridge-spawn/cse_X-*` directory that derives to this transcript; **or, with none of those left, from the id's own uuid version** — see below), `self-hosted` (a `bridge-session` line or a `bridge_status` url it wrote itself), `terminal`, `desktop`. 🛑 Never the registry's `entrypoint`: that says how the process was started, and a fork or a resume rewrites it |
 | `state` | `live-busy` / `live-idle` (a registry row whose pid is proved by `procStart`) or `dead`, plus a machine-wide `ps` sweep for an argv naming `cse_<bare>` or the local id — a registry file survives the `SIGKILL` of its own process |
 | `stop` | `usage-limit` (class, window, `resetsAt`, still in force?), `api-error`, `mid-turn` (the last main-chain assistant line holds a `tool_use` no later `tool_result` answers), `archived` (a `code 4090` line after the last `bridge_status`), `finished`, `empty`, `unknown` — parsed as JSON lines over `CSM_REVIVE_TAIL` (1 MiB), from the last real prompt forward |
 | `lost_work` | the agents whose own `state` is `error` in the sibling directory's `workflows/wf_*.json`. 🛑 Never the file's top-level `status`, which reads `completed` on the incident where five agents died on the limit |
@@ -797,17 +797,62 @@ row 7 cannot be followed by a run that takes row 10.
 | 9 | dead, `server-child`, no `--new-link` | print the one tap; start nothing, wait for nothing |
 | 10 | dead, `server-child`, `--new-link` | fork: `--resume <old> --fork-session --session-id <new uuid4>` |
 
+<a id="the-decide-table"></a>
+The `action` string each row records is part of the interface: `--json` carries it and so does every line of
+`revive.jsonl`.
+
+| row | 1, 2, 4 | 3 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|
+| `action` | `refuse` | `nothing` | `wake` | `move` | `resume` | `resume-new-link` | `keep-link` | `fork` |
+| exit | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+
+⚠️ Row 8's action was `new-link` before 0.5.0's review fixes and is `resume-new-link` now. The old spelling read
+like the `--new-link` FLAG, and the flag takes row **10**, which records `fork` — so a caller filtering
+`action == "new-link"` matched a resume in place and never a fork.
+
+**A `server-child` whose link nothing records is still row 9.** The four sources of a bare bridge id above are all
+things that can be gone: a dead child has no registry row, writes no bridge id into its own transcript (2 of the
+861 version-5 transcripts in the config homes here carry one), and its `~/.claude/bridge-spawn/cse_X-*` directory
+is deleted on a handled exit — a server shutdown or a graceful restart. 840 of those 861 therefore had no source
+at all, and a session named by its own id or by part of its title brings none. The id's **uuid version** is the one
+fact that survives: `derive_local_id` mints a child's id as `uuid5`, every other session gets a random `uuid4`, so
+version 5 *is* the proof. `kind` is then `server-child` with an empty `bridge_id`, and the row says "paste the
+link, or `--new-link`" rather than printing a link it cannot name. 🛑 What this is for is that the alternative is
+row 8 — `--resume <old id>` with **no** `--fork-session` — a second process on the local id a later lazy respawn
+of the old link shares (LESSONS.md L39).
+
+**One copy, or a refusal.** A move is a copy, so after any `csm move` one id sits in two homes. `revive_resolve`'s
+soft pass answers `None` both for "nothing matched" and for "several matched, and `one_of` would refuse", and only
+the first may fall through to `revive_row` — the rung that exists for a transcript every listing *drops*. Fall
+through on the second and revive acts on whichever home came first in `accts` order: a stale snapshot, the wrong
+account's quota, and a note reading "You are still <the other email>". `revive_row` itself asks every home too,
+and `--account NAME` is the cure the refusal names.
+
 **One carrier, and it is a relay.** Whatever the row, the session comes up (or is found) as an ordinary idle
 process with **no positional prompt**, and the note is then delivered by a headless Claude of its own:
 `claude -p --model <CSM_RELAY_MODEL> --permission-mode bypassPermissions --name "csm revive (<machine>)"
 --output-format json "<call SendMessage once, verbatim, between these markers>"`, run under that session's own
-config home with the environment scrubbed, stdin closed, in a folder of csm's own under the state dir, bounded by
-`CSM_RELAY_TIMEOUT_S`. It lands recorded for what it is — `isMeta: true, turnOrigin: "peer", origin: {kind:
+config home with the environment scrubbed, stdin closed (`subprocess.DEVNULL`, so fd 0 really is `/dev/null`), in
+a folder of csm's own under the state dir, bounded by `CSM_RELAY_TIMEOUT_S`. It lands recorded for what it is — `isMeta: true, turnOrigin: "peer", origin: {kind:
 "peer", name: …, fromMode: "bypass", verifiedPeerPid, msg_id}` — and the app shows it as a message from that
 sender. The two alternatives were measured and are worse: a positional prompt is recorded as the user's own
 typing, and an `isMeta` line plus `--reply-on-resume` writes into a transcript — for a fork, into the *old* one,
 where a later lazy respawn of the old link could pick it up as an interrupted turn. So **a revive writes into no
 transcript at all**; the cross-account move still appends its own move note to the copy, as it always has.
+
+**Where the relay's own transcript goes, and the name it addresses.** The cwd moves the project-folder **slug**,
+not the home: the relay's transcript lands at `<its home>/projects/<slug of STATE_DIR/relay>/<its id>.jsonl`, in
+the revived session's own config home, written by the CLI. So the note does reach disk, in that home — csm's rule
+is that *no file csm keeps* holds it (`revive.jsonl`, the log, the record in `--json`'s `result`), never that the
+note is unwritten anywhere. That slug is kept out of `transcripts_by_id`, or every revive would leave a session in
+`csm list`, in `csm find` and in revive's own resolution whose title is the relay instruction.
+
+And the relay addresses the session by the `name` in its registry row, because that is what SendMessage takes — so
+that name has to be unique among the **proved** live rows of that home, or the note could land in an unrelated
+conversation while `prove_turn` watches the intended one and reports "up but idle". More than one is a refusal
+before anything is sent, naming both; and csm's own label carries the session's id8 (`rc_label(<title>, "revived
+by csm <id8>")`) so the windows it starts cannot collide with each other — `rc_label` truncates to 56 characters,
+which two revives of one session used to collide inside.
 
 **The proof is a turn, not a link.** The transcript's byte offset is taken before the relay; exit 0 needs the
 registry row going `busy` or an `assistant` line past that offset within `CSM_REVIVE_PROVE_S`. A relay that
@@ -815,8 +860,13 @@ reports success and delivers nothing is exit 1, printing the one sentence to typ
 is a second proof: a self-hosted session re-attaches its own claude.ai session, so a *new* link means nothing
 re-attached and the note is not sent, because the sentence it carries would be false.
 
-**At most once, and the gate is re-run in the last second.** `state_lock`'s lock-directory shape (with its 120 s
-stale break) keyed on the local id is held from the diagnosis to the start, and because a lazy respawn has the
+**At most once, and the gate is re-run in the last second.** `state_lock`'s lock-directory shape keyed on the
+local id is held from the diagnosis to the start — with the stale break set to `REVIVE_CLAIM_STALE_S` and not the
+120 s the `.claude.json` lock keeps. That lock is held for a read-modify-replace; this claim is held across four
+bounded waits (a window connecting, its registry row appearing, the relay, the turn, and for a fork the new
+transcript) that sum to as much as 660 s, so at 120 s a second `csm revive` of the same session broke a live claim
+from t=120 s on every run. The waits re-stamp the directory as they poll (`touch_locks`), so a killed revive still
+clears itself. The claim is held and because a lazy respawn has the
 *same* local id before and after, every home's registry and the machine-wide `ps` sweep are re-read immediately
 before anything starts: a child that appeared while csm was deciding is a refusal, not a second writer. Each
 revive appends a JSON record to `CSM_REVIVE_LOG` (0600) carrying the at-most-once triple — local id, bridge id,
@@ -828,7 +878,16 @@ a person). It will not wake a session by writing to its peer socket, because a h
 human on a session that bypasses prompts. It will not reuse a server child's id in its own home. It will not reach
 a machine that is off: `--from-machine` is refused for `revive`, because every gate it turns on is a question
 about the machine the transcript is on, and `csm --machine M revive <spec>` runs the whole thing over there
-instead. And it signals nothing, ever.
+instead. It will not choose between two copies of one id, or address a registry name that is not unique. And it
+signals nothing, ever.
+
+🛑 **One deviation from the implementation brief, recorded rather than hidden.** The brief's M5 lists
+`--from-machine M` for `revive` (fetch as `move` does, then rows 6–10 here) and `preflight(..., copy_only=True)`
+for the no-window rows. Neither is built. `--from-machine` is *refused* instead, for the reason above, and the
+`copy_only` preflight is not implementable as written: run on row 5, its live-twin check would refuse a session
+that is deliberately alive, which is that row's own condition. What is left of it and does apply is built — row 5
+checks that the CLI is on PATH before it claims it will relay anything, and the folder and twin gates still run on
+every row that starts a window.
 
 <a id="stop"></a>
 
@@ -1101,6 +1160,7 @@ a test or a one-off can point any of them somewhere else.
 | `CSM_STATE_DIR`, `CSM_LOG`, `CSM_PICKS` | where the log and the saved `list` numbering live (`$XDG_STATE_HOME` is honoured) |
 | `CSM_CAPTURES` | where the pre-signal pane captures are written; default `<state dir>/captures` (0700, each file 0600) |
 | `CSM_LOCK_WAIT` | how many seconds to wait for the CLI's `.claude.json.lock` before writing anyway with a warning (default 2) |
+| `CSM_TMUX_TIMEOUT_S` | how long one `tmux` client may take to answer (default 20). Every other subprocess call in the engine carried a timeout and `tmux()` did not, while `wait_window` — the loop every move and every revive waits in — checks its deadline only *between* captures |
 | `CSM_CLAUDE`, `CSM_TMUX` | the `claude` / `tmux` binaries to use |
 | `CSM_TMUX_SESSION` | the tmux session a moved window is opened in, templated over `{name}`, `{handle}`, `{label}` (default `csm-{name}`); `claude-{handle}` puts it in a per-account session you already keep. `stop` looks only in the session the spelling in force names, so a window open under another spelling is invisible to it until that spelling is given back. An unknown field falls back to the default, and the result is sanitised because tmux reads `.` and `:` as window and pane |
 | `CSM_HEAD_BYTES`, `CSM_TAIL_BYTES` | how much of a transcript is read per row |
@@ -1182,7 +1242,7 @@ More of them, grouped and generalised: [docs/lessons.md](lessons.md).
 | [`docs/lessons.md`](lessons.md) | the generic lessons behind the rules |
 | `docs/design.md` | this page |
 
-The tests — 673 of them — run the real script against fake homes and transcripts, a fake `claude` that records its
+The tests — 694 of them — run the real script against fake homes and transcripts, a fake `claude` that records its
 argv and environment, and a fake `tmux` that really runs the moved window's command, alongside in-process unit
 tests of the pure parts (the dialog answerer, the mode chooser, the memory resolver, the meter arithmetic, folder
 translation, the matrix cells). Anything that would reach another machine runs against `CSM_REMOTE_LOCAL`, with

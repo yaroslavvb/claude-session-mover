@@ -320,6 +320,7 @@ narrative, the table in plain words and what it cannot do are in
 | `--json` | the diagnosis record, the decision and the note, as JSON. The prose goes to stderr, so stdout stays parseable |
 | `--to ACCOUNT` | move it to that account instead of reviving it where it is (`auto` for the one with the most weekly room). It is also the cure for a limit that is still in force |
 | `--new-link` | for a Remote Control **server child**, which cannot be resumed onto its own link: fork it to a new session id and a new link. The old link still opens the old copy |
+| `--account NAME` | which home's copy to revive. Only needed when a move has left copies of one id in more than one home and none of them is running — revive refuses rather than choose, the same as `move` and `stop` |
 | `--say TEXT` | one thing to pass on to the revived session, quoted verbatim and attributed to you. At most 400 characters, and it may not start with `!` or `/`, which the CLI would run as a command |
 | `--permission-mode MODE` | the mode to come back in. Without it, the mode the session recorded, by the same rule as `move` |
 | `--unarchive` | resume a session that was archived or ended from the app, which unarchives it. Refused without this flag |
@@ -366,6 +367,13 @@ days (`CSM_FIND_DAYS`) to everything.
 Two things the table cannot tell you: the **age column is the transcript file's last write**, not the last turn, so
 a dead copy can read as minutes old; and **a move is a copy**, so a session that has been moved shows up as two
 rows, one per home.
+
+**Exit codes:** `0` with rows, `1` when nothing matched — never "the search failed". A caller that wants rows
+counts `--json` (which is `[]`, with the hint on stderr so stdout stays parseable). On no match it prints
+**🛑 0 rows is not proof** that the session is gone: this searches transcript ids and titles, and a session that
+has stopped has no registry row while a Remote Control session usually has no title either — so paste its
+`claude.ai` link, which names the transcript by arithmetic. A config home it was not allowed to read is named as
+unread rather than counted as empty.
 
 ### `csm modes`
 
@@ -497,6 +505,7 @@ rest are all knobs, with a documented default and a tool that works with none of
 | `CSM_LOCK_WAIT` | seconds to wait for the CLI's `.claude.json.lock` before writing anyway with a warning (default 2) |
 | `CSM_TMUX_SESSION` | the tmux session a moved window is opened in, as a template over `{name}`, `{handle}` and `{label}` (default `csm-{name}`). Set it to `claude-{handle}` if you already keep a tmux session per account and want moved windows there. 🛑 `csm stop` finds a moved window only in the session the spelling in force names, so changing this while one is open hides it from `stop`: close those windows first, or name the spelling they were opened under. A template naming a field it does not know falls back to the default; `.` and `:` are replaced, because tmux reads them as window and pane, and a leading `-` is dropped, because the name is passed to `tmux -s` and `-t` |
 | `CSM_TMUX_SOCKET` | add `-L <socket>` to every `tmux` call, to keep `csm`'s windows on a server of their own |
+| `CSM_TMUX_TIMEOUT_S` | how long one `tmux` client may take to answer (default 20). `wait_window` checks its deadline only *between* captures, so one blocking tmux client would otherwise be an unbounded hang inside a bounded wait |
 | `CSM_LOGIN_PROBE` | `true`, `false`, `unknown` or `off` — force the answer of the credential-existence check instead of asking the store, for a machine where asking it is not possible. It announces itself on stderr and in the log on every run |
 | `CSM_BIN_DIR` | where `install.sh` links the command (default `~/.local/bin`) |
 
@@ -637,6 +646,17 @@ Which kind of session it is, is **proved, never guessed**: a server child's loca
 directory that derives to this transcript's name all prove it. The registry's `entrypoint` is deliberately not
 used — it says how a process was started, and a fork or a resume rewrites it.
 
+And when none of those four sources still exists — which is the ordinary state of a dead child named by its own
+id or by part of its title: no registry row, no bridge line in its own file, and no `bridge-spawn` directory once
+it exited cleanly — the id's **uuid version** settles it on its own. A child's id is a `uuid5`; every other
+session gets a random `uuid4`. Such a session takes row 9 or, with `--new-link`, row 10, and the output asks for
+the link rather than printing one it cannot name. It must never take row 8: that would start a second process on
+the old local id, which a later lazy respawn of the old link shares.
+
+The `action` string in `--json` and in `revive.jsonl` is one of `refuse`, `nothing`, `wake`, `move`, `resume`,
+`resume-new-link` (row 8), `keep-link` (row 9) and `fork` (row 10) — see the mapping in
+[docs/design.md](docs/design.md#the-decide-table).
+
 ### The three-line answer
 
 Everything above the detail block is what gets read out on a phone: **what stopped it and when · what revive
@@ -715,6 +735,17 @@ because the proof is the session's own behaviour and not the relay's word for it
   the app needs `--unarchive` said out loud.
 - **It cannot tell you whether an interrupted tool call took effect.** It tells you that there is no recorded
   result, which is the honest answer, and the revived session is told the same thing.
+- **It cannot choose between two copies of one id.** A move is a copy, so after any `csm move` the same id sits
+  in two homes; with neither of them running, nothing says which one was being used, and `revive` refuses and
+  names both — `move` and `stop` do the same. `--account NAME` is the answer.
+- **It cannot address a session whose registry name is not unique.** SendMessage addresses a session *by* its
+  name, so two proved live sessions of one name is a refusal before anything is sent, naming both. csm's own
+  label carries the session's id8 so that the windows it starts cannot collide.
+- **It does not keep the note out of every file on disk — only out of its own.** `revive.jsonl` and the log hold
+  no note text, by design. But the relay is a `claude -p` run, and the CLI files that run's own transcript under
+  the project folder of its cwd — inside the revived session's config home. csm runs the relay in a directory of
+  its own so that transcript lands beside no session's, and keeps that folder out of every listing, but the note
+  is in a file the CLI wrote, in that home.
 
 ## Safety
 
@@ -890,7 +921,7 @@ the machine can reach. Only move sessions between accounts you own.
 python3 tests/test_mover.py
 ```
 
-673 tests, fixtures only: fake homes and transcripts, a fake `claude` that records its argv and environment, a fake
+694 tests, fixtures only: fake homes and transcripts, a fake `claude` that records its argv and environment, a fake
 `tmux` that really runs the moved window's command on a private socket, a fake `ssh` that records the command line
 it was handed, and — for `find --on` and `--from-machine` — "the other machine" played by this process with `HOME`
 pointed at a fixture tree, so no test reaches a real host. No network, no account, no credential store, no real

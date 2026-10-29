@@ -112,6 +112,20 @@ def jwrite(path, d):
         f.write(json.dumps(d) + "\n")
 
 
+def _is_devnull():
+    """Is fd 0 really /dev/null? — which is what `stdin=subprocess.DEVNULL` makes it.
+
+    🛑 THE ONE THING HERE THAT DEPENDS ON CSM'S CHOICE rather than on the test runner's
+    stdin. Compared by (st_dev, st_rdev, st_mode) because /dev/null has no inode number a
+    test may rely on.
+    """
+    try:
+        a, b = os.fstat(0), os.stat(os.devnull)
+    except OSError:
+        return False
+    return (a.st_dev, a.st_rdev, a.st_mode) == (b.st_dev, b.st_rdev, b.st_mode)
+
+
 log = os.environ.get("FAKE_CLAUDE_LOG")
 if log:
     with open(log, "a") as f:
@@ -138,7 +152,15 @@ if "-p" in ARGV:
                 "argv": ARGV,
                 "cwd": os.getcwd(), "sender": opt("--name") or "",
                 "config_dir": os.environ.get("CLAUDE_CONFIG_DIR", ""),
-                "stdin_tty": sys.stdin.isatty()})
+                # 🛑 `isatty` CANNOT MEASURE CSM'S CHOICE HERE. `World.run` passes no
+                # `stdin=`, so csm inherits the test runner's stdin, and under
+                # `python tests/test_mover.py` — or any redirected run, which is how the
+                # suites are run — that is already not a tty: the child reads False whether
+                # or not csm closed stdin, and the assertion could not fail. What DOES
+                # depend on csm's choice is the identity of fd 0: `subprocess.DEVNULL` makes
+                # it /dev/null, and an inherited stdin is anything else.
+                "stdin_tty": sys.stdin.isatty(),
+                "stdin_devnull": _is_devnull()})
     if mode == "held":
         time.sleep(float(os.environ.get("FAKE_RELAY_HOLD") or 600))
     if mode == "crash":
@@ -463,7 +485,8 @@ def user(text, cwd, sid, perm=None, sidechain=False, uuid=None, parent=None):
 
 
 def assistant(text, cwd, sid, model="claude-sonnet-4-5", error=None, resets=None,
-              kind="five_hour", uuid=None, parent=None, tools=(), shape="apiError"):
+              kind="five_hour", uuid=None, parent=None, tools=(), shape="apiError",
+              synthetic=False, api_error_only=None):
     """`tools` are MCP tool names, written as real `tool_use` blocks: a name in a block of
     this shape is a CALL, which is what tells `mcp_used` from `mcp_servers`.
 
@@ -475,6 +498,17 @@ def assistant(text, cwd, sid, model="claude-sonnet-4-5", error=None, resets=None
     `error: "rate_limit"`, `apiErrorStatus: 429` and a top-level `quotaLimits`
     ({status: "rejected", resetsAt: <unix s>, rateLimitType: "five_hour"|"seven_day", …}).
     `shape="rate_limit"` writes that second one.
+
+    🛑 `synthetic=True` IS THE LINE THAT RECORDS A NON-ANSWER: no error keys at all, model
+    `<synthetic>`, text "No response requested." — what the CLI writes when an injected
+    `isMeta` prompt produced NOTHING. Measured here Wed 28 Oct 2026 on CLI 2.1.312: 23 such
+    lines in 20 of the 1,943 transcripts in the config homes on this machine, every one with
+    that exact text. It wears a clean line's clothes, and both readers of a transcript used
+    to count it as the session answering again.
+    🛑 `api_error_only="<kind>"` is the OTHER member of the no-`apiError` family: an error
+    that is not a limit (`api_error_overloaded`, 529), carrying `isApiErrorMessage` and no
+    `apiError` key. "An error that is not a limit is not the session answering again", which
+    the clean branch's comment said while the code counted it.
     """
     d = {"type": "assistant", "cwd": cwd, "sessionId": sid, "isSidechain": False,
          "message": {"role": "assistant", "model": model,
@@ -483,6 +517,13 @@ def assistant(text, cwd, sid, model="claude-sonnet-4-5", error=None, resets=None
                         for i, t in enumerate(tools)]}}
     if uuid:
         d["uuid"], d["parentUuid"] = uuid, parent
+    if synthetic:
+        d["message"]["model"] = "<synthetic>"
+    if api_error_only:
+        d["isApiErrorMessage"] = True
+        d["error"] = api_error_only
+        d["apiErrorStatus"] = 529
+        d["message"]["model"] = "<synthetic>"
     if error:
         d["message"]["model"] = "<synthetic>"
         if shape == "apiError":
@@ -519,6 +560,17 @@ class World:
         #: line per `claude -p` the tool ran. It is the only place the note's text can be
         #: compared with what the tool said it would send.
         self.relay_log = root / "relay.jsonl"
+        #: 🛑 WHAT fd 0 IS WHEN csm RUNS, and deliberately neither the test runner's own stdin
+        #: nor /dev/null. csm must CLOSE stdin for the `claude -p` relay it starts (a `-p` run
+        #: with a terminal on stdin waits for input that never comes), and the only way a test
+        #: can tell that apart from "it passed on whatever it was handed" is for what it was
+        #: handed to be something else. An empty regular file reads EOF at once, is never a
+        #: tty, and is not /dev/null — so the fake claude's `_is_devnull()` measures csm's own
+        #: choice rather than how this suite happened to be invoked (under `python
+        #: tests/test_mover.py` with output redirected, which is how the README says to run it,
+        #: the runner's stdin is already not a tty and may already be /dev/null).
+        self.stdin_file = root / "parent-stdin"
+        self.stdin_file.write_text("")
         for name, body in (("claude", FAKE_CLAUDE), ("tmux", FAKE_TMUX),
                            ("fake-ssh", FAKE_SSH), ("fake-lsof", FAKE_LSOF)):
             p = self.bin / name
@@ -681,8 +733,9 @@ class World:
         return e
 
     def run(self, *args, **env):
-        return subprocess.run([PY, str(TOOL), *args], capture_output=True, text=True,
-                              env=self.env(**env), timeout=60)
+        with open(str(self.stdin_file)) as fd0:          # see `stdin_file`'s 🛑
+            return subprocess.run([PY, str(TOOL), *args], capture_output=True, text=True,
+                                  env=self.env(**env), timeout=60, stdin=fd0)
 
     def claude_calls(self, wait=3.0):
         deadline = time.time() + wait
@@ -2487,10 +2540,16 @@ class RemoteHelper(unittest.TestCase):
         self.addCleanup(sys.modules.pop, "csm_mod", None)
 
     def helper(self, *args, **kw):
+        # ⚠️ `home` replaces HOME for this run: the helper discovers config homes under `~`
+        # (`.claude` and `.claude-*` with a `projects/`), so a test about what it READS has
+        # to own that directory rather than the machine's.
+        env = dict(os.environ)
+        if kw.get("home"):
+            env["HOME"] = str(kw["home"])
         r = subprocess.run([PY] + list(kw.get("flags", ("-I", "-"))) + [str(a) for a in args],
                            input=self.mod.REMOTE_HELPER, stdout=subprocess.PIPE,
                            stderr=subprocess.PIPE, universal_newlines=True, timeout=120,
-                           cwd=kw.get("cwd"))
+                           cwd=kw.get("cwd"), env=env)
         if kw.get("raw"):
             return r
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -2589,6 +2648,49 @@ class RemoteHelper(unittest.TestCase):
         # a bridge id that is not this one must not match either
         self.assertEqual(
             self.helper("detail", str(t), sid, "01SomeOtherFixtureId000")["owners"], [])
+
+    def test_the_helpers_find_reads_BOTH_quota_shapes_like_the_engine(self):
+        """🛑 ONE READING RULE, which is `cmd_find`'s own promise: "it does it through the
+        same helper whether the machine is this one or another, so a row found here and a row
+        found there are the same row." M2's widened detection landed in `scan_transcript` and
+        in `revive_stop` and not in the helper's `scan`, whose `elif not err` branch actively
+        CLEARED a quota found on an earlier line — so `csm find` reported no quota for the 10
+        of 44 measured stop lines that carry no `apiError`, while `csm list` reported one and
+        `csm revive` said `usage-limit`. This class never exercised `scan` at all.
+        """
+        home = self.dir / "h1"
+        for shape, sid in (("apiError", SID_A), ("rate_limit", SID_B)):
+            d = home / ".claude" / "projects" / "-work"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / (sid + ".jsonl")).write_text(jl(
+                user("go", "/work", sid),
+                assistant("You've hit your weekly limit · resets 10pm", "/work", sid,
+                          error="usage_limit_reached", resets=time.time() + 3600,
+                          shape=shape)))
+        for shape, sid in (("apiError", SID_A), ("rate_limit", SID_B)):
+            got = self.helper("find", sid, 21, home=home)
+            rows = [r for r in (got.get("candidates") or []) if r.get("id") == sid]
+            self.assertEqual(len(rows), 1, (shape, got))
+            self.assertTrue(rows[0].get("quota"),
+                            "%s: the helper must see this stop too" % shape)
+            self.assertIn("weekly limit", rows[0]["quota"], shape)
+
+    def test_the_helper_does_not_let_a_non_answer_clear_a_quota_it_found(self):
+        """And the clearing branch has the same two exceptions the engine's does: an error
+        that is not a limit, and a `<synthetic>` "No response requested." line."""
+        home = self.dir / "h2"
+        d = home / ".claude" / "projects" / "-work"
+        d.mkdir(parents=True)
+        (d / (SID_C + ".jsonl")).write_text(jl(
+            user("go", "/work", SID_C),
+            assistant("You've hit your weekly limit · resets 10pm", "/work", SID_C,
+                      error="usage_limit_reached", resets=time.time() + 3600,
+                      shape="rate_limit"),
+            assistant("No response requested.", "/work", SID_C, synthetic=True)))
+        got = self.helper("find", SID_C, 21, home=home)
+        rows = [r for r in (got.get("candidates") or []) if r.get("id") == SID_C]
+        self.assertEqual(len(rows), 1, got)
+        self.assertTrue(rows[0].get("quota"), got)
 
     def test_the_mirror_copies_code_and_leaves_the_ignored_and_the_big_files(self):
         repo = self.dir / "repo"
@@ -2817,6 +2919,24 @@ class RunWindow(Base):
         call = self.w.claude_calls()[0]
         self.assertNotIn("CLAUDE_CONFIG_DIR", call["env"])
         self.assertEqual(call["argv"], ["--permission-mode", "plan", "--resume", SID_A])
+
+    def test_the_plan_format_version_stays_1(self):
+        """🛑 `make_plan`'s own 🛑 — "`version` STAYS 1, so an older csm can read a newer
+        plan" — with nothing that could notice a reflexive bump. `run_window` checks only
+        `kind` and `local_id`, and `RunWindow.PLAN` is an INPUT fixture rather than an
+        expectation, so the number was asserted nowhere at all. The hand-off is written by
+        one csm and read by another, which is the whole reason the field exists.
+        """
+        mod = load_tool()
+        self.addCleanup(sys.modules.pop, "csm_mod", None)
+        acct = mod.Account(name="work", home=self.w.work)
+        s = mod.Session(account=acct, local_id=SID_A, transcript=self.w.work / "t.jsonl",
+                        mtime=0.0, cwd=str(self.w.work))
+        plan = mod.make_plan(s, acct, "label", "default")
+        self.assertEqual(plan["version"], 1)
+        self.assertEqual(plan["kind"], "csm-run")
+        self.assertEqual(self.PLAN["version"], plan["version"],
+                         "the fixture and what the tool writes are one format")
 
     def test_a_file_that_is_not_a_plan_is_neither_deleted_nor_run(self):
         """🛑 `__run`'s next two steps are "unlink this path" and "exec what this JSON
@@ -4502,6 +4622,62 @@ class ReviveDiagnose(InProc):
         self.assertEqual((st["stop"], st["kind"]), ("api-error", "overloaded_error"))
         self.assertIn("not a limit", st["why"])
 
+    def nores(self, uuid="a9", parent="a2"):
+        """The `isMeta` prompt and the `<synthetic>` line that records it getting nothing —
+        the real pair, in the real order (`assistant`'s own 🛑 has the measurement)."""
+        meta = user("Continue from where you left off.", self.cwd, SID_A, uuid="u9",
+                    parent=parent)
+        meta["isMeta"] = True
+        return [meta, assistant("No response requested.", self.cwd, SID_A, synthetic=True,
+                                uuid=uuid, parent="u9")]
+
+    def test_a_no_response_requested_line_does_not_wait_out_a_limit(self):
+        """🛑 THE ONE LINE THAT RECORDS A NON-ANSWER, counted as the answer.
+
+        `revive_stop`'s clean-line branch exists because 2.1.312 auto-continues at a limit
+        and answers anyway — but a `<synthetic>` "No response requested." line is the CLI
+        recording that an injected prompt produced NOTHING. Counting it read a waited-out
+        limit as `finished`, losing `class`, `window` and `resets_at`, and the note then told
+        the revived session it "had answered and was sitting idle".
+        """
+        past = time.time() - 3600
+        st = self.stop_of(self.go(), self.limit(resets=past), *self.nores())
+        self.assertEqual(st["stop"], "usage-limit")
+        self.assertEqual(st["class"], "session")
+        self.assertEqual(st["window"], "five_hour")
+        self.assertAlmostEqual(st["resets_at"], past, delta=1)
+        self.assertIn("that reset has passed", st["why"])
+        # a line that IS the session answering still ends the limit, as before
+        self.assertEqual(self.stop_of(self.go(), self.limit(resets=past),
+                                      self.clean("answering again", uuid="a3",
+                                                 parent="a2"))["stop"], "finished")
+
+    def test_a_no_response_requested_line_does_not_hide_a_mid_turn_kill(self):
+        """And `pending` is taken from the last assistant line, so the same line stole the
+        tool name out of the one sentence M4 makes mandatory."""
+        st = self.stop_of(self.go(),
+                          tool_call(self.cwd, SID_A, name="Bash",
+                                    stamp="2026-10-28T09:33:07.000Z"),
+                          *self.nores(parent="a9"))
+        self.assertEqual((st["stop"], st["tool"]), ("mid-turn", "Bash"))
+        self.assertIn("UNKNOWN", st["why"])
+
+    def test_an_isApiErrorMessage_that_is_not_a_limit_is_not_an_answer_either(self):
+        """The other half of the no-`apiError` family. `scan_transcript` read it as the
+        session answering again — the branch's own comment says the opposite — so `csm list`
+        said `out_of_quota: false` about a session `csm revive` called `usage-limit`."""
+        past = time.time() - 3600
+        over = assistant("overloaded", self.cwd, SID_A, uuid="a3", parent="a2",
+                         api_error_only="api_error_overloaded")
+        t = self.sess(self.go(), self.limit(resets=past, shape="rate_limit"), over)
+        self.assertEqual(self.mod.revive_stop(t.transcript)["stop"], "usage-limit")
+        self.assertTrue(self.mod.scan_transcript(t.transcript)["quota"],
+                        "the two readers must agree about one file")
+        # and the listing's own reader agrees about the synthetic line too
+        t2 = self.sess(self.go(), self.limit(resets=past, shape="rate_limit"),
+                       *self.nores())
+        self.assertTrue(self.mod.scan_transcript(t2.transcript)["quota"])
+
     def test_a_mid_turn_kill_names_the_tool_whose_result_never_came(self):
         """🛑 The one stop where "do not repeat work that is already done" is dangerous
         advice: the tool call may have fully applied, partly applied or not run."""
@@ -4637,6 +4813,38 @@ class ReviveDiagnose(InProc):
         k = self.mod.revive_kind(self.session(self.a))
         self.assertEqual((k["kind"], k["bridge_id"]), ("terminal", ""))
 
+    def test_a_version_5_id_is_a_server_child_even_with_no_source_of_its_link(self):
+        """🛑 THE ONE CASE THAT USED TO READ AS `terminal`, and `terminal` is decide row 8 —
+        `--resume <old id>` with no `--fork-session`, a second process on the old local id.
+
+        A DEAD server child named by its own id or by part of its title has none of the four
+        sources `revive_kind` can prove a bridge id from: no registry row, no bridge line in
+        its own transcript (measured: 2 of 861 v5 transcripts here carry one), and no
+        `bridge-spawn` dir once it exited cleanly. The id's own uuid VERSION needs none of
+        them.
+        """
+        s = self.session(self.a, sid=FORK_SID, lines=[user("go", self.cwd, FORK_SID)])
+        k = self.mod.revive_kind(s)
+        self.assertEqual(k["kind"], "server-child")
+        self.assertEqual(k["bridge_id"], "", "nothing here proved WHICH session")
+        self.assertIn("version-5", k["why"])
+        self.assertIn("link is unknown", k["why"])
+        # and it is the VERSION that does it, not the absence of evidence: a v4 id with the
+        # same empty surroundings is still a terminal session
+        self.assertEqual(self.mod.revive_kind(self.session(self.a, sid=SID_A))["kind"],
+                         "terminal")
+        self.assertEqual(self.mod.uuid_version(FORK_SID), 5)
+        self.assertEqual(self.mod.uuid_version(SID_A), 4)
+        self.assertIsNone(self.mod.uuid_version("not-a-uuid"))
+
+    def test_a_version_5_id_with_a_source_still_names_its_link(self):
+        """The new rung is a FALL-THROUGH, below every source: when one of them answers, the
+        bridge id and the `from` are still that source's, so the link is still printed."""
+        s = self.session(self.a, sid=LINK_SID, lines=[user("go", self.cwd, LINK_SID)])
+        k = self.mod.revive_kind(s, LINK_BARE)
+        self.assertEqual((k["kind"], k["bridge_id"], k["from"]),
+                         ("server-child", LINK_BARE, "the link"))
+
     def test_the_desktop_apps_own_session_is_told_apart(self):
         s = self.session(self.a)
         s.desktop = {"sessionId": "local_1", "title": "from the app"}
@@ -4703,6 +4911,44 @@ class ReviveDiagnose(InProc):
         p = self.claude_with("--resume=" + SID_A)
         st = self.mod.revive_state(self.session(self.a))
         self.assertIn(p.pid, [r["pid"] for r in st["ps"]])
+
+    def test_a_bridge_id_only_MENTIONED_is_a_decoy_and_not_a_running_session(self):
+        """🛑 AFTER A FLAG, NOT ANYWHERE IN THE LINE. This arm was a plain substring, so any
+        process running as `claude` whose argv merely mentioned the id read as "something is
+        running this session NOW" — which `revive_start` turns into a hard refusal. The remote
+        helper's `detail()` has required the flag from the start, and the test that pins it
+        (`RemoteHelper`) calls the other shape a decoy; this is the same rule on this side.
+        """
+        # ⚠️ FORK_BARE, never LINK_BARE: the measured pair names a REAL session on the machine
+        # this was written on, and the sweep reads the real process table — so a test about
+        # what the sweep does NOT match has to name a bridge session nothing ever ran.
+        decoy = self.claude_with("/logs/cse_" + FORK_BARE + "/notes.txt")
+        s = self.session(self.a, sid=FORK_SID, lines=[user("go", self.cwd, FORK_SID)])
+        self.assertEqual(self.mod.revive_state(s, FORK_BARE)["ps"], [],
+                         "a mention is not a flag")
+        del decoy
+        for flag in ("--session-id", "--resume", "--sdk-url"):
+            p = self.claude_with(flag,
+                                 "https://api.anthropic.com/v1/code/sessions/cse_"
+                                 + FORK_BARE)
+            self.assertIn(p.pid, [r["pid"]
+                                  for r in self.mod.revive_state(s, FORK_BARE)["ps"]], flag)
+
+    def test_a_FORK_reading_this_transcript_is_not_a_second_writer_of_it(self):
+        """🛑 `revive_fork`'s own measured fact: a fork writes exactly `<new>.jsonl` and leaves
+        the transcript it read byte-identical (2.1.312, Wed 28 Oct 2026). But `--resume <old
+        id>` stays in that window's argv for its whole life, so `own` matched it and a second
+        `csm revive <old> --new-link` was refused with "two CLIs appending to one transcript
+        cannot be untangled" — about a process that never writes this file at all.
+        """
+        new = "9f1e2d3c-4b5a-4c6d-8e7f-0a1b2c3d4e5f"
+        fork = self.claude_with("--fork-session", "--session-id", new, "--resume", SID_A)
+        s = self.session(self.a)
+        self.assertEqual(self.mod.revive_state(s)["ps"], [], "a fork READ it, it never wrote")
+        del fork
+        # and a plain resume of the same id still is a writer, which is what the sweep is for
+        p = self.claude_with("--resume", SID_A)
+        self.assertIn(p.pid, [r["pid"] for r in self.mod.revive_state(s)["ps"]])
 
     # --- the work it lost ------------------------------------------------
     def wf(self, s, name="wf_d4fd7f6a-04f.json", body=None):
@@ -4979,7 +5225,7 @@ class ReviveNoteText(InProc):
 
     def test_a_resume_in_place_and_a_new_link_resume_are_told_apart(self):
         self.assertIn("the link you had still opens this conversation", self.note("resume"))
-        n = self.note("new-link")
+        n = self.note("resume-new-link")
         self.assertIn("NEW claude.ai link", n)
         self.assertIn("nothing opens the old one", n)
 
@@ -5268,7 +5514,7 @@ class ReviveDryRun(Base):
     def test_row_8_a_terminal_session_resumes_and_gets_a_new_link(self):
         self.dead()
         dec = self.row_of(SID_A)
-        self.assertEqual((dec["row"], dec["action"]), (8, "new-link"))
+        self.assertEqual((dec["row"], dec["action"]), (8, "resume-new-link"))
         self.assertIn("NEW claude.ai link", dec["what"])
         self.assertIn("exposure", dec["risk"])
 
@@ -5285,6 +5531,32 @@ class ReviveDryRun(Base):
         self.assertFalse(dec["note"], "nothing is started, so nothing is told anything")
         out = self.ok(self.revive(link_of(LINK_BARE)))
         self.assertIn(link_of(LINK_BARE), out)
+
+    def test_a_dead_server_child_named_by_its_ID_is_never_resumed_in_place(self):
+        """🛑 THE TWO-WRITER OUTCOME L39 AND F5 FORBID, reachable by the ordinary spec.
+
+        `csm list` prints the 8-character id and the title and `csm revive --help` invites
+        both, and a DEAD server child named that way has no source of its bridge id at all:
+        no registry row, no bridge line in its own transcript, no `bridge-spawn` dir. It
+        therefore read as `terminal`, which is row 8 — `--resume <old id>` with no
+        `--fork-session`, a second process on the old local id, while a later lazy respawn of
+        the old link has that same id. `--new-link` could not rescue it either: the flag is
+        read only inside the `server-child` branches, so row 8 matched first.
+        """
+        self.w.session(self.work, FORK_SID, cwd=self.cwd,
+                       lines=[self.go(FORK_SID), self.clean(FORK_SID)])
+        for spec in (FORK_SID, FORK_SID[:8], "campaign"):
+            dec = self.row_of(spec)
+            self.assertEqual((dec["row"], dec["action"]), (9, "keep-link"), spec)
+            self.assertFalse(dec["note"], spec)
+        # the link it cannot name is ASKED FOR, never invented
+        out = self.ok(self.revive(FORK_SID))
+        self.assertIn("paste the link (`csm revive <link>`)", out)
+        self.assertIn("version-5 uuid", out)
+        self.assertNotIn("https://claude.ai/code/session_", out)
+        # and `--new-link` now reaches row 10, which forks without needing the link
+        dec = self.row_of(FORK_SID, "--new-link")
+        self.assertEqual((dec["row"], dec["action"]), (10, "fork"))
 
     def test_row_9_says_whether_the_server_that_would_respawn_it_is_up(self):
         self.w.session(self.work, LINK_SID, cwd=self.cwd,
@@ -5378,6 +5650,64 @@ class ReviveDryRun(Base):
         self.dead()
         self.refused(self.revive(link_of(LINK_BARE2)), "no transcript for that link here",
                      LINK_SID2)
+
+    def test_a_home_that_could_not_be_READ_is_never_reported_as_not_holding_the_link(self):
+        """🛑 "COULD NOT LOOK" IS NEVER A VERDICT — the doctrine this file states five times
+        and rewrote `preflight`, `live_rows`, `owner_of` and `rc_job_owner` for, missed at
+        the spec layer. Both link rungs used `Path.glob`, which swallows the PermissionError
+        its own scan raises and yields nothing, so a locked-out home came back as "this home
+        does not hold it" and the person was told the session they are rescuing is not on
+        this machine.
+        """
+        t = self.w.session(self.personal, FORK_SID, cwd=self.cwd,
+                           lines=[self.go(FORK_SID), self.clean(FORK_SID)])
+        link = link_of(FORK_BARE)
+        self.assertIn("resolved from the link", self.ok(self.revive(link)))
+        for locked in (t.parent, self.personal / "projects"):
+            mode = locked.stat().st_mode
+            locked.chmod(0o000)
+            try:
+                err = self.refused(self.revive(link))
+            finally:
+                locked.chmod(mode)
+            self.assertIn("could not finish looking", err)
+            self.assertIn("PermissionError", err)
+            self.assertNotIn("no transcript for that link here", err)
+            self.assertNotIn("belong to a session this machine never ran", err)
+
+    def test_one_id_in_two_homes_is_refused_and_never_silently_picked(self):
+        """🛑 `move` AND `stop` BOTH REFUSE HERE, and revive did not. `revive_resolve`'s soft
+        pass answers None for two different reasons — nothing matched, or several copies did
+        — and the rung below it, which exists for a transcript every listing DROPS, answered
+        for both by taking the first home in order. So revive acted on a stale snapshot, on
+        the wrong account's quota, and wrote "You are still <wrong email>" into the note.
+        """
+        old = time.time() - 3 * 86400
+        self.w.session(self.personal, SID_A, cwd=self.cwd,
+                       lines=[self.go()], mtime=old)
+        self.w.session(self.work, SID_A, cwd=self.cwd,
+                       lines=[self.go(), self.clean()])
+        err = self.refused(self.revive(SID_A))
+        self.assertIn("matches 2 sessions", err)
+        self.assertIn("work", err)
+        self.assertIn("personal", err)
+        # and `--account` is the cure the refusal can offer
+        dec = self.row_of(SID_A, "--account", "work")
+        self.assertEqual(dec["row"], 8)
+        got = self.rec(SID_A, "--account", "personal")
+        self.assertEqual(got["record"]["session"]["account"], "personal")
+
+    def test_one_id_in_two_homes_is_refused_even_when_no_listing_carries_it(self):
+        """The rung below the listing has to hold the same rule: a 0-byte pre-created
+        transcript is dropped by `sessions_for` in BOTH homes, so `revive_row` is what
+        answers, and it compared mtimes only WITHIN one home."""
+        for home in (self.work, self.personal):
+            self.w.session(home, LINK_SID, cwd=self.cwd, lines=[])
+        err = self.refused(self.revive(link_of(LINK_BARE)))
+        self.assertIn("2 account homes here hold a copy", err)
+        self.assertIn("--account <handle>", err)
+        dec = self.row_of(link_of(LINK_BARE), "--account", "personal")
+        self.assertEqual(dec["row"], 2, "an empty transcript: nothing to continue")
 
     def test_the_move_gate_is_in_the_plan_and_not_left_for_the_real_run(self):
         """`--to` the account it is already in is the easiest flag to type by accident,
@@ -5607,7 +5937,13 @@ class ReviveWake(ReviveRun):
         self.assertEqual(call["env"]["CLAUDE_CONFIG_DIR"], str(self.work))
         self.assertEqual(os.path.realpath(call["cwd"]),
                          os.path.realpath(str(self.w.state / "relay")))
-        self.assertFalse(self.w.relay_calls()[0]["stdin_tty"], "stdin must be closed")
+        # 🛑 `stdin_tty` CANNOT FAIL IN AN AUTOMATED RUN (the fake's own note says why), so
+        # what is asserted is the identity of fd 0: `stdin=subprocess.DEVNULL` makes it
+        # /dev/null, and an inherited stdin — the thing his 13 Oct 2026 rule forbids a `-p`
+        # run to have — is anything else. Removing that one keyword now fails this test.
+        self.assertTrue(self.w.relay_calls()[0]["stdin_devnull"],
+                        "stdin must be /dev/null, not inherited")
+        self.assertFalse(self.w.relay_calls()[0]["stdin_tty"])
 
     def test_the_relays_environment_is_scrubbed_like_every_other_child(self):
         self.alive()
@@ -5629,6 +5965,9 @@ class ReviveWake(ReviveRun):
         got, _r = self.rec(SID_A)
         self.assertEqual(self.w.relay_calls()[0]["note"], got["note"])
         self.assertIn("written by the tool; the user did not type this", got["note"])
+        # ⚠️ `named` is the fixture counting rows on disk, with no proof of any of them — it
+        # was never a guarantee csm provided. What csm provides is the refusal pinned by
+        # `test_a_name_that_names_two_live_sessions_is_refused_before_anything_is_sent`.
         self.assertEqual(self.w.relay_calls()[0]["named"], 1)
 
     def test_the_registry_going_busy_is_proof_on_its_own(self):
@@ -5706,6 +6045,60 @@ class ReviveWake(ReviveRun):
                 (self.w.state / "revive.jsonl").read_text().splitlines() if x.strip()]
         self.assertEqual((rows[0]["row"], rows[0]["exit"]), (5, 2))
         self.assertIs(rows[0]["started"], False)
+
+    def test_a_row_that_cannot_be_PROVED_in_that_last_second_sends_nothing(self):
+        """🛑 `live_name`'s own 🛑, which the suite measured nothing of: "a registry file
+        outlives its process, so an unproved row is no row at all here — messaging the name
+        of a dead row would send the note to whatever answers to it next."
+
+        The adjacent test arms the row to VANISH, so `live_rows` returns nothing and
+        `live_name` is `{}` either way. This arms the row that is still ON DISK and no longer
+        provable, which is the shape the brief names: rows survive a SIGKILL until a live
+        session sweeps them. With the gate removed the whole suite passes; with this, it does
+        not.
+        """
+        _t, p = self.alive()
+        self.w.server()                  # so the diagnosis really asks lsof, on any machine
+        row = self.work / "sessions" / ("%d.json" % p.pid)
+        stale = self.w.root / "stale.json"
+        d = json.loads(row.read_text())
+        d["procStart"] = "Mon Jan  1 00:00:00 2024"     # same pid, a different process
+        stale.write_text(json.dumps(d))
+        r = self.revive(SID_A, FAKE_LSOF_ARM_FROM=str(stale), FAKE_LSOF_ARM_TO=str(row))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("could not be proved in the second before the note was sent",
+                      r.stderr)
+        self.assertEqual(self.w.relay_calls(), [], "nothing was sent to a dead row's name")
+
+    def test_a_name_that_names_two_live_sessions_is_refused_before_anything_is_sent(self):
+        """🛑 SendMessage ADDRESSES A SESSION BY ITS NAME, and nothing checked that the name
+        was unique. `relay_note` refuses only an EMPTY name, so the note could land in an
+        unrelated live session's conversation — a message in his conversation that he did not
+        type, in the wrong conversation — while `prove_turn` watches the INTENDED session and
+        reports "it is up but idle" with no hint of the misdelivery.
+
+        The suite's fake relay already MEASURED this (`named`), and two tests asserted
+        `named == 1` as though it were a guarantee csm provided; it was a property of the
+        fixture.
+        """
+        self.alive()                                      # SID_A, name "rc-name"
+        _t2, p2 = self.alive(sid=SID_B)                   # unrelated, same name
+        r = self.revive(SID_A)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("is not unique in work", r.stderr)
+        self.assertIn(SID_B[:8], r.stderr)
+        self.assertIn("--name", r.stderr)
+        self.assertEqual(self.w.relay_calls(), [], "nothing was sent to an ambiguous name")
+        # 🛑 AND THE SECOND ROW IS PROVED, not counted: the same row with no recorded start
+        # time cannot be proved, so it is a stale row and not a second answerer — and the
+        # wake goes through exactly as it did before.
+        # ⚠️ The fixture's own `named` still reads 2 — it counts rows on disk, with no proof
+        # of any of them — which is exactly why `named == 1` elsewhere was never a guarantee
+        # csm provided. What csm provides is this: the row it cannot prove is not a twin.
+        self.w.live(self.work, SID_B, p2.pid, cwd=self.cwd, proc_start="")
+        out = self.ok(self.revive(SID_A))
+        self.assertIn("✅ revived", out)
+        self.assertEqual(self.w.relay_calls()[0]["target"], "rc-name")
 
     def test_every_revive_leaves_one_record_and_it_holds_no_note_text(self):
         """🛑 `revive.jsonl` is a record of what ran: the at-most-once triple (the local id,
@@ -5878,6 +6271,28 @@ class ReviveFork(ReviveRun):
         self.assertNotIn("peer", old.read_text())
         self.assertEqual(self.w.relay_calls()[0]["sid"], res["new_id"])
         self.assertIs(res["proved"], True)
+
+    def test_the_record_of_a_FORK_holds_no_note_text(self):
+        """🛑 THE ONE PATH WHERE THE `note` FILTER IS NOT A NO-OP, and the only test of that
+        filter ran on the other one. A wake's result dict has no `note` key at all, so
+        `revive_record`'s `if k != "note"` had nothing to drop and the assertion could not
+        fail; `revive_fork` is the one action that sets `out["note"]`, because the note is
+        rebuilt to name the fork's own new id.
+        """
+        self.child()
+        got, _r = self.rec(link_of(FORK_BARE), "--new-link")
+        self.assertIn("written by the tool", got["note"],
+                      "`--json` DOES report the note that was sent")
+        self.assertNotIn("note", got["result"], "but not under `result`")
+        rows = [json.loads(x) for x in
+                (self.w.state / "revive.jsonl").read_text().splitlines() if x.strip()]
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("note", rows[0])
+        self.assertNotIn("written by the tool", json.dumps(rows[0]))
+        self.assertNotIn("written by the tool",
+                         (self.w.state / "revive.jsonl").read_text())
+        # and the same holds of the log line beside it
+        self.assertNotIn("written by the tool", (self.w.state / "log").read_text())
 
     def test_stop_ends_a_forked_window_by_its_NEW_id(self):
         """🛑 This is what `--session-id` buys: `csm stop` can only end a window it can name
@@ -6066,6 +6481,39 @@ class ReviveRefusals(ReviveRun):
         out = self.ok(self.revive(SID_A, "--unarchive", FAKE_CLAUDE_LINK=url))
         self.assertIn("✅ revived", out)
 
+    def test_a_stale_registry_row_is_never_read_as_a_live_twin_of_itself(self):
+        """🛑 THE REFUSAL THAT CONTRADICTED THE DIAGNOSIS ONE SCREEN ABOVE IT.
+
+        `revive_state` refuses to trust a row whose pid it cannot prove and reads it as DEAD,
+        keeping the reason. `preflight`'s live-twin check read the same row straight out of
+        `live_rows` with no proof — and for an in-place revive `dest_of(s, s.account)` IS the
+        session's own transcript, so `dest_there` is always true and that check runs on every
+        single run. The dry run said "row 7, resume it in place" and the real run exited 2
+        with "<account> is ALREADY running session <id>", whose two cures are both impossible
+        (there is nothing to stop; a third account is not what was asked). It is the
+        machine-restart case the whole feature was built for: the rows that survive a restart
+        name low pid numbers that are very likely in use again.
+        """
+        self.unprovable_row_still_resumes("Mon Jan  1 00:00:00 2024")
+
+    def test_a_row_with_no_recorded_start_time_is_not_a_live_twin_either(self):
+        """The second route to the same refusal, and it needs no pid reuse at all: a row the
+        CLI wrote without a `procStart` can never be proved (`still_the_same_process` has no
+        name-based fallback on purpose)."""
+        self.unprovable_row_still_resumes("")
+
+    def unprovable_row_still_resumes(self, proc_start):
+        self.dead(lines=[self.go(), self.clean(), BRIDGE_LINE])
+        p = self.w.spawn()                       # a real, live pid the row names
+        self.w.live(self.work, SID_A, p.pid, cwd=self.cwd, proc_start=proc_start)
+        got = json.loads(self.ok(self.w.run("revive", SID_A, "--dry-run", "--json")))
+        self.assertEqual(got["record"]["state"]["state"], "dead")
+        self.assertEqual(got["decision"]["row"], 7)
+        url = got["record"]["session"]["url"]
+        out = self.ok(self.revive(SID_A, FAKE_CLAUDE_LINK=url))
+        self.assertNotIn("ALREADY running", out)
+        self.assertIn("✅ revived", out)
+
     def test_a_home_whose_login_is_gone_starts_nothing(self):
         """🛑 Such a home takes the session up and then fails at its first token refresh,
         which looks exactly like a successful revive."""
@@ -6149,8 +6597,10 @@ class ReviveLock(ReviveRun):
     🛑 Two revives, each deciding on a dead transcript and each starting a window, is the one
     outcome this command could produce that nothing else guards: `preflight`'s live-twin check
     only ever sees a process that has already registered. The claim is `state_lock`'s own
-    lock-directory shape, keyed on the local id, with its 120 s stale break — so a revive that
-    was killed does not wedge the session for good.
+    lock-directory shape, keyed on the local id — with its OWN stale break, and not the 120 s
+    the `.claude.json` lock keeps: this claim is held across four bounded waits that add up to
+    more than 120 s, so the short bound made it breakable from t=120 s on every run. The waits
+    re-stamp it as they poll, so a revive that was killed still does not wedge the session.
     """
 
     def claim(self, sid=SID_A):
@@ -6162,9 +6612,40 @@ class ReviveLock(ReviveRun):
         self.claim().mkdir(parents=True)
         r = self.revive(SID_A)
         self.refused(r, "another revive of session 11111111 is in flight")
-        self.assertIn("clears itself after 120s", r.stderr)
         self.assertEqual(t.read_bytes(), before)
         self.assertEqual(self.w.claude_calls(wait=0.4), [])
+        # 🛑 THE BOUND IT NAMES IS THE SUM OF THE WAITS IT IS HELD ACROSS, not the 120 s of the
+        # lock `state_lock` was written for: a window connecting, its registry row appearing,
+        # the relay and the turn, plus one spare connect. Here those are the suite's own small
+        # knobs (CSM_CONNECT_WAIT=30, CSM_RELAY_TIMEOUT_S=30, CSM_REVIVE_PROVE_S=8), so the
+        # arithmetic is asserted rather than a number copied out of the engine.
+        want = 3 * 30 + 30 + 8 + 30
+        self.assertIn("clears itself after %ds" % want, r.stderr)
+        self.assertGreater(want, 120, "the whole point: longer than the .claude.json lock's")
+
+    def test_a_long_wait_keeps_the_claim_fresh_so_a_second_revive_cannot_break_it(self):
+        """🛑 The other half: the bound is read off the directory's MTIME, which `os.mkdir`
+        stamps once. A claim held across a wait that outlasts the bound is a directory that
+        looks abandoned while the thing it protects is running, so each polling wait re-stamps
+        every lock this process holds."""
+        mod = load_tool()
+        self.addCleanup(sys.modules.pop, "csm_mod", None)
+        mod.STATE_DIR = self.w.state
+        self.w.state.mkdir(parents=True, exist_ok=True)
+        p = self.w.state / "claim"
+        with mod.state_lock(p, stale=5.0) as lk:
+            self.assertTrue(lk.held)
+            lock = Path(str(p) + ".lock")
+            old = time.time() - 600
+            os.utime(str(lock), (old, old))
+            self.assertLess(lock.stat().st_mtime, time.time() - 60)
+            mod.touch_locks()
+            self.assertGreater(lock.stat().st_mtime, time.time() - 5,
+                               "a held claim must be re-stamped, not left at its mkdir time")
+            # a second attempt on a fresh claim finds it held, where the aged one was broken
+            with mod.state_lock(p, stale=5.0) as second:
+                self.assertFalse(second.held)
+        self.assertEqual(mod.HELD_LOCKS, [], "and it is forgotten when released")
 
     def test_a_stale_claim_is_broken_and_the_revive_runs(self):
         self.alive()
@@ -6191,15 +6672,16 @@ class ReviveLock(ReviveRun):
         self.assertIn("(dry run: nothing was started", out)
 
     def test_the_claim_is_keyed_on_the_session_so_another_one_is_free(self):
-        # ⚠️ two names, because SendMessage addresses a session BY its name: two live rows
-        # calling themselves one thing is an ambiguity of the fixture, not of the tool.
+        # 🛑 two names, because SendMessage addresses a session BY its name — and as of 0.5.0's
+        # review fixes two proved live rows of one name is a REFUSAL of the tool's own, pinned
+        # by `ReviveWake.test_a_name_that_names_two_live_sessions_is_refused_…`. It was not an
+        # ambiguity of the fixture.
         self.alive(SID_A, name="first-session")
         self.alive(SID_B, name="second-session")
         self.claim(SID_B).mkdir(parents=True)
         out = self.ok(self.revive(SID_A))
         self.assertIn("✅ revived", out)
         self.assertEqual([c["target"] for c in self.w.relay_calls()], ["first-session"])
-        self.assertEqual(self.w.relay_calls()[0]["named"], 1)
 
 
 class RevivePlumbing(InProc):
@@ -6218,6 +6700,34 @@ class RevivePlumbing(InProc):
         self.assertEqual((p["session_id"], p["fork_session"], p["revive_of"]),
                          ("", False, ""))
         self.assertEqual(p["window"], "moved-" + SID_A[:8])
+
+    def test_every_tmux_call_carries_a_timeout_and_one_is_a_failed_capture(self):
+        """🛑 `tmux()` WAS THE ONLY SUBPROCESS CALL IN THE ENGINE WITHOUT A TIMEOUT, and every
+        revive wait is a loop around it: `wait_window` checks its deadline only BETWEEN
+        `capture-pane` calls, so one tmux client that blocks — a wedged server, a socket that
+        accepts and never answers — hung the whole command past `CONNECT_WAIT_S` with no bound
+        at all. That is the one shape the no-blocking-wait rule forbids, inside the command that
+        promises bounded machine waits.
+        """
+        seen = {}
+
+        def blocked(argv, **kw):
+            seen.update(kw)
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout") or 0)
+
+        self.mod.tmux_bin = lambda: "/usr/bin/true"
+        real, self.mod.subprocess.run = self.mod.subprocess.run, blocked
+        self.addCleanup(setattr, self.mod.subprocess, "run", real)
+        r = self.mod.tmux("capture-pane", "-p", check=False)
+        self.assertTrue(seen.get("timeout"), "no timeout was passed to subprocess.run")
+        self.assertEqual(seen["timeout"], self.mod.TMUX_TIMEOUT_S)
+        # a timeout is a FAILED capture, which every caller already handles — so
+        # `wait_window` sees rc != 0 and ends on its own deadline instead of hanging
+        self.assertEqual(r.returncode, 127)
+        self.assertIn("did not answer", r.stderr)
+        with self.assertRaises(self.mod.Refusal) as caught:
+            self.mod.tmux("capture-pane", "-p", check=True)
+        self.assertIn("may be wedged", str(caught.exception))
 
     def test_a_fork_plan_emits_both_flags_and_names_the_window_for_the_new_id(self):
         new = "9f1e2d3c-4b5a-4c6d-8e7f-0a1b2c3d4e5f"

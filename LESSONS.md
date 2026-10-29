@@ -697,6 +697,89 @@ hours. Every one of these is **Beta**: it is behaviour and layout nobody documen
   `grep -h '"isApiErrorMessage":true' <home>/projects/*/*.jsonl | jq -c 'select(.message.content|tostring|test("limit"))|{apiError,error,q:(.message.quotaLimits//.quotaLimits)}' | sort | uniq -c`
 - **Verified.** 2.1.312. **Beta.**
 
+### L46 · A version-5 session id is a server child; that survives every file being gone
+
+- **Rule.** Read the kind of a Remote Control session from the uuid **version** of its local id when
+  nothing else can say. A child's id is `uuid5(<bridge namespace>, <its api url>)` (L37) and every
+  other session gets a random `uuid4`, so version 5 is proof on its own — and a tool that must never
+  resume a child in place (L39) needs that proof precisely when nothing is left to look at.
+- **Why.** The bare bridge id is written down in exactly four places, and a dead child named by its
+  own id or by part of its title has none of them: no live registry row, no `bridge-session` line in
+  its own transcript (L37), and no `~/.claude/bridge-spawn/cse_X-*` directory once it exited cleanly —
+  the bridge deletes that on a *handled* exit, which a server shutdown or a graceful restart is. Of
+  861 version-5 transcripts in the config homes on this machine, **2** name their bridge session in
+  their own file and **19** have a directory or a live row: 840 could be classified only by the id.
+  Reading those as plain terminal sessions is how an in-place `--resume <old id>` — L39's forbidden
+  two-writer start — gets reached by the ordinary spec a person types.
+- **Check.** `uuid5` the derivation for a link you have, then
+  `python3 -c 'import uuid,sys; print(uuid.UUID(sys.argv[1]).version)' <local id>`; compare against
+  how many of your own v5 transcripts carry a `bridge-session` line.
+- **Verified.** 2.1.312, Wed 28 Oct 2026, 861 v5 transcripts on one machine. **Beta.**
+
+### L47 · A `<synthetic>` "No response requested." line is the record of a NON-answer
+
+- **Rule.** A clean assistant line counts as "the session answered again" only when its `model` looks
+  like a model. A line whose model is `<synthetic>` is not an answer, and neither is one carrying
+  `isApiErrorMessage` with an `error` that is not `rate_limit`.
+- **Why.** The CLI writes a non-error assistant line reading **"No response requested."**, model
+  `<synthetic>`, precisely when an injected `isMeta` prompt ("Continue from where you left off.")
+  produced nothing — so the one line that records a non-answer wears a clean line's clothes. Counting
+  it masks a usage-limit stop as `finished` (losing the class, the window and the reset) and a kill
+  mid-tool-call as `finished` too, which drops the one sentence a revived session must be told: its
+  last tool call has no recorded result. Measured: 23 such lines in 20 of the 1,943 transcripts in the
+  config homes here, every one with that exact text.
+- **Check.**
+  `grep -h '"model":"<synthetic>"' <home>/projects/*/*.jsonl | jq -c 'select(.apiError==null and .isApiErrorMessage==null)|.message.content[0].text' | sort | uniq -c`
+- **Verified.** 2.1.312, Wed 28 Oct 2026. **Beta.**
+
+### L48 · A relay's own transcript lands in the TARGET's home; the cwd moves only the slug
+
+- **Rule.** Running the note-carrying `claude -p` relay in a directory of your own does not keep its
+  transcript out of the session's config home — it only changes which project folder inside that home
+  the file lands in. Say so out loud wherever "the note is in no file we keep" is claimed, and keep
+  that project slug out of every listing.
+- **Why.** `cwd` decides the project-folder **slug** and nothing else, so the relay files
+  `<CLAUDE_CONFIG_DIR>/projects/<slug of the relay dir>/<its own id>.jsonl` — with the note verbatim
+  inside it, written by the CLI with the CLI's own permissions. Two consequences follow: the rule that
+  no *tool-kept* file holds the note is not a claim that the note is unwritten; and every run leaves a
+  session whose title is the relay instruction in any listing that scans `projects/*/*.jsonl`, which
+  a session mover will then happily offer to move or revive. A 0700 mode on the relay's cwd protects
+  the cwd, not the transcript.
+- **Check.** `claude -p --output-format json "…"` in a scratch directory, then
+  `ls -lt "$CLAUDE_CONFIG_DIR/projects/"` — the newest folder is that directory's slug, and it holds a
+  transcript named by the `session_id` in the result document.
+- **Verified.** 2.1.312, Wed 28 Oct 2026 (the spike's own result document names its `session_id`).
+  **Beta.**
+
+### L49 · A registry `name` is not unique, and SendMessage addresses a session by it
+
+- **Rule.** Before messaging a session by the `name` in its registry row, count the **proved** live
+  rows in that home carrying that name. Not exactly one is a refusal with nothing sent. And never
+  build a name from a title alone: put the session's id8 in it.
+- **Why.** The registry is keyed by local id, not by name, so two live rows can carry one name; the
+  tool addressing them cannot tell which answers. A note then lands in a conversation nobody named,
+  while the prover watches the intended session and reports "it is up but idle" — a misdelivery with
+  no signal at all. And a name built as `<sanitised title> + <fixed tail>`, truncated to a fixed
+  width, makes the collision by construction: two revives of one session, or two sessions whose
+  titles start alike, register under one identical name.
+- **Check.** `jq -r .name <home>/sessions/*.json | sort | uniq -d`
+- **Verified.** 2.1.312, Wed 28 Oct 2026 (observed in fixtures with two live rows of one name; the
+  collision by construction read off the label builder). **Beta.**
+
+### L50 · A lock whose mtime is never touched is breakable in the middle of the work it protects
+
+- **Rule.** A stale-break bound belongs to the HOLDER, not to the lock type: set it from the sum of
+  the waits that lock is held across, and re-stamp the directory inside each polling wait.
+- **Why.** A lock-directory's age is read from its `mkdir` mtime, so a claim held across several
+  bounded waits looks abandoned from the moment the first bound passes — and the holder is then not
+  "finished", it is in the middle of the one operation the claim exists to serialise. A 120 s bound
+  written for a read-modify-replace of one JSON file, reused for a claim held across a window
+  connecting (150 s), its registry row appearing (150 s), a relay (120 s) and a turn (90 s), was
+  breakable on **every** run from t=120 s.
+- **Check.** Sum the knobs the claim is held across and compare with the break; then
+  `stat -f %m <lock dir>` during a long run and watch whether it moves.
+- **Verified.** Read off the engine's own knob definitions, Wed 28 Oct 2026. **Beta.**
+
 <a id="related"></a>
 
 ## Related tools

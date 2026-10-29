@@ -33,6 +33,7 @@ csm move SESSION --to ACCOUNT|auto [--stop-source] [--dry-run] [--permission-mod
                               [--from-account ACCOUNT]
 csm revive SESSION [--dry-run] [--json] [--to ACCOUNT|auto] [--new-link] [--say TEXT]
                               [--permission-mode MODE] [--unarchive] [--name LABEL]
+                              [--account NAME]
 csm stop SESSION [--dry-run]                  # end a session csm moved, free its window
 csm find TEXT [--on M] [--all] [--json]       # where is that session, on any machine
 csm modes [--account NAME] [--json] [--check] [--restart-idle [--apply]]
@@ -285,6 +286,21 @@ quota):
 | 9 | dead, a Remote Control **server child**, no `--new-link` | prints the one thing to tap and starts nothing |
 | 10 | dead, a server child, `--new-link` | forks it: new id, new link, same past; the old link still opens the old copy |
 
+The `action` in `--json` names the row: `refuse`, `nothing`, `wake`, `move`, `resume`, `resume-new-link` (8),
+`keep-link` (9), `fork` (10). ⚠️ `resume-new-link` is row 8, a resume in place; the `--new-link` FLAG takes row 10,
+which records `fork`.
+
+**A dead server child often cannot name its own link, and that is still row 9.** When nothing records which
+claude.ai session it was — no registry row, no bridge line in its file, no `bridge-spawn` directory — csm proves
+the kind from the id's uuid version alone and asks for the link instead of printing one. Pass that on as it is
+written: *paste its claude.ai link*, or `--new-link` to fork it, which needs no link at all. Never offer to
+"resume it in place": that would put a second process on an id a later respawn of the old link shares.
+
+**Two refusals to pass on as they are.** When one id sits in two homes and neither is running, revive refuses and
+names both — the cure is `--account <handle>`, and it is the same refusal `move` and `stop` give. When two live
+sessions in one home carry the same registry name, revive refuses before sending anything, because SendMessage
+addresses a session by its name — the cure is `--name <label>` on the revive, or stopping the other.
+
 **Row 9 is the one that needs the user, and it is usually the cheapest answer.** Nothing local can make a Remote
 Control server respawn its child — the server does that when the session next gets activity. So tell them: *open
 this link and say "continue"*; the server brings the worker back, and they keep the link, the title, the
@@ -369,6 +385,10 @@ in the app's own index and in no transcript. Two caveats to pass on:
   read as minutes old.
 - **A move is a copy, so a moved session shows up as two rows** — one per home. That is not a
   duplicate to clean up.
+- **Exit 0 with rows, exit 1 when nothing matched.** Exit 1 is never "the search failed": it
+  is "nothing matched", and **0 rows is not proof** the session is gone. Never say "no such
+  session" on it — ask for the `claude.ai` link, which names the transcript by arithmetic
+  with nothing running. A caller that wants rows counts `--json`.
 
 ## "Which of my accounts are set up the same?"
 

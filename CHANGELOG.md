@@ -17,7 +17,7 @@ resume it in place, fork it onto a new link, move it to another account, or prin
 to tap. Everything here is measured against Claude Code **2.1.312** on macOS (Wed 28 Oct 2026)
 — a newer version than the 2.1.296–2.1.300 the rest of this file was written against.
 
-466 tests became **673**, on Python 3.12 and on the 3.7 floor the README promises. Nothing about
+466 tests became **694**, on Python 3.12 and on the 3.7 floor the README promises. Nothing about
 `move`, `stop`, `list`, `modes`, `matrix` or `find` changed behaviour except where this file says
 so: `check_target`'s split is byte-for-byte identical for a move, and `find`'s exit code is the one
 deliberate change to an existing contract.
@@ -202,6 +202,109 @@ deliberate change to an existing contract.
 
 ### Fixed
 
+The first eleven entries are the review of this release's own commits, applied before it shipped.
+Each one has a test that fails without the fix.
+
+- 🛑 **A dead server child named by its id or by part of its title was classified `terminal`
+  and RESUMED IN PLACE on its own local id** — the two-writer start LESSONS.md L39 forbids,
+  reachable by the ordinary spec a person types (`csm list` prints the id8 and the title, and
+  `csm revive --help` invites both). `revive_kind` could prove `server-child` only from one of
+  four sources, and a dead child that exited cleanly has none of them: no registry row, no
+  bridge id in its own transcript, and no `bridge-spawn` directory. It fell through to
+  `terminal`, which is decide row 8 — `claude --resume <old id>` with **no** `--fork-session` —
+  while a later lazy respawn of the old link has that same local id. `--new-link` could not
+  rescue it, because the flag is read only inside the `server-child` branches, so row 8 matched
+  first and the flag was silently ignored while `--json` reported `"action": "new-link"`. The
+  id's own uuid **version** settles it with nothing left to read: a child's id is `uuid5`, every
+  other session's is a random `uuid4`. Of the 861 version-5 transcripts in the config homes on
+  this machine, 2 name their bridge session in their own file and 19 have a live row or a
+  directory — **840 were in the state that mis-classified**. Such a session now takes row 9, or
+  row 10 with `--new-link`, and asks for the link rather than printing one it cannot name.
+- 🛑 **`revive` silently picked the wrong copy when one id sat in two homes**, where `move` and
+  `stop` both refuse. `revive_resolve`'s soft pass answers `None` both for "nothing matched" and
+  for "several matched, and `one_of` would refuse", and the rung below it — which exists for a
+  transcript every listing *drops* — answered for both by taking the first home in `accts` order.
+  A move is a copy, so two dead copies of one id is the ordinary state after any `csm move`: a
+  3-day-old snapshot was resumed over a 1-minute-old one, published on a new claude.ai link,
+  charged to the wrong account's quota, and told "You are still `<the other email>`". Only "no
+  listing row for this id anywhere" now reaches that rung, it asks every home rather than the
+  first, and **`--account NAME`** is the cure both refusals name.
+- **`preflight`'s live-twin check refused every in-place revive over a stale registry row.**
+  `revive_state` refuses to trust a row whose pid it cannot prove and reads it as DEAD, keeping
+  the reason; `preflight` read the same row straight out of `live_rows` with no proof. For a
+  *move* that branch is rare, because the destination usually does not exist; for a revive in
+  place the destination **is** the session's own transcript, so it ran on every run against the
+  session's own dead row. The dry run said "row 7, resume it in place" and the real run exited 2
+  with "`<account>` is ALREADY running session `<id>`", whose two cures are both impossible —
+  and it is the machine-restart case the feature was built for, where the surviving rows name low
+  pid numbers that are very likely in use again. The row is now proved by
+  `still_the_same_process`, exactly as `live_name` does, and only where the destination is the
+  session's own file, so `move` keeps its conservative behaviour byte for byte.
+- **`Path.glob` swallowed the PermissionError, so `revive <link>` and `find <link>` answered "no
+  transcript for that link here" about a home they could not read.** Both link rungs globbed, and
+  `Path.glob` does not raise on a directory it may not open — it yields nothing — so the
+  `except OSError` around it was dead code and a locked-out home came back as a home that does
+  not hold the file. That is the worst answer this feature can give: the person is told the
+  session they are rescuing is not on this machine. The scan is now `os.listdir` plus a stat per
+  folder (the shape `preflight`, `live_rows`, `owner_of` and `rc_job_owner` were already
+  rewritten to, measured on 3.7.9 and 3.13), unreadable folders are carried on the spec, and
+  every sentence that claimed absence names them instead.
+- **A `<synthetic>` "No response requested." line counted as the session answering, masking both
+  a usage-limit stop and a mid-turn kill as `finished`.** The CLI writes that line — no error
+  keys, model `<synthetic>` — precisely when an injected `isMeta` prompt produced **nothing**, so
+  the one line that records a non-answer was being read as the answer. A waited-out limit lost
+  its `class`, `window` and `resets_at` and the note then said the session "had answered and was
+  sitting idle"; a session killed mid-`Edit` read as finished too, which dropped the one sentence
+  M4 makes mandatory — its last tool call has no recorded result. 23 such lines in 20 of the
+  1,943 transcripts here, all with that exact text. Both readers now ask one question
+  (`answered_here`), which also fixes the other half: an `isApiErrorMessage` line whose `error` is
+  not `rate_limit` still set `scan_transcript`'s marker, so `csm list` said `out_of_quota: false`
+  about a session `csm revive` called `usage-limit`.
+- **The widened quota detection was not applied to `REMOTE_HELPER.scan`**, so `csm find` still
+  reported no quota for 10 of the 44 measured stop lines — and its `elif not err` branch actively
+  *cleared* a quota found on an earlier line. `cmd_find` promises the opposite ("one reading rule,
+  so a row found here and a row found there are the same row") and runs the helper locally too, so
+  three readers disagreed about one file. The helper now tests both shapes, and only a line that is
+  really an answer clears a quota.
+- **Nothing checked that the registry `name` the relay addresses is unique**, and csm made the
+  collisions itself. SendMessage addresses a session *by* its name; `live_rows` is keyed by local
+  id, and `rc_name` was `rc_label(<title>, "revived by csm")` truncated to 56 characters, so two
+  revives of one session — or two sessions whose titles start alike — registered under one
+  identical name. The note could then land in a conversation nobody named while `prove_turn`
+  watched the intended session and reported "it is up but idle" with no hint of the misdelivery.
+  The proved live rows of that home are now counted before anything is sent, more than one is a
+  refusal naming both, and csm's own label carries the session's id8.
+- **The at-most-once claim did not hold for the length of a revive.** `state_lock` breaks a lock
+  directory older than 120 s by its `mkdir` mtime and nothing refreshed it, while a revive holds
+  its claim across four bounded waits — a window connecting (150 s), its registry row appearing
+  (150 s), the relay (120 s), the turn (90 s), and for a fork the new transcript (150 s) — so from
+  t=120 s a concurrent `csm revive <same id>` broke a claim that was very much alive, on every
+  run. The waits now re-stamp every lock this process holds (`touch_locks`), and the revive claim
+  has its own bound, `REVIVE_CLAIM_STALE_S`; the `.claude.json` lock keeps the 120 s it was
+  written for.
+- **`relay_dir`'s docstring was wrong about where the relay's own transcript goes**, which made a
+  real fact look handled. The cwd moves the project-folder **slug**, not the home: the relay files
+  `<the session's home>/projects/<slug of the relay dir>/<its id>.jsonl`, with the note inside it.
+  So every revive left a session in `csm list`, in `csm find` and in revive's own resolution whose
+  title was the relay instruction — and one of those is revivable. That slug is now skipped by
+  `transcripts_by_id` and by the spec layer's scan, the docstring says what the 0700 mode really
+  protects (the cwd, not the transcript), and README, design.md and LESSONS.md (L48) say that the
+  note does reach disk in that home, so "no note in any file csm keeps" is not read as more than
+  it claims.
+- **`revive_state`'s `ps` sweep matched too much, twice, and each one became a hard refusal.** The
+  bridge-id arm was a plain substring, so any process running as `claude` whose command line
+  merely *mentioned* the id read as "something is running this session NOW" — the remote helper's
+  `detail()` has always required the id to follow a flag, and the test that pins it calls the other
+  shape a decoy. And `own` matched `--resume <old id>`, which a session **forked** from that id
+  carries for its whole life, so a second `csm revive <old> --new-link` was refused with "two CLIs
+  appending to one transcript" — which `revive_fork`'s own measured fact contradicts: a fork writes
+  only `<new>.jsonl` and leaves the file it read byte-identical.
+- **`tmux()` was the only subprocess call in the engine with no timeout**, and every revive wait is
+  a loop around it: `wait_window` checks its deadline only *between* captures, so one blocking tmux
+  client — a wedged server, a socket that accepts and never answers — hung the whole command past
+  `CONNECT_WAIT_S` with no bound at all, which is the one shape the no-blocking-wait rule forbids,
+  inside the command that promises bounded machine waits. `CSM_TMUX_TIMEOUT_S` (default 20) now
+  bounds it, and a timeout is a failed capture, which every caller already handles.
 - **`scan_transcript` missed roughly a quarter of real usage-limit stops, and read them as a
   clean finish.** Detection was `apiError in QUOTA_ERRORS`, but of 44 assistant quota-stop
   lines in the config homes on this machine **10 carry no `apiError` key at all** — only
@@ -246,6 +349,24 @@ deliberate change to an existing contract.
   likely to have a title at all (11% of v5 transcripts here carry an `ai-title`, against 64%
   of v4 ones). The hint names the derived transcript when a link was given, and asks for the
   link when one was not.
+- **Row 8's `action` is `resume-new-link`, not `new-link`.** The `action` strings are a public
+  vocabulary — `--json` carries them and so does every line of `revive.jsonl`, which README
+  documents as the machine-readable record — and the one value a reader would guess was actively
+  wrong: a caller filtering `action == "new-link"` got row 8, a terminal session resumed in
+  place, and never row 10, which is what the `--new-link` **flag** does and is recorded as
+  `fork`. The whole vocabulary (`refuse`, `nothing`, `wake`, `move`, `resume`,
+  `resume-new-link`, `keep-link`, `fork`) is now in the decide tables in docs/design.md,
+  README and SKILL.md.
+- **Rows 3 and 9 say what they did not carry out.** `--say` is rendered only for the rows that
+  deliver a note, so on rows 3 and 9 it was never delivered *and* never mentioned, and a `--to`
+  typed at a live-busy session was dropped in silence — row 5 already said so out loud for the
+  same reason. `--say`'s own length and leading-`!`/`/` checks have moved out of `revive_note`
+  into the plan, so `csm revive X --say "/compact now"` against a limit now reports the prefix
+  instead of exiting on the limit with the bad flag unexamined.
+- **Row 5 checks that the CLI is on PATH before it claims it will relay anything**, rather than
+  discovering it inside `relay_note` and reporting "the note was NOT delivered". It is the part
+  of the brief's `preflight(..., copy_only=True)` for the no-window rows that is actually
+  applicable; the rest is not, and docs/design.md records that deviation and why.
 - **`--version` says 0.5.0**, and `revive --help`'s `--dry-run` line no longer calls itself "the
   only mode that answers today" — it was written while only the diagnosis existed, and a flag's
   own help saying the command does nothing is the one doc nobody re-reads.
@@ -284,6 +405,19 @@ deliberate change to an existing contract.
 - `docs/design.md`: a **Revive** section (what it reads, the decide table, the one carrier, the
   proof, at-most-once, and the limits), **ten** new rows in the measured-facts table — each stamped
   2.1.312, each with its own re-verification recipe — and the revive knobs in the knob table.
+- From the review of this release: `LESSONS.md` gains **L46–L50** (a version-5 id is a server child
+  and that survives every file being gone; a `<synthetic>` "No response requested." line is the
+  record of a NON-answer; a relay's own transcript lands in the target's home and the cwd moves only
+  the slug; a registry `name` is not unique and SendMessage addresses a session by it; a lock whose
+  mtime is never touched is breakable in the middle of the work it protects). `docs/design.md` gains
+  the row→`action` mapping, the version-5 rung, the one-copy-or-a-refusal rule, where the relay's
+  transcript really goes, the name-uniqueness rule, the claim's own stale bound, and — recorded
+  rather than hidden — **the one deviation from the implementation brief**: `--from-machine` is
+  refused for `revive` rather than built, and `preflight(..., copy_only=True)` for the no-window
+  rows is not implementable as written (on row 5 its live-twin check would refuse a session that is
+  deliberately alive, which is that row's own condition), so only the part that applies is built.
+  README and SKILL.md gain `csm find`'s exit codes, `--account`, and the two refusals to pass on
+  as they are written.
 
 ## [0.4.0] — 2026-10-25
 

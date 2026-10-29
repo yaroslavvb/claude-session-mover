@@ -322,6 +322,12 @@ TMUX_SESSION = os.environ.get("CSM_TMUX_SESSION") or "csm-{name}"
 #: server: the fixtures' session names are the real ones, and on the default socket a
 #: `stop` test would kill your own windows.
 TMUX_SOCKET = os.environ.get("CSM_TMUX_SOCKET") or ""
+#: 🛑 How long one `tmux` client may take to answer. Every other subprocess call in this
+#: file carries a timeout and `tmux()` did not, while `wait_window` — the loop every revive
+#: and every move waits in — only ever checks its deadline BETWEEN captures: one blocking
+#: tmux client was an unbounded hang inside a bounded wait. Generous, because the calls are
+#: local and cheap; it is a bound, not a budget.
+TMUX_TIMEOUT_S = _env_num("CSM_TMUX_TIMEOUT_S", 20.0, float)
 #: TEST ONLY. Forces the answer of the credential-existence probe (`true` / `false` /
 #: `unknown` / `off`). It announces itself on stderr and in the log on EVERY run while it
 #: is set: a stale export must never switch a safety check off in silence.
@@ -1336,6 +1342,49 @@ def derive_local_id(spec: str) -> str:
     return str(uuidlib.uuid5(uuidlib.UUID(BRIDGE_NS), BRIDGE_NAME % bare))
 
 
+def answered_here(d: dict, m: dict) -> bool:
+    """Is this assistant line the session ANSWERING, as against recording that it did not?
+
+    🛑 TWO KINDS OF NON-ANSWER WEAR A CLEAN LINE'S CLOTHES, and both readers of a transcript
+    key "it recovered and answered again" on finding one:
+      * an `isApiErrorMessage` line whose `error` is NOT `rate_limit` — an overload, say.
+        An error that is not a limit is not the session answering again, which is what the
+        clean branch's own comment has always said while the code counted it anyway.
+      * a `<synthetic>` line reading "No response requested.", which the CLI writes
+        precisely when an injected `isMeta` prompt produced NOTHING. The one line that
+        records a non-answer was being read as the answer, which masked a usage-limit stop
+        as `finished` (losing its class, window and reset) and a mid-turn kill as `finished`
+        too (losing "its last tool call has no recorded result", the one sentence M4 makes
+        mandatory). Measured here Wed 28 Oct 2026, CLI 2.1.312: 23 such lines in 20 of the
+        1,943 transcripts in the config homes on this machine, every one of them with that
+        exact text.
+    A line with NO `model` key keeps counting as an answer: `MODEL_RE` is the test for a
+    model that is really a model, and absence is not `<synthetic>`.
+    """
+    if d.get("isApiErrorMessage"):
+        return False
+    mdl = m.get("model") if isinstance(m, dict) else None
+    if isinstance(mdl, str) and not MODEL_RE.fullmatch(mdl):
+        return False
+    return True
+
+
+def uuid_version(s: str):
+    """The uuid VERSION of a local session id, or `None` when it is not a uuid at all.
+
+    🛑 The one fact about an id that no file has to still exist for. `derive_local_id`
+    mints a Remote Control server child's local id as `uuid5` of its bridge session's api
+    url, while every other session gets a random `uuid4` — so version 5 is proof that a
+    transcript belongs to a child, read off the name alone, with nothing running, no
+    registry row and no bridge line left anywhere. `revive_kind` needs it because the four
+    places a bare bridge id is written down are all gone for a child that exited cleanly.
+    """
+    try:
+        return uuidlib.UUID(str(s or "")).version
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
 def canary_path(version: str) -> Path:
     return STATE_DIR / ("canary-%s.json" % re.sub(r"[^A-Za-z0-9._-]", "-", version or "?"))
 
@@ -1671,9 +1720,10 @@ def scan_transcript(path: Path) -> dict:
                             break
                 quota = {"error": err or str(d.get("error") or ""), "kind": kind,
                          "resets_at": resets, "message": tidy(_text_of(m), 80)}
-            elif not err:
-                # Only a CLEAN line counts: an error line names its model `<synthetic>`,
-                # and an error that is not a limit is not the session answering again.
+            elif not err and answered_here(d, m):
+                # Only a line that is really the session ANSWERING counts — `answered_here`
+                # holds the two exceptions and what each of them cost. `revive_stop` asks
+                # the same question, so the two readers cannot disagree about one file.
                 assistant_idx = i
                 mdl = m.get("model")
                 if isinstance(mdl, str) and MODEL_RE.fullmatch(mdl):
@@ -1824,10 +1874,19 @@ def transcripts_by_id(acct: Account, only=None) -> dict:
 
     `only` is a set of 8-character id prefixes, narrowing WHICH ids are read and nothing
     else, so a row from a narrowed call is identical to one from a full scan.
+
+    🛑 CSM'S OWN RELAY TRANSCRIPTS ARE NOT SESSIONS. Every `revive` runs a `claude -p` relay
+    in `relay_dir()`, and the CLI files that run's own transcript under the project folder of
+    its cwd — inside the revived session's home (see `relay_dir`). Left in, each revive added
+    a row to `csm list`, to `csm find` and to revive's own resolution whose title was the
+    relay instruction, and `csm revive` would happily have revived one. One folder name is
+    skipped, by the slug alone: no file in it is opened, and a transcript a person really put
+    there is not something this tool goes near either.
     """
+    skip = relay_slug()
     try:
         cands = [(p.stat().st_mtime, p) for p in acct.projects.glob("*/*.jsonl")
-                 if p.is_file()]
+                 if p.parent.name != skip and p.is_file()]
     except OSError:
         cands = []
     by_id = {}
@@ -2189,6 +2248,10 @@ class Spec:
     #: in — the second is what a refusal has to name, so the reader knows what was asked.
     homes: list = field(default_factory=list)
     searched: list = field(default_factory=list)
+    #: 🛑 The folders that would not OPEN while looking for the derived transcript. They are
+    #: the difference between "no home here holds it" and "this is what could not be read",
+    #: and every sentence that would otherwise claim absence names them instead.
+    unread: list = field(default_factory=list)
     canary: dict = field(default_factory=dict)
 
     @property
@@ -2197,6 +2260,47 @@ class Spec:
         if self.bare:
             return "session_" + self.bare
         return "that spacesheep session page" if self.link else self.typed
+
+
+def home_copies(acct: Account, name: str, unread: list = None) -> list:
+    """Every `projects/*/<name>` this home really holds. Unreadable folders go in `unread`.
+
+    🛑 `os.listdir` AND A STAT PER FOLDER, NOT `glob`. `Path.glob` swallows the
+    PermissionError its own scan raises and yields nothing, so a project folder — or a whole
+    `projects/` tree — this process may not read came back as "this home does not hold it",
+    and the two callers then said so out loud: `resolve_spec` dropped the home from
+    `Spec.homes`, and `pick_resolved` and `cmd_find` printed "nothing under <homes> holds it"
+    about a directory they had never been allowed to open. For `revive` that is the worst
+    answer the feature can give — the person is told the session they are rescuing is not on
+    this machine. `preflight` measured the same thing on 3.7.9 and 3.13 and was rewritten for
+    it; this is the spec layer's copy of that rule. "Could not look" is never a verdict, so a
+    folder that would not open is recorded rather than dropped.
+    """
+    out = []
+    try:
+        folders = sorted(os.listdir(str(acct.projects)))
+    except FileNotFoundError:
+        return out                   # nothing has ever run in this home: a measurement
+    except OSError as e:
+        if unread is not None:
+            unread.append("%s (%s)" % (tilde(acct.projects), e.__class__.__name__))
+        return out
+    skip = relay_slug()
+    for n in folders:
+        if n == skip:
+            continue                   # csm's own relay litter, never a session
+        p = acct.projects / n / name
+        try:
+            # `lstat_kind`, not `is_file`: from 3.14 `is_file` answers False on a
+            # permission error too. ENOTDIR reads as not there, which is right.
+            mode = lstat_kind(p)
+        except OSError as e:
+            if unread is not None:
+                unread.append("%s (%s)" % (tilde(p.parent), e.__class__.__name__))
+            continue
+        if mode is not None and statmod.S_ISREG(mode):
+            out.append(p)
+    return out
 
 
 def resolve_spec(spec: str, accts: list) -> Spec:
@@ -2223,13 +2327,12 @@ def resolve_spec(spec: str, accts: list) -> Spec:
     out.link, out.bare, out.derived = True, bare_bridge_id(typed), derived
     for a in accts:
         out.searched.append(a.label)
-        try:
-            # `glob`, not `is_file` on a guessed folder: one id can sit in several project
-            # folders of one home (a folder reached through a symlink is a second slug).
-            if any(p.is_file() for p in a.projects.glob("*/" + derived + ".jsonl")):
-                out.homes.append(a.label)
-        except OSError:
-            continue
+        # Every project folder, not one guessed from the cwd: one id can sit in several
+        # folders of one home (a folder reached through a symlink is a second slug). And
+        # `home_copies`, not `glob` — see its 🛑: a home that could not be read must not
+        # come back as a home that does not hold it.
+        if home_copies(a, derived + ".jsonl", out.unread):
+            out.homes.append(a.label)
     if out.homes:
         out.pin = derived
     out.canary = canary()
@@ -2245,6 +2348,10 @@ def spec_notes(sp: Spec) -> list:
         out.append("resolved from the link: %s is the transcript %s names, in %s "
                    "(computed from the link, not looked up — nothing has to be running)"
                    % (sp.derived[:8], sp.what, ", ".join(sp.homes)))
+    if sp.unread:
+        out.append("⚠ not every home could be read while looking for %s: %s — so "
+                   "\"nowhere here holds it\" is not a thing this run can say"
+                   % (sp.derived[:8] or sp.what, "; ".join(sp.unread[:3])))
     c = sp.canary or {}
     if sp.bare and c.get("ok") is not True:
         # 🛑 NEVER A SILENT PASS. The derivation is still used — it is the only way to this
@@ -2282,6 +2389,17 @@ def pick_resolved(sp: Spec, rows: list, soft: bool = False):
     if soft:
         return None
     looked = ", ".join(sp.searched) or "no account home"
+    if sp.unread:
+        # 🛑 "COULD NOT LOOK" IS NEVER A VERDICT. The derived name is exact, so a miss would
+        # normally be proof of absence — but a `projects/` folder that would not open yields
+        # nothing and looks exactly like a folder that does not hold the file, and saying
+        # "it is not on this machine" about the session somebody is trying to rescue is the
+        # worst answer this command has. So the folders are named and nothing is claimed.
+        die("could not finish looking for that link here: %s names %s, and %s would not "
+            "open — so whether a home here holds it is UNREAD, not no. Fix those "
+            "permissions and run this again, or look with `csm find %s`%s"
+            % (sp.what, sp.derived, "; ".join(sp.unread[:3]), shlex.quote(sp.typed),
+               "".join("; " + n for n in spec_notes(sp) if not n.startswith("⚠ not"))))
     die("no transcript for that link here: %s names %s, and nothing under %s on %s holds "
         "it. It may be on another machine (`csm find %s --on M`), or belong to a session "
         "this machine never ran. A link is never matched by part of an id or by title — "
@@ -3322,16 +3440,28 @@ def scan(p):
         m = d.get("message")
         if t == "assistant" and isinstance(m, dict):
             err = d.get("apiError") or m.get("apiError")
-            if err in QUOTA:
+            # ONE READING RULE, HERE TOO. `cmd_find` promises that a row found on this
+            # machine and a row found on another are the same row, and it runs this helper
+            # for both — so the engine's two quota shapes have to be this helper's two as
+            # well. 10 of the 44 real stop lines measured here carry no `apiError` at all,
+            # only `isApiErrorMessage` + `error: "rate_limit"`, and reading those as clean
+            # both missed the limit AND cleared one found earlier in the file.
+            mdl = m.get("model")
+            real_model = not isinstance(mdl, str) or bool(
+                re.match(r"^[A-Za-z0-9][A-Za-z0-9._\[\]-]{1,63}$", mdl))
+            if err in QUOTA or (d.get("isApiErrorMessage")
+                                and d.get("error") == "rate_limit"):
                 c = m.get("content")
                 txt = ""
                 if isinstance(c, list):
                     txt = " ".join(str(x.get("text") or "") for x in c if isinstance(x, dict))
-                info["quota"] = (txt or err)[:120]
-            elif not err:
+                info["quota"] = (txt or err or d.get("error") or "rate_limit")[:120]
+            elif not err and not d.get("isApiErrorMessage") and real_model:
+                # Only a line that is really the session ANSWERING clears a quota found
+                # earlier: an error that is not a limit is not an answer, and neither is a
+                # `<synthetic>` "No response requested." line.
                 info["quota"] = ""
-                mdl = m.get("model")
-                if isinstance(mdl, str) and re.match(r"^[A-Za-z0-9][A-Za-z0-9._\[\]-]{1,63}$", mdl):
+                if isinstance(mdl, str) and real_model:
                     info["model"] = mdl
     return info
 
@@ -4563,8 +4693,23 @@ def tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess:
         # it ever opens, for the life of the server, so it gets the scrubbed one: run from
         # inside an agent, it would otherwise carry that session's identity into unrelated
         # windows that anyone opens later.
-        r = subprocess.run(argv, capture_output=True, text=True,
+        # 🛑 AND A TIMEOUT, like every other subprocess call in this file. `wait_window`
+        # checks its deadline only BETWEEN `capture-pane` calls, so one tmux client that
+        # blocks — a wedged server, a socket that accepts and never answers — hung the whole
+        # command past CONNECT_WAIT_S with no bound at all: the one shape his 13 Oct 2026
+        # rule forbids, inside the command that promises bounded machine waits. A timeout is
+        # a failed capture, which every caller already handles, and `wait_window` then ends
+        # on its own deadline.
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=TMUX_TIMEOUT_S,
                            env=scrubbed_env(dict(os.environ)))
+    except subprocess.TimeoutExpired:
+        if check:
+            die("tmux %s did not answer within %ds: the tmux server may be wedged "
+                "(`tmux -L %s kill-server` clears it)"
+                % (" ".join(args[:2]), int(TMUX_TIMEOUT_S), TMUX_SOCKET or "default"))
+        return subprocess.CompletedProcess(list(args), 127, "",
+                                           "tmux did not answer within %ds"
+                                           % int(TMUX_TIMEOUT_S))
     except OSError as e:
         if check:
             die(f"cannot run tmux ({e})")
@@ -4734,8 +4879,37 @@ def preflight(s: Session, tgt: Account, mode: str, accts=None, mirror: bool = Fa
         # rather than a note, because the thing that cannot be ruled out is two CLIs
         # appending to one file. Same doctrine as `owner_of` and `login_check`: "could not
         # look" is never a verdict.
+        # 🛑 AND FOR AN IN-PLACE START THE ROW IS PROVED, NOT BELIEVED. For a move `dest` is
+        # a file in ANOTHER home and this branch is rare, so an unprovable row there stays a
+        # blocker — "could not look" is never a verdict, and it cuts toward refusing. For a
+        # revive in place `dest` IS the session's own transcript, so `dest_there` is always
+        # true and this check runs on every single run, against the session's OWN dead row:
+        # after the machine restart this whole feature exists for, those rows name low pid
+        # numbers that are very likely in use again. Believing one refused the revive with
+        # "<account> is ALREADY running session <id>" — two cures that are both impossible —
+        # one screen below a diagnosis that had already called the session dead and said
+        # why. `revive_state` proves the same row with `still_the_same_process`; so does
+        # this, by the same probe `live_name` builds.
         blind = []
-        owner, twin = tgt.label, live_rows(tgt, blind).get(s.local_id)
+        in_place = same_path(dest, s.transcript)
+
+        def proved_twin(a):
+            r = live_rows(a, blind).get(s.local_id)
+            if not isinstance(r, dict) or not in_place:
+                return r
+            probe = Session(account=a, local_id=s.local_id, transcript=dest, mtime=0.0,
+                            pid=int(r.get("pid") or 0),
+                            proc_start=str(r.get("procStart") or ""),
+                            status=str(r.get("status") or ""))
+            ok, why = still_the_same_process(probe)
+            if ok:
+                return r
+            log("preflight: %s's registry row for %s names pid %s but cannot be proved, so "
+                "it is a stale row and not a live twin: %s"
+                % (a.label, s.short, r.get("pid"), why))
+            return None
+
+        owner, twin = tgt.label, proved_twin(tgt)
         if not twin:
             # 🛑 WITH ONE SHARED `projects/` THE OWNER CAN BE A THIRD HOME. `dest` is then
             # the only copy on the machine, so the process writing it need not be in the
@@ -4756,7 +4930,7 @@ def preflight(s: Session, tgt: Account, mode: str, accts=None, mirror: bool = Fa
             for a in other_homes(s, tgt, accts):
                 if not same_path(a.projects, tgt.projects):
                     continue
-                r = live_rows(a, blind).get(s.local_id)
+                r = proved_twin(a)
                 if r:
                     owner, twin = a.label, r
                     break
@@ -5059,6 +5233,28 @@ def clear_first_run(tgt: Account, cwd: str, apply: bool) -> list:
 STATE_LOCK_WAIT_S = _env_num("CSM_LOCK_WAIT", 2.0, float)
 STATE_LOCK_STALE_S = 120.0
 
+#: 🛑 EVERY LOCK THIS PROCESS HOLDS, so a long bounded wait can keep its own claim fresh.
+#: The stale break reads a lock directory's mtime, and `os.mkdir` stamps it once — so a
+#: claim held across four waits was, from the moment the first one passed the bound, a
+#: directory that looked abandoned while the thing it protects was very much running.
+HELD_LOCKS = []
+
+
+def touch_locks() -> None:
+    """Re-stamp every lock directory this process holds. Called from the polling waits.
+
+    A heartbeat, not a renewal: the lock is the same directory and the same owner, and what
+    moves is its mtime — which is the only thing another process's stale break can read.
+    Failures are ignored on purpose; a lock whose mtime cannot be written is a lock another
+    process may break, and that is the behaviour this replaces, not a new risk.
+    """
+    now = time.time()
+    for lk in list(HELD_LOCKS):
+        try:
+            os.utime(str(lk.path), (now, now))
+        except OSError:
+            pass
+
 
 class state_lock(object):
     """The CLI's own `<file>.lock` directory, held for the shortest possible window.
@@ -5076,9 +5272,14 @@ class state_lock(object):
     `held` says which of the two happened.
     """
 
-    def __init__(self, p):
+    def __init__(self, p, stale: float = 0.0):
         self.path = Path(str(p) + ".lock")
         self.held = False
+        # ⚠️ `stale` is HOW LONG THIS PARTICULAR LOCK MAY GO UNTOUCHED, because the two
+        # callers hold it for wildly different spans: 120 s is right for a
+        # read-modify-replace of `.claude.json`, and far shorter than any one of the four
+        # bounded waits a revive holds its claim across.
+        self.stale = float(stale or STATE_LOCK_STALE_S)
 
     def __enter__(self):
         deadline = time.time() + max(0.0, STATE_LOCK_WAIT_S)
@@ -5086,13 +5287,14 @@ class state_lock(object):
             try:
                 os.mkdir(str(self.path))
                 self.held = True
+                HELD_LOCKS.append(self)
                 return self
             except FileExistsError:
                 try:
                     age = time.time() - os.stat(str(self.path)).st_mtime
                 except OSError:
                     age = 0.0
-                if age > STATE_LOCK_STALE_S:
+                if age > self.stale:
                     try:
                         os.rmdir(str(self.path))        # abandoned by a dead writer
                         continue
@@ -5109,6 +5311,10 @@ class state_lock(object):
             try:
                 os.rmdir(str(self.path))
             except OSError:
+                pass
+            try:
+                HELD_LOCKS.remove(self)
+            except ValueError:
                 pass
         self.held = False
         return False
@@ -5728,6 +5934,8 @@ def wait_window(sess: str, win: str, seconds: float, want_link: bool, perm: str)
         answer_prompt(target, pane, perm, tries)
         if not want_link and time.time() >= start + SETTLE_S:
             return "", pane, True
+        # ⚠️ A claim held across this wait must not look abandoned to the next `csm revive`.
+        touch_locks()
         time.sleep(POLL_S)
     return "", pane, not want_link
 
@@ -6516,6 +6724,19 @@ def revive_kind(s: Session, bare: str = "") -> dict:
       * `desktop` — the desktop app's own session, which the app's index knows.
       * `terminal` — neither: a plain `claude` in a terminal, with a random v4 id.
 
+    🛑 AND A VERSION-5 LOCAL ID IS A SERVER CHILD EVEN WHEN NOTHING SAYS WHICH ONE. The
+    four sources above are the only places the bare bridge id is written down, and a DEAD
+    child named by its own local id or by part of its title has none of them: no registry
+    row, no bridge id in its own transcript, and no `bridge-spawn` dir once it exited
+    cleanly. It used to fall through to `terminal` here, and `terminal` takes decide row 8
+    — `--resume <old id>` with no `--fork-session`, a second process on the old local id,
+    which is exactly what LESSONS.md L39 forbids. The id's own uuid VERSION settles it
+    without needing the link at all: `derive_local_id` mints a child's id as `uuid5`, while
+    a plain `claude` gets a random v4. Measured on this machine, CLI 2.1.312, Wed 28 Oct
+    2026: of 861 version-5 transcripts in the config homes here, 2 name their bridge
+    session in their own file and 19 have a live row or a `bridge-spawn` dir — so 840 of
+    them reached that fall-through.
+
     🛑 NEVER `entrypoint`. The registry's `entrypoint` looks like the answer and is not:
     measured on CLI 2.1.312, Wed 28 Oct 2026, it is a property of HOW the process was
     started (`sdk-cli` means `--print`), and a fork or a resume rewrites it — so a revived
@@ -6546,6 +6767,17 @@ def revive_kind(s: Session, bare: str = "") -> dict:
         out["kind"], out["from"] = "desktop", "the desktop app's index"
         out["bridge_id"] = s.bridge_id or bare
         out["why"] = "the desktop app's own session index knows this session"
+        return out
+    if uuid_version(s.local_id) == 5:
+        # The bridge id stays EMPTY on purpose: both candidates (`s.bridge_id` and `bare`)
+        # were already tried against the derivation above, so neither is this session's.
+        # A kind with no link is honest and still safe — row 9 asks for the link and row
+        # 10 (`--new-link`) forks, which needs no link at all.
+        out["kind"], out["from"] = "server-child", "its own id"
+        out["why"] = ("%s is a version-5 uuid, which only a Remote Control server child's "
+                      "local id ever is — but nothing here still says WHICH claude.ai "
+                      "session (no live row, no bridge line in its transcript, no "
+                      "bridge-spawn dir), so its link is unknown" % s.short)
         return out
     out["bridge_id"] = s.bridge_id or bare
     out["why"] = ("nothing ties %s to a claude.ai session: no derivation, no bridge line, "
@@ -6578,11 +6810,31 @@ def revive_state(s: Session, bare: str = "") -> dict:
     # ⚠️ `bare` is the PROVED bridge id (`revive_kind`), which for a dead server child comes
     # from the link and is in no file csm read — so taking it from `s.bridge_id` alone would
     # sweep for a name nothing carries, in exactly the case this sweep exists for.
-    cse = "cse_" + (bare or s.bridge_id) if (bare or s.bridge_id) else ""
+    bare = bare or s.bridge_id
+    # 🛑 AFTER A FLAG, NOT ANYWHERE IN THE LINE. The bridge-id arm used to be a plain
+    # substring, so any process running as `claude` whose command line merely MENTIONED the
+    # id — the id inside a path, a log name, an argument about it — read as "something is
+    # running this session NOW", which `revive_start` turns into a hard refusal. The
+    # REMOTE_HELPER's `detail()` has required the id to follow a flag that means "this is my
+    # session" from the start, and the test that pins it calls the other shape a decoy; this
+    # is the same rule on this side.
+    cse = (re.compile(r"--(?:resume|session-id|sdk-url)[= ]\S*cse_" + re.escape(bare)
+                      + r"\b") if bare else None)
+    # 🛑 AND A FORK'S `--resume <old id>` IS NOT A WRITER. `claude_argv` ends a fork with
+    # `--resume <old> --fork-session --session-id <new>`, and that stays in its argv for the
+    # whole life of the window — so `own` matched it and a second `csm revive <old>
+    # --new-link` was refused with "two CLIs appending to one transcript", which `revive_fork`
+    # itself contradicts: measured on 2.1.312, Wed 28 Oct 2026, a fork writes exactly
+    # `<new>.jsonl` and leaves the file it read byte-identical. A process that carries
+    # `--fork-session` READ this transcript; it never writes it.
+    forked = re.compile(r"--fork-session\b")
     for pid, cmd in sorted((rows or {}).items()):
         if not is_claude_exe(cmd):
             continue
-        if own.search(cmd) or (cse and cse in cmd):
+        hit = own.search(cmd) or (cse and cse.search(cmd))
+        if hit and forked.search(cmd) and not (cse and cse.search(cmd)):
+            continue
+        if hit:
             out["ps"].append({"pid": pid, "cmd": cmd[:160]})
     if not s.pid:
         out["why"] = "no config home here has a registry row for it"
@@ -6716,12 +6968,12 @@ def revive_stop(path: Path, tail: int = 0) -> dict:
             results |= set(x for x in _tool_results(d) if x)
         if t != "assistant" or not isinstance(d.get("message"), dict):
             continue
-        last_asst = d
         m = d["message"]
         err = d.get("apiError") or m.get("apiError")
         is_quota = err in QUOTA_ERRORS or (d.get("isApiErrorMessage")
                                            and d.get("error") == "rate_limit")
         if is_quota:
+            last_asst = d
             p = d.get("apiErrorParams") or m.get("apiErrorParams") or {}
             rl = p.get("rate_limit_info") if isinstance(p, dict) else None
             rl = rl if isinstance(rl, dict) else {}
@@ -6743,16 +6995,22 @@ def revive_stop(path: Path, tail: int = 0) -> dict:
                      "clears_with_time": clears, "message": tidy(txt, 120),
                      "error": err or str(d.get("error") or ""), "at": _stamp(d)}
         elif err or d.get("isApiErrorMessage"):
+            last_asst = d
             api_err = {"i": i, "kind": str(err or d.get("error") or "an error"),
                        "message": tidy(_text_of(m), 120), "at": _stamp(d)}
-        else:
+        elif answered_here(d, m):
             # 🛑 A CLEAN LINE AFTER THE ERROR MEANS IT RECOVERED. One prompt's turn can hit
             # a limit, wait, and answer anyway (2.1.312 auto-continues at a usage limit when
             # the session is interactive), so the error being IN the window is not the
             # session stopping there. `scan_transcript` keeps the same rule for the same
-            # reason, and an error line is never a clean line: it names its model
-            # `<synthetic>`.
+            # reason.
+            # 🛑 BUT A `<synthetic>` LINE IS NOT ONE. "No response requested." is what the
+            # CLI writes when an injected prompt produced nothing, so counting it here read
+            # a waited-out limit and a mid-turn kill as `finished` — see `answered_here`.
+            # And `pending` is taken from `last_asst`, so the same line stole the tool name
+            # out of the mid-turn warning: it is not the last assistant line either.
             clean_i = i
+            last_asst = d
     if not main:
         out["stop"] = "empty"
         out["why"] = ("nothing in the last %s of %s is a line of the main conversation: "
@@ -7119,6 +7377,25 @@ def no_command_prefix(text: str, what: str) -> None:
             "space is not enough — the CLI strips it)" % (what, first))
 
 
+def check_say(say: str) -> None:
+    """🛑 WHAT `--say` MAY CARRY, checked on EVERY row and not only the ones that send it.
+
+    This used to live inside `revive_note`, which `revive_plan` builds for rows 5, 6, 7, 8
+    and 10 only — so `csm revive X --say "/compact now"` against a session that was still
+    inside its limit exited 2 on the limit and never said a word about the prefix the CLI
+    would have run as a command. A flag is either wrong or it is not; which row the session
+    happens to take is not what decides.
+    """
+    say = (say or "").strip()
+    if not say:
+        return
+    if len(say) > REVIVE_SAY_MAX:
+        die("--say is %d characters and the limit is %d: this text is quoted verbatim "
+            "into the session's own next turn, so it is refused rather than shortened"
+            % (len(say), REVIVE_SAY_MAX))
+    no_command_prefix(say, "--say")
+
+
 def revive_note(s: Session, rec: dict, action: str, tgt: Account = None, say: str = "",
                 new_id: str = "", when: str = "", boot: float = None) -> str:
     """THE REVIVE NOTE: what a revived session is told, as its next user turn.
@@ -7142,12 +7419,7 @@ def revive_note(s: Session, rec: dict, action: str, tgt: Account = None, say: st
     stop = rec.get("stop") or {}
     lost = rec.get("lost_work") or {}
     say = (say or "").strip()
-    if say:
-        if len(say) > REVIVE_SAY_MAX:
-            die("--say is %d characters and the limit is %d: this text is quoted verbatim "
-                "into the session's own next turn, so it is refused rather than shortened"
-                % (len(say), REVIVE_SAY_MAX))
-        no_command_prefix(say, "--say")
+    check_say(say)
     head = ("[claude-session-mover — written by the tool; the user did not type this] "
             "Revived at %s on `%s`." % (when, machine()))
     reason = {
@@ -7181,7 +7453,7 @@ def revive_note(s: Session, rec: dict, action: str, tgt: Account = None, say: st
                 "restarted and the claude.ai link is unchanged.",
         "resume": "csm resumed it in place, in the same account, on the same claude.ai "
                   "session: the link you had still opens this conversation.",
-        "new-link": "csm resumed it in place; it was not a Remote Control session before, "
+        "resume-new-link": "csm resumed it in place; it was not a Remote Control session before, "
                     "so it has a NEW claude.ai link and nothing opens the old one.",
         "fork": "csm FORKED it: this copy is %s, forked from %s. The old link still opens "
                 "the OLD copy, which is a second conversation with the same past — do not "
@@ -7294,6 +7566,18 @@ RELAY_NAME = os.environ.get("CSM_RELAY_NAME") or "csm revive ({machine})"
 #: `busy`, or an assistant line appearing past the byte offset taken before the relay. A
 #: bounded machine wait; when it passes without proof the exit code is 1, never 0.
 REVIVE_PROVE_S = _env_num("CSM_REVIVE_PROVE_S", 90.0, float)
+#: 🛑 HOW LONG A REVIVE'S OWN CLAIM MAY GO UNTOUCHED before another revive breaks it. The
+#: `.claude.json` lock keeps `STATE_LOCK_STALE_S` (120 s): it is held for a
+#: read-modify-replace. A revive's claim is held from the diagnosis to the proof, and that
+#: span is the SUM of its own bounded waits — a window connecting, its registry row
+#: appearing, the relay, the turn, and for a fork the new transcript too: 150 + 150 + 120 +
+#: 90 (+150) = up to 660 s. At 120 s a second `csm revive <same id>` was therefore breaking
+#: a claim that was very much alive, from t=120 s onward, on every single run — and the
+#: machine-wide `ps` re-check that still caught the second window runs on rows 7, 8 and 10
+#: only. `touch_locks` keeps the mtime fresh inside each wait; this is the bound for the
+#: gaps between them, with one spare `CONNECT_WAIT_S` of headroom.
+REVIVE_CLAIM_STALE_S = (3 * CONNECT_WAIT_S + RELAY_TIMEOUT_S + REVIVE_PROVE_S
+                        + CONNECT_WAIT_S)
 #: 🛑 One JSON record per revive, 0600. It holds what was decided and what ran — and NOT the
 #: note: the note is conversation text, and this file is a record of actions. The at-most-once
 #: triple `(local id, bridge id, transcript size at diagnosis)` is in every record, because
@@ -7324,13 +7608,21 @@ def relay_name() -> str:
 def relay_dir() -> Path:
     """The folder the relay RUNS IN — csm's own, under the state dir.
 
-    🛑 NEVER the revived session's own folder. A `claude -p` run files a transcript of its
-    own under the project folder of whatever directory it ran in, so a relay run in the
-    session's cwd would drop a second, unrelated transcript beside the one being revived, in
-    the same home, and every listing of that folder would carry it. Here it lands under
-    csm's own directory, where it is this tool's litter and nobody else's.
-    ⚠️ 0700, like `CAPTURES`: a relay's own transcript holds the note, which is conversation
-    text.
+    🛑 THE CWD MOVES THE SLUG, NOT THE HOME. A `claude -p` run files a transcript of its own
+    under the project folder of whatever directory it ran in — so what this buys is that the
+    relay's transcript lands under `projects/<slug of STATE_DIR/relay>/` instead of beside
+    the transcript being revived, in `projects/<slug of the session's cwd>/`. It is still
+    inside the revived session's own config home, written by the CLI with the CLI's own
+    permissions, and it still holds the note: `revive`'s "no note in any file csm keeps" rule
+    (`revive_record`, `revive_json`) is about the files CSM writes, and was never a claim
+    that the note reaches no disk at all. LESSONS.md says so out loud.
+    ⚠️ 0700 all the same, like `CAPTURES`. What it protects is this directory — any stdout,
+    stderr or scratch a relay run leaves in its cwd — and NOT the transcript, which is in
+    the home.
+    🛑 AND THE SLUG IS KEPT OUT OF EVERY LISTING (`RELAY_SLUG`, read by `transcripts_by_id`).
+    Without that, each revive left a session in `csm list`, `csm find` and revive's own
+    resolution whose title was the relay instruction — "Use the SendMessage tool exactly
+    once, then stop…" — and one of those is revivable.
     """
     d = STATE_DIR / "relay"
     d.mkdir(parents=True, exist_ok=True)
@@ -7339,6 +7631,15 @@ def relay_dir() -> Path:
     except OSError:
         pass
     return d
+
+
+def relay_slug() -> str:
+    """The project-folder name the CLI gives `relay_dir()`: every non-alphanumeric to `-`.
+
+    🛑 The CLI's own rule, and the one string that lets `transcripts_by_id` recognise csm's
+    own litter without reading a single line of it.
+    """
+    return re.sub(r"[^A-Za-z0-9]", "-", str(STATE_DIR / "relay"))
 
 
 def relay_instruction(name: str, note: str) -> str:
@@ -7483,6 +7784,55 @@ def live_name(acct: Account, local_id: str, transcript: Path) -> dict:
     return out
 
 
+def name_twins(acct: Account, local_id: str, name: str) -> list:
+    """Other PROVED live sessions in this home that answer to the same `name`.
+
+    🛑 THE RELAY ADDRESSES A SESSION BY ITS NAME, and nothing makes a name unique. `live_rows`
+    is keyed by local id, so two rows can carry one `name` and `relay_note` would hand
+    SendMessage a word that names both — a message in his conversation that he did not type,
+    in the wrong conversation, while `prove_turn` watches the INTENDED session and reports
+    "it is up but idle" with no hint that anything was mis-delivered.
+
+    🛑 AND CSM USED TO MAKE THE COLLISION ITSELF: `rc_name` was `rc_label(<title>, "revived
+    by csm")`, truncated to ≤ 56 characters, so two revives of one session — or two sessions
+    whose titles start alike — registered under one identical name. The id8 is in that tail
+    now, which closes the half csm controls; this closes the half it does not.
+
+    The pid is PROVED, like everywhere else a row is trusted: a registry file outlives its
+    process, and a dead row that happens to share the name is not a second answerer.
+    """
+    out = []
+    if not name:
+        return out
+    for sid, r in sorted((live_rows(acct) or {}).items()):
+        if sid == local_id or not isinstance(r, dict):
+            continue
+        if str(r.get("name") or "") != name:
+            continue
+        # ⚠️ The transcript is not part of the proof (`still_the_same_process` compares the
+        # pid's start time and nothing else), so the home stands in for a path this
+        # function has no reason to go looking for.
+        probe = Session(account=acct, local_id=sid, transcript=acct.home, mtime=0.0,
+                        pid=int(r.get("pid") or 0),
+                        proc_start=str(r.get("procStart") or ""),
+                        status=str(r.get("status") or ""))
+        ok, _why = still_the_same_process(probe)
+        if ok:
+            out.append(sid)
+    return out
+
+
+def ambiguous_name_why(acct: Account, local_id: str, name: str, twins: list) -> str:
+    """The one sentence an ambiguous relay target gets, wherever it is caught."""
+    return ("its registry row's name “%s” is not unique in %s — %d other live session%s "
+            "answer%s to it (%s), and SendMessage addresses a session BY its name, so the "
+            "note would go to whichever one answered. Nothing was sent. Give this one a "
+            "name of its own (`csm revive <spec> --name <label>`), or stop the other%s"
+            % (name, acct.label, len(twins), "" if len(twins) == 1 else "s",
+               "s" if len(twins) == 1 else "", ", ".join(t[:8] for t in twins),
+               "" if len(twins) == 1 else "s"))
+
+
 def wait_for_live(acct: Account, local_id: str, transcript: Path, seconds: float) -> dict:
     """Poll for that proved row until it carries a `name`; `{}` when it never did.
 
@@ -7498,6 +7848,8 @@ def wait_for_live(acct: Account, local_id: str, transcript: Path, seconds: float
             return row
         if time.time() >= deadline:
             return row
+        # ⚠️ A claim held across this wait must not look abandoned to the next `csm revive`.
+        touch_locks()
         time.sleep(POLL_S)
 
 
@@ -7524,6 +7876,8 @@ def wait_for_transcript(acct: Account, local_id: str, seconds: float):
                 continue
         if time.time() >= deadline:
             return None
+        # ⚠️ A claim held across this wait must not look abandoned to the next `csm revive`.
+        touch_locks()
         time.sleep(POLL_S)
 
 
@@ -7587,6 +7941,8 @@ def prove_turn(acct: Account, local_id: str, dest: Path, after: int,
             out["how"] = ("nothing within %ds: its registry row never went busy and nothing "
                           "was appended past %d bytes" % (int(seconds), after))
             break
+        # ⚠️ A claim held across this wait must not look abandoned to the next `csm revive`.
+        touch_locks()
         time.sleep(POLL_S)
     out["seconds"] = round(time.time() - t0, 1)
     return out
@@ -7669,9 +8025,14 @@ def revive_record(s: Session, rec: dict, dec: dict, result: dict) -> None:
 #: conditions in this order and the FIRST match wins, which is the whole contract — a
 #: session that is both out of quota and dead is answered about the quota, because starting
 #: it would spend the next turn hitting the same wall.
+#: ⚠️ THE `action` STRINGS ARE A PUBLIC VOCABULARY: `--json` carries them and so does every
+#: line of `revive.jsonl`, which README documents as the machine-readable record. They are
+#: listed in docs/design.md beside the table, and row 8's was renamed for this build: it was
+#: `new-link`, which read like the `--new-link` FLAG while the flag takes row 10 (`fork`),
+#: so a caller filtering `action == "new-link"` matched a resume in place and never a fork.
 REVIVE_ROWS = {
     1: ("refuse", 2), 2: ("refuse", 2), 3: ("nothing", 0), 4: ("refuse", 2),
-    5: ("wake", 0), 6: ("move", 0), 7: ("resume", 0), 8: ("new-link", 0),
+    5: ("wake", 0), 6: ("move", 0), 7: ("resume", 0), 8: ("resume-new-link", 0),
     9: ("keep-link", 0), 10: ("fork", 0),
 }
 #: Which rows deliver the revive note. Rows 1, 2 and 4 refuse, row 3 has nothing to say to
@@ -7697,11 +8058,26 @@ def revive_decide(rec: dict, args, tgt: Account = None) -> dict:
     out = {"row": 0, "action": "refuse", "exit": 2, "what": "", "risk": "",
            "cures": [], "refusal": "", "note": False}
 
+    def dropped(row):
+        """🛑 A FLAG THAT WAS NOT CARRIED OUT SAYS SO. Row 5's author wrote this clause for
+        `--to` and rows 3 and 9 are the same case unapplied: `--say` is only rendered for
+        `REVIVE_ROWS_WITH_NOTE`, so on rows 3 and 9 it was never delivered and never
+        mentioned, and a `--to` typed at a live-busy session was dropped in silence too.
+        """
+        bits = []
+        if to and row != 6:
+            bits.append("move it to %s" % (tgt.label if tgt else to))
+        if (getattr(args, "say", "") or "").strip() and row not in REVIVE_ROWS_WITH_NOTE:
+            bits.append("pass on what you said (nothing is being sent a note on this row)")
+        return (", and NOT " + " or ".join(bits)) if bits else ""
+
     def take(row, what, risk="", refusal="", cures=()):
         out["row"], out["what"], out["risk"] = row, what, risk
         out["action"], out["exit"] = REVIVE_ROWS[row]
         out["refusal"], out["cures"] = refusal, list(cures)
         out["note"] = row in REVIVE_ROWS_WITH_NOTE
+        if row in (3, 9):
+            out["what"] = what + dropped(row)
         return out
 
     if own.get("owner"):
@@ -7769,10 +8145,19 @@ def revive_decide(rec: dict, args, tgt: Account = None) -> dict:
                     "of exposure, not a restoration")
     if kind == "server-child" and not getattr(args, "new_link", False):
         up = srv.get("up")
-        return take(9, "nothing is started: open %s and say continue — its server respawns "
-                    "it on open%s" % (sess.get("url") or "its link",
-                                      "" if up else " (and its server is %s)"
-                                      % ("down" if up is False else "unread")),
+        srv_tail = ("" if up else " (and its server is %s)"
+                    % ("down" if up is False else "unread"))
+        if sess.get("url"):
+            what = ("nothing is started: open %s and say continue — its server respawns "
+                    "it on open%s" % (sess["url"], srv_tail))
+        else:
+            # 🛑 NO LINK TO PRINT, so none is invented. The kind was proved from the id's
+            # own uuid version and nothing here records which claude.ai session it is, so
+            # the two things that DO work are what the reader is given.
+            what = ("nothing is started: it is a server child whose claude.ai link nothing "
+                    "here records — paste the link (`csm revive <link>`), or `--new-link` "
+                    "to fork it onto a new one%s" % srv_tail)
+        return take(9, what,
                     "a server child cannot be resumed onto its own link; the cure that "
                     "does not need you is `--new-link`, which forks")
     if kind == "server-child":
@@ -7899,22 +8284,62 @@ def revive_row(sp: Spec, accts: list):
 
     Only ever reached for a spec that named ONE whole id (typed or derived), never for a
     title or a prefix: this is not another rung of the ladder.
+
+    🛑 AND EVERY HOME IS ASKED, NOT THE FIRST ONE THAT ANSWERS. A move is a COPY, so one id
+    sitting in two homes is the ordinary state after any `csm move` (`one_of`'s own rule).
+    Returning the first home in `accts` order picked a copy nobody named — revive would
+    resume a stale snapshot, spend the wrong account's quota and write "You are still
+    <wrong email>" into the note — and because this rung answers, `pick_resolved`'s refusal
+    never printed. So the hits are collected across homes and more than one is `one_of`'s
+    refusal, naming each copy.
     """
     if not sp.pin:
         return None
+    found = []
     for a in accts:
         if not a.home.is_dir():
             continue
-        try:
-            hits = [p for p in a.projects.glob("*/" + sp.pin + ".jsonl") if p.is_file()]
-        except OSError:
+        best = None
+        for p in home_copies(a, sp.pin + ".jsonl"):
+            try:
+                m = os.stat(str(p)).st_mtime
+            except OSError:
+                continue
+            if best is None or m > best[0]:
+                best = (m, p)
+        if best is None:
             continue
-        if not hits:
-            continue
-        p = sorted(hits, key=lambda x: -x.stat().st_mtime)[0]
-        return session_of(a, p, p.stat().st_mtime, live_rows(a).get(sp.pin),
-                          subagent_rule=False)
-    return None
+        if any(same_path(best[1], q) for _m, _a, q in found):
+            continue            # one shared `projects/` tree: the same file, not a copy
+        found.append((best[0], a, best[1]))
+    if not found:
+        return None
+    rows = []
+    for i, (m, a, p) in enumerate(sorted(found, key=lambda t: -t[0]), 1):
+        r = session_of(a, p, m, live_rows(a).get(sp.pin), subagent_rule=False)
+        if r is not None:
+            r.pos = i
+            rows.append(r)
+    if not rows:
+        return None
+    if len(rows) == 1:
+        return rows[0]
+    # ⚠️ `one_of`'s RULE, in its own words rather than its own sentence: these rows are in
+    # no listing (that is the whole reason this function exists), so its cure — "say which,
+    # by its row number from `csm list`" — names a number that does not exist here. The
+    # live-copy tie-break is the same, and so is refusing rather than choosing.
+    live = [r for r in rows if r.live]
+    if len(live) == 1:
+        return live[0]
+    die("%s names transcript %s, and %d account homes here hold a copy of it (a move is a "
+        "copy, so one id can sit in more than one account): %s. None of them is running, so "
+        "nothing says which one you mean — say which with `csm revive %s --account <handle>`"
+        % (sp.what, sp.pin, len(rows),
+           "; ".join("%d. %s %s %s (%s)" % (r.pos, r.handle, r.short,
+                                            "live" if r.live else "ended", tilde(r.transcript))
+                     for r in rows),
+           shlex.quote(sp.typed)))
+    raise AssertionError("unreachable")
 
 
 def revive_resolve(args, accts: list):
@@ -7922,10 +8347,32 @@ def revive_resolve(args, accts: list):
 
     The soft pass first, then the file no listing carries, then the hard pass, whose refusal
     text is the only one a reader ever sees, so the two cannot drift apart.
+
+    🛑 AND ONLY "NO ROW ANYWHERE" MAY REACH `revive_row`. The soft pass answers `None` for
+    two different reasons — nothing matched it, or SEVERAL copies did and `one_of` would
+    refuse — and `revive_row` answers for both, taking the first home in `accts` order. A
+    move is a copy, so two dead copies of one id is the ordinary state after any `csm move`:
+    revive acted on whichever account came first, resumed a stale snapshot onto a NEW
+    claude.ai link, spent the wrong account's quota and wrote "You are still <wrong email>"
+    into the note, while `one_of`'s refusal — which `move` and `stop` both print on exactly
+    this spec — never ran. So the rung is taken only when the listing holds no row for this
+    id at all, which is the single case it was added for (`sessions_for` drops a transcript
+    with no main-thread line).
     """
-    sp = resolve_spec(args.session, accts)
-    rows = all_sessions(accts, max(DEFAULT_LIMIT, 60), pin=sp.pin)
-    s = pick_resolved(sp, rows, soft=True) or revive_row(sp, accts) or pick_resolved(sp, rows)
+    pool = accts
+    want = (getattr(args, "account", "") or "").strip()
+    if want:
+        # ⚠️ RESOLUTION ONLY. Every gate a revive runs afterwards — a second writer in
+        # another home, `other_homes`, the shared-tree sweep — is asked of the WHOLE list,
+        # so narrowing which home the SPEC may name must not narrow those.
+        pool = [resolve(want, accts)]
+    sp = resolve_spec(args.session, pool)
+    rows = all_sessions(pool, max(DEFAULT_LIMIT, 60), pin=sp.pin)
+    s = pick_resolved(sp, rows, soft=True)
+    if s is None and not (sp.pin and any(r.local_id.lower() == sp.pin for r in rows)):
+        s = revive_row(sp, pool)
+    if s is None:
+        s = pick_resolved(sp, rows)
     return s, sp
 
 
@@ -7937,6 +8384,7 @@ def revive_plan(s: Session, sp: Spec, args, accts: list) -> dict:
     by a run that takes row 10. It diagnoses, resolves the target, runs the gates it can
     before anything is written, picks the row, and builds the note that row would deliver.
     """
+    check_say(args.say or "")
     rec = diagnose(s, accts, sp)
     to = (args.to or "").strip()
     tgt = None
@@ -7974,8 +8422,14 @@ def revive_plan(s: Session, sp: Spec, args, accts: list) -> dict:
         # the dry run rather than a surprise in the real one.
         perm, why_perm = resolve_mode(s, tgt or s.account, args.permission_mode)
         if dec["action"] != "wake":
+            # ⚠️ THE ID8 IS IN THE TAIL. `rc_label` truncates to 56 characters, so
+            # `rc_label(<title>, "revived by csm")` gave two revives of one session — and
+            # two sessions whose titles merely start alike — one identical name, and the
+            # relay addresses a session BY its name (`name_twins`). The 8 characters that
+            # make a window's name unique are the same 8 every other id-keyed part of this
+            # tool uses.
             rc_name = rc_label(args.name or s.label,
-                               "" if args.name else "revived by csm")
+                               "" if args.name else "revived by csm " + s.short)
         note = revive_note(s, rec, dec["action"], tgt=tgt, say=args.say or "")
     return {"rec": rec, "dec": dec, "tgt": tgt, "note": note, "perm": perm,
             "why_perm": why_perm, "rc_name": rc_name}
@@ -8035,6 +8489,16 @@ def revive_deliver(acct: Account, local_id: str, dest: Path, name: str, note: st
         out["exit"] = 1
         return 1
     out["after"] = after
+    twins = name_twins(acct, local_id, name)
+    if twins:
+        # 🛑 NOTHING IS SENT TO AN AMBIGUOUS NAME. By the time this runs the window is up
+        # (rows 7, 8 and 10 start one), so this is "started, not proved" rather than a
+        # refusal — the relay doctrine's own rule: never raise once something is running.
+        # The wake row, where nothing was started, refuses outright instead.
+        out["why"] = ambiguous_name_why(acct, local_id, name, twins)
+        out["exit"] = 1
+        print("  🛑 %s" % out["why"])
+        return 1
     out["relay"] = relay_note(acct, name, note)
     if not out["relay"]["ok"]:
         out["why"] = "the note was NOT delivered: %s" % out["relay"]["why"]
@@ -8272,8 +8736,15 @@ def revive_act(s: Session, sp: Spec, args, accts: list, p: dict) -> int:
             # the server respawns the child when it is opened; a tool that sat here polling
             # for a person to tap something is the one shape his 13 Oct 2026 rule forbids.
             srv, url = rec.get("server") or {}, (rec.get("session") or {}).get("url") or ""
-            print("  open          %s\n                and say continue — its server "
-                  "respawns the child on open, idle" % (url or "its claude.ai link"))
+            if url:
+                print("  open          %s\n                and say continue — its server "
+                      "respawns the child on open, idle" % url)
+            else:
+                # The kind was proved from the id's uuid version and the link is in no file
+                # csm read, so it is asked for rather than guessed at.
+                print("  link          unknown: %s is a server child (version-5 id) and "
+                      "nothing here\n                records its claude.ai session. Paste "
+                      "it: `csm revive <link>`" % s.short)
             print("  server        " + (srv.get("why") or
                                         ("up" if srv.get("up") else "down")))
             print("  then          `csm revive %s` once it is open: csm wakes an idle "
@@ -8281,6 +8752,17 @@ def revive_act(s: Session, sp: Spec, args, accts: list, p: dict) -> int:
             print("  or            `csm revive %s --new-link`, which FORKS it onto a new "
                   "link and needs nothing of yours" % s.short)
         elif dec["action"] == "wake":                                       # row 5
+            # 🛑 THE ONE GATE THAT APPLIES TO A ROW THAT STARTS NOTHING. The brief's M5 asks
+            # for `preflight(..., copy_only=True)` on the no-window rows, and most of
+            # `preflight` cannot run here: its live-twin check would refuse a session that is
+            # deliberately ALIVE, which is this row's own condition. What is left of it and
+            # still true is that the relay is a `claude -p` run, so the CLI has to be on PATH
+            # — and `relay_note` would otherwise discover that only after the plan had been
+            # printed and reported it as "the note was NOT delivered".
+            if not claude_bin():
+                die("session %s is up and idle, and waking it means running `claude -p` as "
+                    "the relay — but the claude CLI is not on PATH (set CSM_CLAUDE to its "
+                    "path). Nothing was sent" % s.short)
             url = (rec.get("session") or {}).get("url") or ""
             row = live_name(s.account, s.local_id, s.transcript)
             if not row:
@@ -8297,6 +8779,13 @@ def revive_act(s: Session, sp: Spec, args, accts: list, p: dict) -> int:
                 out["exit"] = 1
                 print("  🛑 %s" % out["why"])
             else:
+                twins = name_twins(s.account, s.local_id, row["name"])
+                if twins:
+                    # 🛑 A REFUSAL, not "started, not proved": this row starts nothing, so
+                    # there is no window to leave behind and no reason to soften it.
+                    die("session %s cannot be woken safely: %s"
+                        % (s.short, ambiguous_name_why(s.account, s.local_id, row["name"],
+                                                       twins)))
                 # 🛑 NOTHING IS STARTED HERE: it is already up, and the only thing missing is
                 # a turn. `out["started"]` stays False, which is what the log then says.
                 revive_deliver(s.account, s.local_id, s.transcript, row["name"], note, out)
@@ -8306,7 +8795,7 @@ def revive_act(s: Session, sp: Spec, args, accts: list, p: dict) -> int:
                       % (url or "it in the app"))
         elif dec["action"] == "move":                                       # row 6
             out["exit"] = revive_move(s, args, accts, tgt, note, out)
-        elif dec["action"] in ("resume", "new-link"):                       # rows 7 and 8
+        elif dec["action"] in ("resume", "resume-new-link"):                # rows 7 and 8
             link, pane, win = revive_start(s, rec, accts, perm, rc_name, out)
             want = (rec.get("session") or {}).get("url") or ""
             if not link:
@@ -8334,7 +8823,7 @@ def revive_act(s: Session, sp: Spec, args, accts: list, p: dict) -> int:
                                             % perm))
                 print("  window        %s — `csm stop %s` ends it and frees the window"
                       % (out["window"], s.short))
-                if dec["action"] == "new-link":
+                if dec["action"] == "resume-new-link":
                     print("  ⚠ new link    it was never a Remote Control session, so this "
                           "link is new exposure,\n                not a restoration: "
                           "nothing opens the way in it had before")
@@ -8378,9 +8867,12 @@ def do_revive(args, accts: list) -> int:
     session, each deciding on a dead transcript and each starting a window, is the one
     outcome this command could produce that nothing else in the tool guards — `preflight`'s
     live-twin check only ever sees a process that has already registered. The lock is
-    `state_lock`'s own lock-directory shape (with its 120 s stale break, so a killed revive
-    does not wedge the session for good), keyed on the local id; and because a lazy respawn
-    has the SAME local id before and after, the liveness check is re-run in the last second
+    `state_lock`'s own lock-directory shape, keyed on the local id, with the stale break set
+    to `REVIVE_CLAIM_STALE_S` and not the 120 s the `.claude.json` lock keeps: this claim is
+    held across four bounded waits that add up to more than 120 s, so the short bound made
+    the claim breakable from t=120 s on every run. The waits touch it as they poll
+    (`touch_locks`), so a killed revive still clears itself. And because a lazy respawn has
+    the SAME local id before and after, the liveness check is re-run in the last second
     before anything starts (`revive_recheck`).
     """
     if getattr(args, "from_machine", None):
@@ -8419,13 +8911,14 @@ def do_revive(args, accts: list) -> int:
         return 0
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     claim = STATE_DIR / ("revive-" + s.local_id)
-    with state_lock(claim) as lk:
+    with state_lock(claim, stale=REVIVE_CLAIM_STALE_S) as lk:
         if not lk.held:
             die("another revive of session %s is in flight (%s): at most one revive of one "
                 "session at a time, because two would each decide on a dead transcript and "
                 "each start a window on it. Nothing was diagnosed, started or written. If no "
                 "revive is really running, that directory is stale and clears itself after "
-                "%ds" % (s.short, tilde(Path(str(claim) + ".lock")), int(STATE_LOCK_STALE_S)))
+                "%ds" % (s.short, tilde(Path(str(claim) + ".lock")),
+                         int(REVIVE_CLAIM_STALE_S)))
         return revive_act(s, sp, args, accts, revive_plan(s, sp, args, accts))
 
 
@@ -9382,7 +9875,7 @@ def over_ssh(dest: str, argv: list, named_machine: bool = True) -> int:
     return r.returncode
 
 
-def no_match_hint(args, on) -> list:
+def no_match_hint(args, on, accts=None) -> list:
     """🛑 0 ROWS IS NOT PROOF, and this is the line that says so.
 
     What `find` searched is transcript names, ids and titles. The session a caller is
@@ -9398,10 +9891,22 @@ def no_match_hint(args, on) -> list:
                "and a Remote Control session usually has no title either — its transcript "
                "is named by a uuid that is in nothing you would type."]
     if d:
-        out.append("   %s names transcript %s, and no config home on %s holds that file."
-                   % ("That link" if SHEEP_SESSION_RE.search(args.text)
-                      else "session_" + (bare_bridge_id(args.text) or "?"),
-                      d, on or machine()))
+        # 🛑 AND NOT "no home holds it" WHEN A HOME WOULD NOT OPEN. `home_copies` separates
+        # the two; `Path.glob`, which this used to rest on, cannot (see its 🛑). Only asked
+        # for THIS machine: `--on M` reads M's homes through the helper, which has its own.
+        unread = []
+        if not on:
+            for a in (accts or []):
+                home_copies(a, d + ".jsonl", unread)
+        what = ("That link" if SHEEP_SESSION_RE.search(args.text)
+                else "session_" + (bare_bridge_id(args.text) or "?"))
+        if unread:
+            out.append("   %s names transcript %s, and whether a config home on %s holds "
+                       "that file is UNREAD, not no: %s would not open."
+                       % (what, d, machine(), "; ".join(unread[:3])))
+        else:
+            out.append("   %s names transcript %s, and no config home on %s holds that "
+                       "file." % (what, d, on or machine()))
         if not on:
             c = canary()
             if c.get("ok") is not True:
@@ -9419,7 +9924,7 @@ def no_match_hint(args, on) -> list:
     return out
 
 
-def cmd_find(args) -> int:
+def cmd_find(args, accts=None) -> int:
     """`find <text>`: sessions matching an id, a link or title text — here, or on `--on M`.
 
     Unlike `list`, this reads EVERY config home there (the default one included, which is
@@ -9449,12 +9954,12 @@ def cmd_find(args) -> int:
         if not rows:
             # ⚠️ STDERR, so the hint cannot land inside the JSON a script is parsing. The
             # exit code is the same 1 either way.
-            print("\n".join(no_match_hint(args, on)).strip(), file=sys.stderr)
+            print("\n".join(no_match_hint(args, on, accts)).strip(), file=sys.stderr)
             return 1
         return 0
     print(render_found(rows, on or machine()))
     if not rows:
-        print("\n".join(no_match_hint(args, on)))
+        print("\n".join(no_match_hint(args, on, accts)))
         return 1
     if on:
         print("\nto bring one here: csm move <id> --from-machine %s --to <account> "
@@ -9653,6 +10158,10 @@ def main(argv: list) -> int:
                          "name, handle or email from `csm accounts`, or `auto` for the one "
                          "with the most weekly room. It is also the cure for a limit that "
                          "is still in force")
+    pr.add_argument("--account", metavar="NAME",
+                    help="which account home's copy to revive — a name, handle or email "
+                         "from `csm accounts`. Only needed when a move has left copies of "
+                         "one id in more than one home and none of them is running")
     pr.add_argument("--new-link", action="store_true", dest="new_link",
                     help="for a Remote Control server child, which cannot be resumed onto "
                          "its own link: FORK it to a new session id and a new link. The "
@@ -9824,7 +10333,7 @@ def main(argv: list) -> int:
                   else render_list(rows, accts))
             return 0
         if args.cmd == "find":
-            return cmd_find(args)
+            return cmd_find(args, accts)
         if args.cmd == "move":
             return do_move(args, accts)
         if args.cmd == "revive":

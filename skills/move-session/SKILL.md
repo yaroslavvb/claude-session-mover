@@ -370,14 +370,23 @@ csm revive <id> --auto                   # continue ONE of them, as an unattende
    conversations with one history**, so `--json`'s `result.old_bridge_id` names the old claude.ai session, which
    has to be **archived** — csm cannot do that itself. Tell the user plainly when this happens: the old link
    still opens the old copy, archive it, do not type there.
-6. **`handled` is per STOP, not per session.** A stop already revived (a record with exit 0) is not due again; a
-   session that stopped, was woken and stopped **again** is a new stop and is due. A row whose `handled.failed`
-   is non-zero is a wake that was tried and **failed** — that is what `--check` reports as `FAULT:`, and it is
-   worth raising on its own, because the next pass will just try again.
+   ⚠️ **And read `result.forked`, not the exit code.** The fork is made before the note is relayed, so a relay or
+   proof failure comes back as exit 1 with the fork already there: `forked: true` beside `"exit": 1` still means a
+   second session exists, still has to be archived, and must **not** be forked again.
+6. **`handled` is per STOP, not per session — and the stop, not the id, is the key.** A stop already revived (a
+   record with exit 0) is not due again; a session that stopped, was woken and stopped **again** is a new stop and
+   is due. Because a fork copies the transcript, the same stop line can end two sessions, and a record for either
+   covers both (`handled.copy_of` names which) — otherwise one stop event would be woken once per copy. A row
+   whose `handled.failed` is non-zero is a wake that was tried and **failed** — that is what `--check` reports as
+   `FAULT:`, and it is worth raising on its own, because the next pass will just try again.
 7. **`csm stalled --check` answers "is the waking working?"** `ok:` while nothing has failed, `FAULT:` for a due
    session whose last wake failed, `INCOMPLETE:` when something could not be read. ⚠️ A session merely **being**
    due is not a fault: that is the normal state between two passes, so do not report `ok: 2 session(s) due` as a
    problem.
+8. **A row that says "`ps` could not be asked" is a reading nobody could take, not a verdict.** Such a row is
+   never due, because with `ps` blind a *running* session reads dead and resuming it would put two CLIs on one
+   transcript. Report it as unread — it is in `coverage.unread` too — and look at the session yourself rather
+   than waking it.
 
 ## "Is anything running in the wrong mode?" `csm modes`
 

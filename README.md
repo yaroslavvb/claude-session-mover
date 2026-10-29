@@ -1179,12 +1179,21 @@ into one spends its first turn hitting the same wall. Nor is a limit whose class
 an unread class is not a clearable one. A clean finish is not due either (it answered, and there is nothing to
 continue), and nor is an API error, which time does not fix.
 
-**And five things are never due, whatever their stop**: a session that is **working** right now (a message would
+**And six things are never due, whatever their stop**: a session that is **working** right now (a message would
 join the turn it is in the middle of); one a **bot** owns (a relay into a bot's session surfaces as a message in
 the channel that bot answers); one a **scheduled pass** owns that is not live and idle (its own supervisor puts
-that one back); one with **no conversation** in it (a Remote Control server pre-creates those by the hundred);
-and one **archived or ended from the app**, which was somebody's decision and not a failure to repair. Every row
-`csm stalled` prints carries its reason in `why`, so "not due" is never a silence.
+that one back); one whose **state could not be measured**; one with **no conversation** in it (a Remote Control
+server pre-creates those by the hundred); and one **archived or ended from the app**, which was somebody's
+decision and not a failure to repair. Every row `csm stalled` prints carries its reason in `why`, so "not due"
+is never a silence.
+
+**An unmeasured state is never a dead one** (0.6.1). A session can only be called live by *proving* its registry
+row, and that proof needs `ps`; with `ps` unaskable every live session reads `dead` — and a live session that is
+BUSY ends its transcript on an unanswered tool call, which is exactly the `mid-turn` shape above. So a row whose
+`state.ps_asked` is false is listed with that reason, counted in `coverage.unread`, and **not** due: resuming a
+session that is running puts two CLIs on one transcript, which `revive` itself refuses.
+
+**One stop event is one wake, however many copies of the transcript exist** — see *At most once per stop* below.
 
 ### What each state gets
 
@@ -1213,20 +1222,36 @@ actor is **archiving that old claude.ai session**, which csm deliberately cannot
 archiving is an authenticated call to claude.ai. So it reports the id instead, in `--json`'s `result`:
 
 ```json
-{ "new_id": "9c1f…", "old_bridge_id": "01PHXsk…", "old_url": "https://claude.ai/code/session_01PHXsk…",
-  "archive_old": true }
+{ "forked": true, "new_id": "9c1f…", "old_bridge_id": "01PHXsk…",
+  "old_url": "https://claude.ai/code/session_01PHXsk…", "archive_old": true }
 ```
 
 `old_bridge_id` is the bare id; the API spells it `cse_<id>`. **A caller that forks and does not archive has made
 two actors with one past**, and should say so loudly rather than quietly: that is worse than not waking the
 session at all.
 
+🛑 **Read `forked`, never the exit code** (0.6.1). The fork row makes the new session, its link and its
+transcript *before* the note is relayed, so a registry name that turned ambiguous, a relay that errored or a turn
+that never appeared all come back as **exit 1 with the fork already made**. `forked` is `true` from the moment the
+second session exists, whatever happens after it, so the archive and the "do not do this again" decision both key
+on that and not on the exit code. A fork that printed no claude.ai link at all left `forked` false: nothing new
+came into being there, and that one alone is safe to take again.
+
 ### At most once per stop
 
-The key is **`(local id, stop event uuid)`** — the uuid of the transcript line the stop was read from. Every
-record in `CSM_REVIVE_LOG` carries it as `stop_uuid`, and `csm stalled` reads the log back to fill `handled`.
-The id alone could only answer "was this session ever revived"; a session that stopped, was woken, worked for an
-hour and stopped again is a **new** stop and is due again, which is exactly what a key per stop gets you.
+The key is **the stop event uuid** — the uuid of the transcript line the stop was read from. Every record in
+`CSM_REVIVE_LOG` carries it as `stop_uuid`, and `csm stalled` reads the log back to fill `handled`. The local id
+alone could only answer "was this session ever revived"; a session that stopped, was woken, worked for an hour
+and stopped again is a **new** stop and is due again, which is exactly what a key per stop gets you.
+
+🛑 **And the uuid is matched across copies of the transcript** (0.6.1). A fork *copies* the file, so the same stop
+line — the same uuid — ends a second session: csm's own fork row makes one, and so does `claude --resume X
+--fork-session` or `/fork` on a parked session, with no csm involved at all. Keying on `(local id, uuid)` meant
+the parent's exit-0 record could not cover the copy, both rows read **due** for one stop event, and a pass that
+wakes everything due woke both — two actors continuing one history, which is the thing this key exists to
+prevent. So a record is matched on the stop event alone, `handled.copy_of` names the session it was matched from,
+and `csm stalled` refuses to call two rows that share a stop uuid due in one sweep (it keeps the older file,
+since a copy is written after the conversation it copied).
 
 A stop counts as handled only on a record with **exit 0**. A non-zero exit is a wake that was *attempted and
 failed* — nothing was delivered, the session is still sitting there — so the row stays **due**, the attempt is
@@ -1246,6 +1271,14 @@ The shape that works, and the two things to get right:
   (`CSM_CONNECT_WAIT`, `CSM_RELAY_TIMEOUT_S`, `CSM_REVIVE_PROVE_S`) and can take minutes; two passes overlapping
   would each diagnose the same dead transcript. `revive` holds its own per-session claim, but the pass should
   hold one of its own so the next tick skips rather than piles up.
+- 🛑 **Never cap one `csm revive` below its own ceiling.** The record that says a stop has been acted on is
+  written *after* the action returns, so a caller that kills the process at a timeout kills it in exactly the slow
+  cases it was built to survive — after the window is up, the note relayed or the fork made, and before anything
+  says so. The row then stays due and the next pass does it all again. The honest bound is
+  `REVIVE_CLAIM_STALE_S`: `3 × CSM_CONNECT_WAIT + CSM_RELAY_TIMEOUT_S + CSM_REVIVE_PROVE_S` plus one spare
+  connect — **810 s** at the defaults, which is how long csm itself says one revive may hold its claim. And
+  whatever the number, **treat a wake whose outcome you could not read as done, not as pending**: repeating it is
+  how one stop event becomes a dozen.
 
 `csm stalled --check` is the health check to put beside it: `ok:` while nothing has failed, `FAULT:` for a due
 session whose last wake failed, `INCOMPLETE:` when something could not be read. It never asks a credential
@@ -1328,7 +1361,7 @@ machine; connectors are free, because they follow the account.
 
 ## Lessons
 
-Nine of the rules that cost the most to learn. **[LESSONS.md](LESSONS.md)** has 45, each with a one-line rule,
+Nine of the rules that cost the most to learn. **[LESSONS.md](LESSONS.md)** has 55, each with a one-line rule,
 the incident behind it, a command to check it, and the Claude Code version it was verified against, with the
 fast-changing (Beta) facts marked. The longer narrative is in [docs/lessons.md](docs/lessons.md).
 
@@ -1452,7 +1485,7 @@ the machine can reach. Only move sessions between accounts you own.
 python3 tests/test_mover.py
 ```
 
-745 tests, fixtures only: fake homes and transcripts, a fake `claude` that records its argv and environment, a fake
+753 tests, fixtures only: fake homes and transcripts, a fake `claude` that records its argv and environment, a fake
 `tmux` that really runs the moved window's command on a private socket, a fake `ssh` that records the command line
 it was handed, and — for `find --on` and `--from-machine` — "the other machine" played by this process with `HOME`
 pointed at a fixture tree, so no test reaches a real host. No network, no account, no credential store, no real

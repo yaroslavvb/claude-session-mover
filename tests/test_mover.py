@@ -7486,12 +7486,20 @@ class Stalled(ReviveRun):
         self.assertIs(again["handled"]["done"], False)
         self.assertEqual(again["handled"]["attempts"], 0)
 
-    def test_a_record_for_another_session_never_marks_this_one_handled(self):
+    def test_a_record_for_another_stop_event_never_marks_this_one_handled(self):
+        """⚠️ THE OTHER SESSION'S STOP NEEDS A UUID OF ITS OWN here, and that is the fixture
+        catching up with reality (Thu 29 Oct 2026): a uuid names ONE transcript line, so two
+        unrelated sessions never share one, and the only way they do is that one is a COPY of
+        the other — which is the case `revive_handled` now matches on purpose, because a fork
+        copies the transcript and both copies would otherwise be woken for one stop. This test
+        keeps the claim it was written for: a wake of a DIFFERENT conversation is not this
+        one's."""
         self.parked(time.time() - 3600)
-        self.logged(SID_B, "a2", exit=0)
+        self.logged(SID_B, "someone-elses-stop", exit=0)
         r, _got, _run = self.row()
         self.assertTrue(r["due"], r["why"])
         self.assertEqual(r["handled"]["attempts"], 0)
+        self.assertEqual(r["handled"]["copy_of"], "")
 
     def test_a_failed_wake_leaves_the_row_due_and_counts_the_attempt(self):
         """🛑 `done` IS EXIT 0, NOT "A RECORD EXISTS". A non-zero exit means nothing was
@@ -7673,6 +7681,170 @@ class Stalled(ReviveRun):
         r = self.sweep("--check")
         self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
         self.assertIn("1 not read (personal:", r.stdout)
+
+    def test_a_session_whose_ps_could_not_be_asked_is_listed_and_never_due(self):
+        """🛑 AN UNMEASURED STATE IS NOT A DEAD ONE (Thu 29 Oct 2026, week 44).
+
+        `revive_state` can only call a session live by PROVING its registry row, and that
+        proof needs `ps`; `ps_table`'s own promise is that `None` is never "nothing is
+        running". So with `ps` blind every live session reads `dead` — and a live session
+        that is BUSY ends its transcript on an unanswered tool_use, which is exactly the
+        `mid-turn` shape this sweep calls due. The row stays listed with its reason, because
+        resuming it would put two CLIs on one transcript, which `revive_start` itself refuses.
+        """
+        self.dead(lines=[self.go(), tool_call(self.cwd, SID_A)])
+        ps = self.w.bin / "ps"                          # the fixture bin is FIRST on PATH
+        ps.write_text("#!/bin/sh\necho 'ps: illegal option' >&2\nexit 1\n")
+        ps.chmod(0o755)
+        r, got, run = self.row()
+        self.assertFalse(r["due"], r["why"])
+        self.assertIn("`ps` could not be asked", r["why"])
+        self.assertNothingStarted(run)
+        self.assertIn("could not be asked", got["coverage"]["unread"][0]["reason"])
+        # ...and the one line a scheduled caller reads says so too, rather than "nothing due".
+        c = self.sweep("--check")
+        self.assertEqual(c.returncode, 3, c.stdout + c.stderr)
+        self.assertTrue(c.stdout.startswith("INCOMPLETE:"), c.stdout)
+
+    # --- one stop event, however many copies of it there are --------------
+    def forked_pair(self, stop_uuid="stop1", resets=None):
+        """A parked session and the COPY a fork leaves: the same stop line, two local ids.
+
+        ⚠️ THE MTIMES ARE SET, because which row is kept is "the older file" — a fork's copy
+        is written after the conversation it copied — and two fixtures written in the same
+        millisecond have no order at all.
+        """
+        now = time.time()
+        resets = now - 7200 if resets is None else resets
+        parent = self.dead(SID_A, lines=[self.go(SID_A), self.clean(SID_A),
+                                         self.limit(resets, SID_A, uuid=stop_uuid)])
+        copy = self.dead(SID_B, lines=[self.go(SID_B), self.clean(SID_B),
+                                       self.limit(resets, SID_B, uuid=stop_uuid)])
+        os.utime(str(parent), (now - 600, now - 600))
+        os.utime(str(copy), (now - 60, now - 60))
+        return parent, copy
+
+    def test_one_stop_event_is_due_once_however_many_copies_of_it_exist(self):
+        """🛑 A FORK COPIES THE TRANSCRIPT, so one stop line ends two sessions.
+
+        The same uuid under a second local id is what `csm revive --new-link` leaves behind —
+        and what `claude --resume X --fork-session` or `/fork` on a parked session leaves
+        behind with no csm involved at all. Both rows used to read DUE for ONE stop event and
+        an unattended pass woke both: two actors continuing one history, which is the thing
+        the at-most-once key exists to prevent.
+        """
+        self.forked_pair()
+        got, _r = self.doc()
+        due = [x for x in got["rows"] if x["due"]]
+        self.assertEqual([x["local_id"] for x in due], [SID_A],
+                         [(x["local_id"], x["due"], x["why"]) for x in got["rows"]])
+        held = [x for x in got["rows"] if not x["due"]][0]
+        self.assertEqual(held["local_id"], SID_B)
+        self.assertIn("same stop event", held["why"])
+        self.assertIn("two actors", held["why"])
+        self.assertEqual(got["due"], 1)
+
+    def test_a_wake_recorded_for_one_copy_covers_the_other(self):
+        """The at-most-once key is `(stop event)`, not `(local id, stop event)`: the parent's
+        exit-0 record has to cover the copy, or the copy is woken on the next pass."""
+        self.forked_pair()
+        self.logged(SID_A, "stop1", exit=0)
+        got, _r = self.doc()
+        self.assertEqual([x["due"] for x in got["rows"]], [False, False],
+                         [(x["local_id"], x["why"]) for x in got["rows"]])
+        copy = [x for x in got["rows"] if x["local_id"] == SID_B][0]
+        self.assertIn("already revived for this stop", copy["why"])
+        self.assertIn("shares this stop line", copy["why"])
+        self.assertEqual(copy["handled"]["copy_of"], SID_A)
+        c = self.sweep("--check")
+        self.assertEqual(c.returncode, 0, c.stdout + c.stderr)
+
+    def test_a_NEW_stop_in_the_copy_is_its_own_question(self):
+        """The uuid is matched, not the id — so a copy that stopped again on a line of its
+        own is due again, exactly as the parent would be."""
+        self.forked_pair()
+        self.logged(SID_A, "stop1", exit=0)
+        self.dead(SID_C, lines=[self.go(SID_C), self.clean(SID_C),
+                                self.limit(time.time() - 7200, SID_C, uuid="stop2")])
+        got, _r = self.doc()
+        by = dict((x["local_id"], x) for x in got["rows"])
+        self.assertTrue(by[SID_C]["due"], by[SID_C]["why"])
+
+    # --- the machine is read once a sweep, not once a session -------------
+    def test_the_machine_is_read_once_a_sweep_and_not_once_a_session(self):
+        """🛑 `ps_table`'S OWN PROMISE IS "ONE CALL, NOT ONE PER SESSION", and the sweep broke
+        it: `diagnose` asks `ps` in `revive_state` and again in `server_in_folder`, and asks
+        the credential store in `revive_account`, once per candidate. Measured here Thu 29 Oct
+        2026 against the engine before the fix: these six parked fixture sessions in one home
+        cost 12 machine-wide `ps -Ao` runs and 6 credential probes in ONE sweep, against 1 and
+        1 after — at ~101 ms per `ps` on this Mac, and growing with the number of parked
+        sessions, i.e. exactly when this loop matters most.
+        """
+        counter = self.w.root / "ps-calls"
+        real = shutil.which("ps") or "/bin/ps"
+        ps = self.w.bin / "ps"
+        ps.write_text('#!/bin/sh\necho "$@" >> "%s"\nexec %s "$@"\n' % (counter, real))
+        ps.chmod(0o755)
+        now = time.time()
+        for n, sid in enumerate((SID_A, SID_B, SID_C, LINK_SID, LINK_SID2, FORK_SID)):
+            self.dead(sid, lines=[self.go(sid), self.clean(sid),
+                                  self.limit(now - 3600, sid, uuid="u-%d" % n)])
+        got, r = self.doc()
+        self.assertEqual(got["candidates"], 6, got["rows"])
+        # ⚠️ ONLY THE MACHINE-WIDE ONES. `self_session` walks its own parents with
+        # `ps -o ppid= -p <pid>`, which is one ladder per RUN and not one per session.
+        wide = [x for x in counter.read_text().splitlines() if "-Ao" in x]
+        self.assertLessEqual(len(wide), 2,
+                             "the whole machine was read %d times for 6 sessions" % len(wide))
+        # ⚠️ `CSM_LOGIN_PROBE` announces itself on stderr every time it is asked, which is how
+        # the per-session probe was found: the answer is a property of the HOME, and each
+        # `security` call is another chance to block on a locked keychain nobody can unlock.
+        probes = [x for x in r.stderr.splitlines() if "CSM_LOGIN_PROBE" in x]
+        self.assertEqual(len(probes), 1, probes)
+
+    def test_revive_itself_still_asks_ps_afresh(self):
+        """🛑 AND THE MEMO IS THE SWEEP'S ALONE. `revive_recheck` asks `ps` again in the last
+        second before it starts a window, because a Remote Control server respawns its child
+        lazily and one can appear between the diagnosis and the start. A cached reading there
+        would hand it an answer from minutes ago."""
+        counter = self.w.root / "ps-calls"
+        real = shutil.which("ps") or "/bin/ps"
+        ps = self.w.bin / "ps"
+        ps.write_text('#!/bin/sh\necho "$@" >> "%s"\nexec %s "$@"\n' % (counter, real))
+        ps.chmod(0o755)
+        self.parked(time.time() - 3600)
+        r = self.revive(SID_A, "--json", "--auto")
+        self.assertIn(r.returncode, (0, 1), r.stdout + r.stderr)
+        wide = [x for x in counter.read_text().splitlines() if "-Ao" in x]
+        self.assertGreaterEqual(len(wide), 2,
+                                "revive read the machine %d time(s): the diagnosis and the "
+                                "re-check are two readings" % len(wide))
+
+    # --- what the two commands say about one session ----------------------
+    def test_the_due_sentence_ages_the_reset_and_not_the_wake_margin(self):
+        """`ready` is the instant a wake becomes PERMITTED (reset + 120 s), not the instant
+        the limit lifted, and `human_age` floors — so measuring from it reported a two-hour
+        wait as "1h ago" in the sentence a person reads."""
+        now = time.time()
+        self.parked(now - 7200, at=now - 7200)
+        r, _got, _run = self.row()
+        self.assertTrue(r["due"], r["why"])
+        self.assertIn("2h ago", r["why"])
+
+    def test_a_limit_whose_class_was_never_named_gets_one_answer_from_both(self):
+        """🛑 THE SWEEP AND THE RUN MAY NEVER DISAGREE, and `clears_with_time` is `None` —
+        not `False` — for a limit line whose own words matched no class csm knows. `stalled`
+        calls that "waiting does not clear a limit whose class its own words did not name";
+        row 4 keyed on `is False` and so told the reader of the same build to wait for the
+        reset instead."""
+        self.parked(time.time() + 3600, text="Something about usage went wrong")
+        r, _got, _run = self.row()
+        self.assertFalse(r["due"], r["why"])
+        self.assertIn("whose class its own words did not name", r["why"])
+        self.assertEqual(r["row"], 4)
+        out = self.ok(self.w.run("revive", SID_A, "--dry-run"))
+        self.assertIn("waiting may not clear it at all", out)
+        self.assertNotIn("wait until", out)
 
 
 # -------------------------------------------------------- what the move says it will cost

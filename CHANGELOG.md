@@ -9,6 +9,56 @@ Every fact below was measured against Claude Code 2.1.296–2.1.300 on macOS. Th
 state it reads is undocumented and can change in any CLI release; the tests pin every shape
 the tool depends on.
 
+## [0.6.1] — 2026-10-29
+
+What a review of 0.6.0's sweep found the same day, before the loop was anybody's: six fixes, all
+in `csm stalled` and the fork row. The theme is that a reading nobody could take must never read
+as a verdict, and that one stop event is one wake however many copies of the transcript exist.
+753 tests (745 + 8).
+
+### Fixed
+
+- **A session whose `ps` could not be asked is no longer called due.** `revive_state` can only
+  call a session live by PROVING its registry row, and that proof needs `ps`; with `ps` blind
+  every live session read `dead`, and a live-BUSY session's transcript ends in an unanswered
+  `tool_use` — exactly the `mid-turn` shape the sweep calls due. So an unattended caller would
+  resume a session that was running, which `revive_start` itself refuses ("two CLIs appending to
+  one transcript cannot be untangled"). `stalled_report` already put such a row in
+  `coverage.unread`; `stalled_due` now refuses it too, with that reason, so the row stays listed
+  and out of a watchdog's hands. `ps_table`'s own promise — "`None` is never nothing is running"
+  — is what this keeps.
+- **One stop event is one wake, across copies of the transcript.** A fork copies the file, so
+  the same stop line and the same uuid end a second session: csm's own fork row makes one, and
+  so does `claude --resume X --fork-session` or `/fork` on a parked session. `revive_handled`
+  filtered the log by local id first, so the parent's exit-0 record could not cover the copy,
+  both rows read DUE for one stop event, and a pass that wakes everything due woke both — two
+  actors continuing one history. The at-most-once key is now the stop event itself when the
+  line carries a uuid (the id + size triple remains the no-uuid fallback), the record names the
+  copy it matched (`handled.copy_of`), and `csm stalled` refuses to call two rows that share a
+  stop uuid due in ONE sweep — keeping the older file, since a copy is written after what it
+  copied.
+- **The machine is read once a sweep, not once a session.** `ps_table`'s contract is "one call,
+  not one per session", and running the whole `diagnose` per candidate broke it: `revive_state`
+  and `server_in_folder` each ask `ps`, `revive_account` asks the credential store,
+  `server_in_folder` asks `lsof` whenever a Remote Control server is up. Measured on the
+  suite's own fixtures: six parked sessions in one home cost 12 machine-wide `ps -Ao` runs and
+  6 credential probes in one sweep, now 1 and 1. `read_only_memo` is opened by `stalled_report`
+  and by nothing else — `revive_recheck` still asks `ps` afresh in the last second before it
+  starts a window, because there the answer's age is the whole question.
+- **`result.forked` says whether a second claude.ai session exists.** The fork row makes the new
+  session, its link and its transcript BEFORE the relay, so an ambiguous registry name, a relay
+  that errors or a turn that never appears all return exit 1 with the fork already made — and a
+  caller reading the exit code alone takes that for "nothing happened", skips archiving the old
+  session and forks again on its next pass. The key is `False` from the start and set exactly
+  where the second session comes into being.
+- **The due sentence ages the reset, not the wake margin.** `ready` is the instant a wake becomes
+  permitted (`resets_at` + `CSM_WAKE_MARGIN_S`), and `human_age` floors — so a two-hour wait read
+  as "1h ago" in the one sentence a person reads.
+- **`csm revive` and `csm stalled` now give one answer about a limit whose class was never
+  named.** `clears_with_time` is `None`, not `False`, when the stop line's own words matched no
+  class, and row 4 keyed on `is False` — so the same build told the reader to wait for the reset
+  while `stalled` said waiting does not clear a limit whose class its own words did not name.
+
 ## [0.6.0] — 2026-10-29
 
 Continuing a stopped session **without anybody asking**. 0.5.0 could revive one session a person
@@ -1242,6 +1292,7 @@ Initial public release.
 - Fixture-only tests (fake homes, fake `claude`, fake tmux; no network, no account) and CI on
   ubuntu and macOS × Python 3.9 and 3.12.
 
+[0.6.1]: https://github.com/yaroslavvb/claude-session-mover/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/yaroslavvb/claude-session-mover/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/yaroslavvb/claude-session-mover/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/yaroslavvb/claude-session-mover/compare/v0.3.1...v0.4.0

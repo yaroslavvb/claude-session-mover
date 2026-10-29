@@ -109,6 +109,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import contextlib
 import errno
 import hashlib
 import json
@@ -132,7 +133,7 @@ try:                                      # POSIX only; the tool is macOS/Linux 
 except ImportError:                       # pragma: no cover
     pwd = None
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 PROG = "claude-session-mover"
 
 HOME = Path(os.path.expanduser("~"))
@@ -2612,6 +2613,47 @@ def machine_default_mode(accts: list = None):
     return "", ""
 
 
+#: 🛑 THE READ-ONLY SWEEP'S OWN MEMO, AND NOTHING ELSE'S. `ps_table`'s promise below is "one
+#: call, not one per session", and `csm stalled` broke it the moment it ran the whole
+#: `diagnose` per candidate: `revive_state` and `server_in_folder` each ask `ps`,
+#: `revive_account` asks the credential store, `server_in_folder` asks `lsof` once a Remote
+#: Control server is up — which on an always-on Mac is always. Measured Thu 29 Oct 2026 (week
+#: 44) on the suite's own fixtures: six parked sessions in ONE home cost 12 machine-wide
+#: `ps -Ao` runs and 6 credential probes in one sweep, against 1 and 1 after — at ~101 ms per
+#: `ps` here, and the cost grows with the number of parked sessions, i.e. exactly when the loop
+#: that reads this matters most. Each answer is a property of the MACHINE, the HOME or the
+#: FOLDER and not of the session, so inside one read-only sweep each is read once.
+#: ⚠️ NEVER FOR A CALLER THAT ACTS, and `revive` is the caller that acts. `revive_recheck` asks
+#: `ps` again in the last second before it starts a window precisely because a Remote Control
+#: server respawns its child lazily and one can appear between the diagnosis and the start; a
+#: cached reading there would hand it an answer from minutes ago and two CLIs would end up
+#: appending to one transcript. So the memo is opened by `stalled_report` and by nothing else,
+#: and it lives no longer than that one call.
+_MEMO = None                             # type: dict | None
+
+
+@contextlib.contextmanager
+def read_only_memo():
+    """Inside this block the machine-wide probes answer once per key. Read-only callers only."""
+    global _MEMO
+    outer = _MEMO
+    if outer is None:
+        _MEMO = {}
+    try:
+        yield _MEMO
+    finally:
+        _MEMO = outer
+
+
+def _memo(key, make):
+    """`make()`, called once per key while a memo is open — and every time when none is."""
+    if _MEMO is None:
+        return make()
+    if key not in _MEMO:
+        _MEMO[key] = make()
+    return _MEMO[key]
+
+
 def ps_table():
     """`{pid: its whole command line}` in ONE `ps`, or `None` when `ps` COULD NOT BE ASKED.
 
@@ -2619,7 +2661,14 @@ def ps_table():
     a busy machine) and `_ps` spawns a process each time. `None` and `{}` are kept apart for
     the same reason `_ps` keeps them apart — "ps did not answer" is not "that pid is not
     there", and conflating them turns a blinded prover into agreement.
+
+    Inside `read_only_memo` this is asked once; everywhere else — `revive`'s own re-check
+    above all — it is asked afresh, because there the answer's age is the whole question.
     """
+    return _memo(("ps",), _ps_table_now)
+
+
+def _ps_table_now():
     env = scrubbed_env(dict(os.environ))
     env["LC_ALL"] = "C"                   # one locale, so a parse is a parse everywhere
     env.pop("LANG", None)
@@ -7138,6 +7187,13 @@ def revive_lost_work(s: Session) -> dict:
 def revive_account(s: Session, accts: list, probe: bool = True) -> dict:
     """Can the session's OWN home still run it, and how much quota does that account have?
 
+    🛑 ONE READING PER ACCOUNT, not per session, inside `read_only_memo`. Every answer here
+    is a property of the HOME: six parked sessions in one home used to cost six
+    `security find-generic-password` calls in one sweep, and `credential_present`'s own
+    warning is that each one is another chance to block on a locked keychain that an
+    unattended run has nobody to unlock. The copy is shallow so a caller that annotates
+    `rec["account"]` cannot write into the next session's answer.
+
     `usable` is `check_home_usable`'s verdict, caught rather than raised: a diagnosis says
     what is wrong, and the refusal belongs to whatever decides to act.
 
@@ -7155,6 +7211,11 @@ def revive_account(s: Session, accts: list, probe: bool = True) -> dict:
     `quotaLimits.resetsAt` (see `revive_stop`), and the reading here is reported as
     `fresh` / `stale` / `unread` — unread is never room.
     """
+    return dict(_memo(("account", s.account.name, bool(probe)),
+                      lambda: _revive_account_now(s, accts, probe)))
+
+
+def _revive_account_now(s: Session, accts: list, probe: bool) -> dict:
     a = s.account
     out = {"label": a.label, "email": a.email, "home": tilde(a.home), "usable": None,
            "why": "", "meter": "unread", "meter_text": meter_text(None),
@@ -7225,7 +7286,19 @@ def server_in_folder(cwd: str) -> dict:
 
     Best effort by construction: the folder a process is in is not in its argv, so it takes
     an `lsof` per candidate, and an `lsof` that will not answer leaves the question open.
+
+    🛑 ONE READING PER FOLDER inside `read_only_memo`: the answer is about the folder, and a
+    sweep of N sessions in one working directory used to pay N `lsof` calls for it. The key is
+    the realpath, because two sessions can name one folder by two paths.
     """
+    try:
+        key = os.path.realpath(cwd) if cwd else ""
+    except OSError:
+        key = cwd or ""
+    return dict(_memo(("server", key), lambda: _server_in_folder_now(cwd)))
+
+
+def _server_in_folder_now(cwd: str) -> dict:
     out = {"up": None, "why": "", "pids": [], "names": []}
     if not cwd:
         out["why"] = "the session records no folder, so there is nothing to ask about"
@@ -8288,6 +8361,18 @@ def revive_decide(rec: dict, args, tgt: Account = None) -> dict:
             cures.append("waiting does NOT clear a %s limit: move it to an account with "
                          "room (`--to auto`), or lift the cap itself"
                          % (stop.get("class") or "spend/credit/model"))
+        elif waiting is None:
+            # 🛑 AN UNREAD CLASS IS NOT A CLEARING ONE (corrected Thu 29 Oct 2026, week 44).
+            # `clears_with_time` is `None`, not `False`, when the stop line's own words
+            # matched nothing in `LIMIT_CLASSES` — a wording change in the CLI, a line with
+            # no class in it — and `stalled_due` refuses such a row with "waiting does not
+            # clear a limit whose class its own words did not name". Taking the else branch
+            # for it had one build give a reader opposite advice about one session: wait, says
+            # `revive`; waiting is useless, says `stalled`. `revive_home_gate` exists so the
+            # sweep and the run cannot disagree; this is the same duty one layer up.
+            cures.append("its own words did not name a limit class csm knows, so waiting may "
+                         "not clear it at all: read the message in the session itself, or "
+                         "`--to auto` now, onto the account with the most room")
         else:
             cures.append("wait until %s and run this again" % clock(stop["resets_at"]))
             cures.append("or `--to auto` now, onto the account with the most room — which "
@@ -8991,6 +9076,12 @@ def revive_fork(s: Session, rec: dict, args, accts: list, perm: str, rc_name: st
     link, pane, win = revive_start(s, rec, accts, perm, rc_name, out, new_id=new_id)
     if not link:
         return revive_window_failed(out, pane, win, s)
+    # 🛑 A SECOND CLAUDE.AI SESSION EXISTS FROM HERE ON, whatever happens next. Everything
+    # below can still fail — no transcript, an ambiguous name, a relay that errors, a turn
+    # that never appears — and every one of those returns exit 1 with this link live. The
+    # caller's duty (archive the old session, and say loudly that one past has two actors) is
+    # keyed on THIS, never on the exit code.
+    out["forked"] = True
     dest = wait_for_transcript(s.account, new_id, CONNECT_WAIT_S)
     out["fork_file"] = str(dest) if dest else ""
     if dest is None:
@@ -9059,9 +9150,16 @@ def revive_act(s: Session, sp: Spec, args, accts: list, p: dict) -> int:
     """
     rec, dec, tgt = p["rec"], p["dec"], p["tgt"]
     note, perm, rc_name = p["note"], p["perm"], p["rc_name"]
+    # 🛑 `forked` IS ITS OWN KEY, because the exit code cannot carry it (added Thu 29 Oct
+    # 2026, week 44). A fork makes the new session, its link and its transcript BEFORE the
+    # relay, so every relay or proof failure after that returns exit 1 with the fork already
+    # made — and a caller reading the exit code alone takes that for "nothing happened",
+    # skips archiving the old claude.ai session and forks again on its next pass. `False` here
+    # and set exactly where the second session comes into being, so the document says which
+    # of the two it is.
     out = {"row": dec["row"], "action": dec["action"], "started": False, "proved": False,
-           "new_id": "", "link": "", "window": "", "argv": "", "relay": {}, "proof": {},
-           "why": "", "exit": dec["exit"]}
+           "forked": False, "new_id": "", "link": "", "window": "", "argv": "", "relay": {},
+           "proof": {}, "why": "", "exit": dec["exit"]}
 
     if dec["action"] == "refuse":
         out["why"], out["exit"] = revive_refusal(dec), 2
@@ -9425,14 +9523,23 @@ def revive_handled(local_id: str, stop: dict, records: list, size=None) -> dict:
     that was ATTEMPTED AND FAILED: nothing was delivered, the session is still sitting there,
     and it has to stay due or it is never woken at all. Those attempts are counted instead
     (`failed`), which is what `--check` turns into its one FAULT line.
+
+    🛑 AND THE UUID IS MATCHED ACROSS COPIES, not only inside one local id (corrected Thu 29
+    Oct 2026, week 44). A fork COPIES the transcript, so the same stop line — the same uuid —
+    exists under a second local id: csm's own fork row makes one, and so does a person
+    running `claude --resume X --fork-session` or `/fork` on a parked session. Filtering by
+    the id first meant the parent's exit-0 record could not cover the copy, both rows read
+    DUE for ONE stop event, and an unattended pass woke both: two actors continuing one
+    history, which is the one thing this key exists to prevent. The uuid names a transcript
+    line that was written once, so a record carrying it covers every copy of that line.
     """
     key = str((stop or {}).get("uuid") or "")
     mine = [d for d in records
             if str(d.get("local_id") or "").lower() == str(local_id or "").lower()]
     out = {"done": False, "attempts": 0, "failed": 0, "last_exit": None, "at": 0.0,
-           "key": key, "compared": "", "why": ""}
+           "key": key, "compared": "", "copy_of": "", "why": ""}
     if key:
-        hits = [d for d in mine if str(d.get("stop_uuid") or "") == key]
+        hits = [d for d in records if str(d.get("stop_uuid") or "") == key]
         out["compared"] = "stop event %s" % key[:8]
     elif size is not None:
         # 🛑 THE FALLBACK IS 0.5.0's OWN TRIPLE, never a looser match on the id. A stop line
@@ -9454,9 +9561,20 @@ def revive_handled(local_id: str, stop: dict, records: list, size=None) -> dict:
     if hits:
         out["last_exit"] = hits[-1].get("exit")
         out["at"] = float(hits[-1].get("at") or 0.0)
+    if hits:
+        # Whose record it was, when it was not this session's own: a fork's copy is handled
+        # by the parent's wake, and the reader has to be able to see which conversation took
+        # the turn without going to the log for it.
+        other = [d for d in hits
+                 if str(d.get("local_id") or "").lower() != str(local_id or "").lower()]
+        if other:
+            out["copy_of"] = str(other[-1].get("local_id") or "")
+    said = ("" if not out["copy_of"] else
+            " — the record is session %s, which shares this stop line: a fork copies the "
+            "transcript, and one stop event is woken once" % out["copy_of"][:8])
     if out["done"]:
-        out["why"] = ("already revived for this stop at %s (matched on %s)"
-                      % (clock(float(ok[-1].get("at") or 0.0)), out["compared"]))
+        out["why"] = ("already revived for this stop at %s (matched on %s)%s"
+                      % (clock(float(ok[-1].get("at") or 0.0)), out["compared"], said))
     elif bad:
         out["why"] = ("%d wake(s) for this stop FAILED, the last with exit %s at %s (matched "
                       "on %s), so it is still due"
@@ -9475,11 +9593,12 @@ def stalled_due(rec: dict, handled: dict, now: float = 0.0) -> dict:
     finish is not due — it answered, and there is nothing to continue — and neither is an API
     error, which waiting does not fix.
 
-    🛑 AND FIVE THINGS ARE NEVER DUE, whatever their stop: a session that is working right
+    🛑 AND SIX THINGS ARE NEVER DUE, whatever their stop: a session that is working right
     now (a message would join the turn it is in the middle of), one a bot owns (a relay would
     surface in the channel that bot answers), one a scheduled pass owns that is not live and
-    idle (its own supervisor puts that one back), one with no conversation in it, and one
-    archived or ended from the app, which was somebody's decision and not a failure.
+    idle (its own supervisor puts that one back), one whose STATE COULD NOT BE MEASURED, one
+    with no conversation in it, and one archived or ended from the app, which was somebody's
+    decision and not a failure.
     """
     now = now or time.time()
     st = (rec.get("state") or {}).get("state") or "dead"
@@ -9497,6 +9616,20 @@ def stalled_due(rec: dict, handled: dict, now: float = 0.0) -> dict:
                   % (own.get("owner"), st))
     if st == "live-busy":
         return no("it is working right now")
+    if not (rec.get("state") or {}).get("ps_asked"):
+        # 🛑 AN UNMEASURED STATE IS NOT A DEAD ONE (added Thu 29 Oct 2026, week 44).
+        # `revive_state` can only call a session live by PROVING its registry row, and that
+        # proof needs `ps`; `ps_table`'s own promise is that `None` is never "nothing is
+        # running". With `ps` blind every live session therefore reads `dead` — and a live
+        # session that is BUSY ends its transcript on an unanswered tool_use, which is
+        # exactly the `mid-turn` shape this function calls due. So a watchdog would resume a
+        # session that is running, and "two CLIs appending to one transcript cannot be
+        # untangled" (`revive_start`'s own refusal). `stalled_report` already names such a
+        # row in `coverage.unread`; this keeps it listed with its reason and out of the
+        # watchdog's hands. The conditions correlate, which is why it matters: the sweep is
+        # heaviest, and the machine busiest, right after the restart this feature exists for.
+        return no("`ps` could not be asked, so nothing here can say whether a process is "
+                  "running it")
     if stop.get("stop") == "empty":
         return no("there is no conversation to continue")
     if stop.get("archived"):
@@ -9517,9 +9650,15 @@ def stalled_due(rec: dict, handled: dict, now: float = 0.0) -> dict:
         if ready > now:
             return no("its %s limit resets %s, and a wake waits %gs past that"
                       % (klass, clock(stop["resets_at"]), WAKE_MARGIN_S))
+        # ⚠️ THE AGE IS THE RESET'S, NOT THE MARGIN'S. `ready` is the instant a wake becomes
+        # permitted — `resets_at` plus 120 s — and `human_age` floors, so measuring from it
+        # reported a two-hour wait as "1h ago" (found Thu 29 Oct 2026). The sentence is read
+        # by a person asking how long this session has been sitting there, and that is the
+        # age of the reset; `ready` stays what the comparison above is made against.
         return {"due": True,
                 "why": "its %s limit reset at %s, %s ago"
-                       % (klass, clock(stop["resets_at"]), human_age(ready))}
+                       % (klass, clock(stop["resets_at"]),
+                          human_age(float(stop["resets_at"])))}
     if stop.get("stop") == "mid-turn":
         if st != "dead":
             return no("it was cut off mid-turn, but something is running it now (%s)" % st)
@@ -9595,7 +9734,18 @@ def stalled_report(accts: list, since_h: float = 0.0, probe: bool = True) -> dic
 
     `probe=False` leaves every account's credential store unasked, for `--check`, whose
     contract is one line and nothing else on either stream.
+
+    🛑 AND THE MACHINE IS READ ONCE, not once per candidate (`read_only_memo`). This is the
+    one caller that runs the whole `diagnose` over every session in every home, and the
+    probes inside it — the machine-wide `ps`, the credential store, `lsof` — answer about the
+    machine, the home and the folder rather than about the session. Nothing here acts, so
+    nothing here needs a second reading; `revive` opens no memo and asks afresh.
     """
+    with read_only_memo():
+        return _stalled_report(accts, since_h, probe)
+
+
+def _stalled_report(accts: list, since_h: float, probe: bool) -> dict:
     since_h = float(since_h) if since_h else STALLED_SINCE_H
     unread, read = [], []
     found, pres, scanned = stalled_scan(accts, since_h, unread, read)
@@ -9654,6 +9804,27 @@ def stalled_report(accts: list, since_h: float = 0.0, probe: bool = True) -> dic
             "what": dec.get("what"), "handled": handled,
             "prefilter": pre.get("why") or "",
         })
+    # 🛑 ONE STOP EVENT, ONE DUE ROW — even before any wake has been recorded (added Thu 29
+    # Oct 2026, week 44). `revive_handled` keeps a stop from being woken twice ACROSS passes;
+    # this keeps it from being woken twice in ONE pass, which is the state a fork leaves
+    # behind the moment it is made: two transcripts whose last main-chain line is the same
+    # limit line, with the same uuid, and no record yet for either. The older file is the
+    # one kept, because a fork's copy is written after the conversation it copied.
+    stops = {}
+    for r in rows:
+        u = str((r["stop"] or {}).get("uuid") or "")
+        if not (r["due"] and u):
+            continue
+        first = stops.get(u)
+        if first is None or float(r.get("mtime") or 0.0) < float(first.get("mtime") or 0.0):
+            stops[u] = r
+    for r in rows:
+        u = str((r["stop"] or {}).get("uuid") or "")
+        if r["due"] and u and stops.get(u) is not r:
+            r["due"] = False
+            r["why"] = ("session %s ends on the same stop event (%s) and is the copy this "
+                        "sweep woke instead: they share one past, and continuing both would "
+                        "make two actors of it" % (stops[u]["short"], u[:8]))
     # 🛑 DUE FIRST, OLDEST STOP FIRST. The caller takes these rows in order and wakes at most
     # a few per run, and the one that has been waiting longest is the one to wake first —
     # a newer stop would otherwise keep jumping the queue on every pass.

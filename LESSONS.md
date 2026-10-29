@@ -841,6 +841,45 @@ hours. Every one of these is **Beta**: it is behaviour and layout nobody documen
 - **Verified.** Read off this tool's own note builder, Thu 29 Oct 2026. **Stable** (it is a rule
   about what to write, not a measurement of the CLI).
 
+### L54 · A fork copies the transcript, so one stop event lives under two session ids
+
+- **Rule.** Match an unattended wake's at-most-once record on the **stop event uuid alone** when the
+  stop line carries one — never on `(session id, uuid)` — and refuse to call two rows that share a
+  stop uuid due in one sweep.
+- **Why.** `--fork-session` writes a NEW transcript holding every line of the old one, uuids
+  included, and leaves the file it read byte-identical. So the stop line that made the parent due
+  ends the copy too, under a second local id. Filter the log by id first and the parent's exit-0
+  record cannot cover the copy: both rows read **due** for one stop event, and a pass that wakes
+  everything due wakes both — two actors continuing one history, which is the single outcome the
+  key exists to prevent. It needs no bug to reach: a person running `claude --resume X
+  --fork-session`, or `/fork`, on a parked session leaves exactly this pair. A uuid names one
+  transcript line that was written once, so it is already the right key; narrowing it with the id
+  is what breaks it. Keep the `(id, size)` triple only for a stop line that carries no uuid.
+- **Check.** Fork a parked throwaway session, then `csm stalled --json | jq '[.rows[] |
+  {short, due, stop: .stop.uuid, handled: .handled.copy_of}]'`: at most one row sharing a
+  `stop.uuid` may read due, and a record for either must mark both handled.
+- **Verified.** 2.1.312, Thu 29 Oct 2026 (the fork's copied uuids read off the written transcript;
+  the two-due-rows state reproduced in fixtures). **Beta.**
+
+### L55 · A fork that came up is done, whatever the exit code says
+
+- **Rule.** A caller decides whether to archive, and whether to try again, on **what the document
+  says was created** — not on the process's exit code. Publish that as its own key (`result.forked`)
+  rather than leaving it to be inferred.
+- **Why.** The fork row creates the new session, its link and its transcript *before* it relays the
+  note, so every failure after that point — an ambiguous registry name, a relay that errors, a turn
+  that never appears — returns a non-zero exit with the fork already made. An exit code is one
+  number for "nothing happened" and "something happened and could not be proved", and a caller that
+  reads it as the first skips the archive in precisely the cases where the old link is live beside
+  a new one, and leaves the row due so its next pass forks again: three conversations with one past
+  and no archive, each failure buying another. The same holds one level down for a timeout: a caller
+  that SIGKILLs the tool at a cap below the tool's own ceiling destroys the record that would have
+  said what was done, so an unknown outcome must be treated as **done**, never as pending.
+- **Check.** `csm revive <dead server child> --auto --json` with the relay made to fail: `result`
+  must carry `forked: true`, `new_id`, `old_bridge_id` and `archive_old` beside `"exit": 1`.
+- **Verified.** Read off this tool's own fork row, Thu 29 Oct 2026, and reproduced in the fleet
+  caller's fixtures. **Stable** (it is a rule about what a result must state).
+
 <a id="related"></a>
 
 ## Related tools

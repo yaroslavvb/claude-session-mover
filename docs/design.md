@@ -1,6 +1,6 @@
 # Claude Session Mover: design and implementation
 
-Version 0.6.0 · code **[github.com/yaroslavvb/claude-session-mover](https://github.com/yaroslavvb/claude-session-mover)**
+Version 0.6.1 · code **[github.com/yaroslavvb/claude-session-mover](https://github.com/yaroslavvb/claude-session-mover)**
 (MIT, one Python file, standard library only).
 
 Everything here is Claude Code's own **undocumented on-disk state**. It has already changed inside one minor
@@ -930,9 +930,17 @@ sweep.
 (`session`, `weekly`) once `resetsAt + CSM_WAKE_MARGIN_S` has passed; and a `mid-turn` stop whose process is gone,
 inside `CSM_WAKE_MAX_AGE_H`. `monthly-spend`, `credits` and `model` never clear by waiting, and a class whose own
 words nothing matched is not on the positive list either — an unread class is not a clearable one. A `finished`
-stop is not due (it answered), nor is `api-error` (time does not fix it). And five states are never due whatever
-the stop: `live-busy`, bot-owned, owned by a scheduled pass that is not live-idle, `empty`, and archived. Every
-row carries its reason in `why`, so "not due" is never a silence.
+stop is not due (it answered), nor is `api-error` (time does not fix it). And six states are never due whatever
+the stop: `live-busy`, bot-owned, owned by a scheduled pass that is not live-idle, **unmeasured**, `empty`, and
+archived. Every row carries its reason in `why`, so "not due" is never a silence.
+
+🛑 **Unmeasured is the sixth, and it was added in 0.6.1.** A session is only called live by proving its registry
+row, and that proof needs `ps`; `ps_table` answers `None` when `ps` could not be *asked*, and `None` is never
+"nothing is running". With `ps` blind every live session reads `dead` — and a live session that is BUSY ends its
+transcript on an unanswered `tool_use`, which is exactly the `mid-turn` shape above, so the sweep called a
+running session due and a watchdog would have resumed it. `stalled_report` already put the row in
+`coverage.unread`; `stalled_due` now refuses it with that same sentence. The conditions correlate, which is why
+it matters: the sweep is heaviest, and the machine busiest, right after the restart this feature exists for.
 
 **The prefilter is `revive_stop` on a smaller window.** A `diagnose` is a 1 MiB parse plus a machine-wide `ps`,
 and a home holds thousands of transcripts. So the last `CSM_STALLED_PREFILTER` (64 KiB) is parsed first, and only
@@ -946,19 +954,44 @@ a text match on a tail is the thing `revive_stop` exists not to be.
 
 **At most once per stop, keyed on the stop and not on the session.** `revive_stop` reports the `uuid` of the line
 its verdict was read from; `revive_record` writes it as `stop_uuid`; `revive_handled` reads the log's tail back and
-matches `(local id, stop_uuid)`. A session that stopped, was woken, worked for an hour and stopped again has a new
+matches on **`stop_uuid` alone** (0.6.1 — see below). A session that stopped, was woken, worked for an hour and stopped again has a new
 uuid and is due again — which is the whole point, because a key per *session* would wake it once and never more,
 and no key at all would relay the same note twelve times an hour. Handled means a record with **exit 0**: a
 non-zero exit is a wake that was attempted and failed, so the row stays due and the attempt is counted
 (`handled.failed`), which is what `--check` reports as its one `FAULT:`. Where a stop line carries no `uuid`, the
 fallback is 0.5.0's own `(local id, transcript size)` — never the id alone.
 
+🛑 **And the uuid is not narrowed by the local id, because a fork copies the transcript** (0.6.1). `--fork-session`
+writes a new file holding every line of the old one, uuids included, and leaves what it read byte-identical — so
+the stop line that made the parent due ends the copy too, under a second local id. Matching `(local id, uuid)`
+meant the parent's exit-0 record could not cover the copy: both rows read due for ONE stop event and a pass that
+wakes everything due woke both, which is two actors continuing one history. It needs no csm bug to reach — a
+person running `claude --resume X --fork-session`, or `/fork`, on a parked session leaves exactly that pair. So a
+record matches on the stop event, `handled.copy_of` names the session it was matched from, and `stalled_report`
+refuses to call two rows sharing a `stop.uuid` due in one sweep, keeping the older file.
+
+**And the machine is read once a sweep** (`read_only_memo`, 0.6.1). This is the one caller that runs the whole
+`diagnose` over every session in every home, and the probes inside it answer about the machine, the home and the
+folder rather than about the session: `revive_state` and `server_in_folder` each take a machine-wide `ps`,
+`revive_account` asks the credential store, `server_in_folder` asks `lsof`. Measured on the suite's own fixtures:
+six parked sessions in one home cost 12 `ps -Ao` runs and 6 credential probes in one sweep, now 1 and 1. The memo
+is opened by `stalled_report` and by nothing else — `revive_recheck` asks `ps` afresh in the last second before it
+starts a window, because there the answer's *age* is the whole question.
+
 **`--auto` changes two things and no gate.** The note's *attribution*, because nobody typed the run and the
 receiving session decides what to do next on the strength of that sentence; and row 9, which becomes row 10's
 fork, because a dead server child has no unattended way back onto its own link. A fork leaves two conversations
-with one history, so `--json`'s `result` names `old_bridge_id` / `old_url` / `archive_old`: the old claude.ai
-session has to be archived, and csm cannot do that itself — it reads no credential, and archiving is an
+with one history, so `--json`'s `result` names `forked` / `old_bridge_id` / `old_url` / `archive_old`: the old
+claude.ai session has to be archived, and csm cannot do that itself — it reads no credential, and archiving is an
 authenticated call. Every refusal, the limit still in force above all, is untouched.
+
+🛑 **`forked` is its own key because the exit code cannot carry it** (0.6.1). `revive_fork` creates the new
+session, its link and its transcript *before* the relay, so a registry name that turned ambiguous, a relay that
+errored or a turn that never appeared all return **exit 1 with the fork already made** — and a caller reading the
+exit code alone takes that for "nothing happened", skips the archive in exactly the cases where the old link is
+live beside a new one, and forks again on its next pass. `forked` is `False` in `revive_act`'s `out` from the
+start and set at the one line where the second session comes into being; a fork that printed no link leaves it
+`False`, because nothing new came into being there.
 
 **`--check` is `modes --check`'s contract, with one difference worth naming: being due is not a fault.** It is the
 normal state between one pass and the next. The fault is a wake that was tried and failed for the same stop, which

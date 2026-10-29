@@ -133,7 +133,7 @@ try:                                      # POSIX only; the tool is macOS/Linux 
 except ImportError:                       # pragma: no cover
     pwd = None
 
-__version__ = "0.6.2"
+__version__ = "0.6.3"
 PROG = "claude-session-mover"
 
 HOME = Path(os.path.expanduser("~"))
@@ -7005,9 +7005,28 @@ def revive_stop(path: Path, tail: int = 0) -> dict:
     "does this conversation mention a rate limit", which is true of any session that
     discussed one — measured Wed 28 Oct 2026: of 321 transcripts written in the last week
     here, one of the two hits was a session that merely contained the words. And the window
-    starts at the last non-`isMeta`, non-`tool_result` USER line because that is where this
-    attempt began: a limit from a turn two prompts ago was waited out and is not why the
-    session is sitting still now.
+    starts at the last non-`isMeta`, non-`isCompactSummary`, non-`tool_result` USER line
+    because that is where this attempt began: a limit from a turn two prompts ago was waited
+    out and is not why the session is sitting still now.
+
+    🛑 A COMPACTION SUMMARY IS NOT A PROMPT, AND READING IT AS ONE CALLED IDLE SESSIONS DEAD
+    MID-WORK (fixed Thu 29 Oct 2026, week 44, the same day the unanswered-prompt verdict was
+    added). The CLI compacts a session that is SITTING IDLE to keep its prompt cache warm —
+    its own words, in the `informational` line it writes right after: "Compacted while idle,
+    before the prompt cache expired · turn off with \"idleCompaction\": false". What that
+    leaves at the end of the file is a `system` line of subtype `compact_boundary`, a `user`
+    line carrying `isCompactSummary: true` (and `isVisibleInTranscriptOnly: true`) whose text
+    is the summary, and a run of `attachment` lines — and NO assistant line, because the
+    session had already answered everything and nobody had asked it anything since. Measured
+    over all 1,958 transcripts in the config homes on this machine: 132 of them end in that
+    shape, and every one read `mid-turn` — "killed before it said anything" — about a session
+    that was idle precisely because it had finished. With the summary skipped the window opens
+    at the real prompt before it, whose answer is right there, and all 132 read `finished`;
+    the 40 genuinely unanswered prompts in the same corpus are untouched. ⚠️ AND IT IS FIXED
+    HERE, AT THE WINDOW, NOT IN THE VERDICT: a session parked on a usage limit is idle, so it
+    is a candidate for idle compaction too, and a window opening at the summary holds neither
+    the limit line nor the prompt it belongs to — which reads as the wrong stop entirely and,
+    through `stalled_due`'s mid-turn branch, as due NOW rather than at the reset.
 
     🛑 `uuid` IS THE STOP EVENT'S OWN NAME — the `uuid` of the transcript line this verdict
     was read from (the limit line, the error line, the unanswered assistant line, the
@@ -7042,8 +7061,13 @@ def revive_stop(path: Path, tail: int = 0) -> dict:
     out["lines"] = len(rows)
     start = 0
     for i, d in enumerate(rows):
+        # ⚠️ `isCompactSummary` BELONGS IN THIS LIST FOR THE SAME REASON `isMeta` DOES: the
+        # line is `type: "user"` and nobody sent it. It is the CLI's own summary of the
+        # conversation so far, written when a session is compacted — and a session compacted
+        # WHILE IDLE ends its file there, with nothing after it to be the answer the verdicts
+        # below look for (see the 🛑 above).
         if (d.get("type") == "user" and not d.get("isSidechain") and not d.get("isMeta")
-                and not _tool_results(d)):
+                and not d.get("isCompactSummary") and not _tool_results(d)):
             start, out["from_prompt"] = i, True
     window = rows[start:]
     quota, api_err, last_asst = {}, {}, {}
@@ -7160,7 +7184,10 @@ def revive_stop(path: Path, tail: int = 0) -> dict:
     elif out["from_prompt"] and asst_i < 0:
         # 🛑 THE PROMPT ITSELF IS THE STOP EVENT, so its own uuid names it (the at-most-once
         # key). `window[0]` IS that prompt: the window opens at the last real, non-`isMeta`,
-        # non-`tool_result` user line, and `from_prompt` is what says one was found in the
+        # non-`isCompactSummary`, non-`tool_result` user line — a compaction summary is the
+        # CLI's own line and an idle compaction leaves the file ending on one, which is how
+        # this verdict first came to call 132 idle sessions here mid-turn (see the 🛑 in this
+        # function's docstring) — and `from_prompt` is what says one was found in the
         # window at all — without it a tail holding only tool results would report the stop
         # of a turn whose prompt this read never saw. `tool` stays empty, and that is the one
         # thing that tells the two mid-turn shapes apart downstream (`revive_risk`, the note).

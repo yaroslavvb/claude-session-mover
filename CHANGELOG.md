@@ -9,6 +9,40 @@ Every fact below was measured against Claude Code 2.1.296–2.1.300 on macOS. Th
 state it reads is undocumented and can change in any CLI release; the tests pin every shape
 the tool depends on.
 
+## [0.6.3] — 2026-10-29
+
+What an adversarial review of 0.6.2 found the same day, by running both readers over every
+transcript in the config homes on one machine (1,958 files): the new unanswered-prompt verdict
+fired on 132 of them, and in every one of those the session had answered everything anybody
+asked it. 764 tests (761 + 3).
+
+### Fixed
+
+- **A compaction summary is not a prompt, and reading it as one called idle sessions dead
+  mid-work.** The CLI compacts a session that is SITTING IDLE to keep its prompt cache warm, and
+  says so itself in the `informational` line it writes right after: *"Compacted while idle, before
+  the prompt cache expired · turn off with `"idleCompaction": false`"*. What that leaves at the end
+  of the file is a `system` line of subtype `compact_boundary`, a `user` line carrying
+  `isCompactSummary: true` (and `isVisibleInTranscriptOnly: true`) whose text is the summary, and a
+  run of `attachment` lines — and NO assistant line, because the session was idle. 0.6.2's window
+  opened at that summary, found nothing after it, and reported `mid-turn`: *"killed before it said
+  anything"*, about a session that was idle precisely because it had finished. Measured over all
+  1,958 transcripts in the config homes on this machine: 132 end in that shape, nine of them inside
+  `CSM_WAKE_MAX_AGE_H`, and for a dead Remote Control child the action an unattended caller takes
+  on that verdict is a FORK plus archiving the claude.ai link the session already had.
+  - `isCompactSummary` now joins `isMeta` and `tool_result` in the lines a window may not open at:
+    the line is `type: "user"` and nobody sent it. The window then opens at the real prompt before
+    the compaction, whose answer is in the same window, and all 132 read `finished`. The 40
+    genuinely unanswered prompts in that corpus — eight of them carrying the CLI's own
+    `interruptedByShutdown` — are untouched, and no other verdict moves: `usage-limit` 39,
+    `api-error` 22, `finished` 1,589, `empty` 132, `mid-turn` (unanswered tool call) 4, all
+    identical before and after.
+  - 🛑 AND IT IS FIXED AT THE WINDOW, NOT IN THE VERDICT. A session parked on a usage limit is
+    idle, so it is a candidate for idle compaction too — and a window opening at the summary holds
+    neither the limit line nor the prompt it belongs to. Such a session read `mid-turn` rather than
+    `usage-limit`, which `stalled_due` calls due NOW instead of at the reset: pinned by a test,
+    because waking inside the window spends the session's first turn on a second 429.
+
 ## [0.6.2] — 2026-10-29
 
 What a live end-to-end run of the waker on throwaway sessions found (CLI 2.1.312, the same day):

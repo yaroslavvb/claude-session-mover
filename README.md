@@ -1207,6 +1207,17 @@ what tells the two shapes apart: empty means nothing it may have begun is record
 is *thinking* leaves the same bytes on disk, which is why no mid-turn stop is ever due while something is
 running it.
 
+**A compaction summary is not a prompt** (0.6.3). The CLI compacts a session *because* it is idle — "Compacted
+while idle, before the prompt cache expired", in its own words — and the file then ends on the
+`compact_boundary` line, a `user` line carrying `isCompactSummary: true`, and a run of attachments, with no
+assistant line after any of it. That is the shape above, so 0.6.2 read it as a kill: measured over all 1,958
+transcripts in the config homes on one machine, 132 of them, every one a session that was idle because it had
+answered everything. `isCompactSummary` now joins `isMeta` in the lines a window may not open at, so the window
+opens at the real prompt before the compaction and its answer is right there. The fix is at the window and not
+in the verdict on purpose: a session parked on a usage limit is idle too, and a window opening at the summary
+holds neither the limit line nor the prompt it belongs to — so that session read `mid-turn`, due NOW, instead of
+`usage-limit`, due at the reset.
+
 **One stop event is one wake, however many copies of the transcript exist** — see *At most once per stop* below.
 
 ### What each state gets

@@ -4541,6 +4541,41 @@ def tokens_reminder(cwd, sid, uuid="t9", parent="u1"):
             "uuid": uuid, "parentUuid": parent}
 
 
+def idle_compaction(cwd, sid, uuid="c9", parent="a1"):
+    """WHAT THE CLI LEAVES AT THE END OF A SESSION IT COMPACTED WHILE IT WAS IDLE.
+
+    🛑 THE MEASURED SHAPE (the config homes on this machine, Thu 29 Oct 2026, week 44: 132
+    of 1,958 transcripts end in it). The CLI compacts an IDLE session to keep its prompt
+    cache warm and says so itself in the `informational` line it writes after — "Compacted
+    while idle, before the prompt cache expired" — so the file ends on a `compact_boundary`
+    system line, a `user` line carrying `isCompactSummary: true` and
+    `isVisibleInTranscriptOnly: true` whose text is the summary, and a run of `attachment`
+    lines. There is no assistant line after it, because the session was idle: it had already
+    answered everything anybody asked. Returned as the whole run of lines, in order.
+    """
+    summary = user("This session is being continued from a previous conversation that ran "
+                   "out of context. The summary below covers the earlier portion.",
+                   cwd, sid, uuid=uuid, parent=parent)
+    summary["isCompactSummary"] = True
+    summary["isVisibleInTranscriptOnly"] = True
+    summary["turnPosition"] = {"promptIndex": 1, "turnIndex": 1}
+    def att(kind, u):
+        return {"type": "attachment", "cwd": cwd, "sessionId": sid, "isSidechain": False,
+                "attachment": {"type": kind}, "renderedRole": "system",
+                "uuid": u, "parentUuid": uuid}
+    return [{"type": "system", "subtype": "compact_boundary", "isSidechain": False,
+             "isMeta": False, "cwd": cwd, "sessionId": sid, "uuid": "sysc", "parentUuid": parent,
+             "message": {"role": "system", "content": ""},
+             "compactMetadata": {"trigger": "auto", "preTokens": 170000}},
+            summary,
+            att("compact_file_reference", "at1"), att("environment", "at2"),
+            att("skill_listing", "at3"),
+            {"type": "system", "subtype": "informational", "isSidechain": False,
+             "isMeta": False, "cwd": cwd, "sessionId": sid, "uuid": "sysi",
+             "parentUuid": uuid, "content": "Compacted while idle, before the prompt cache "
+                                            "expired · turn off with \"idleCompaction\": false"}]
+
+
 class ReviveDiagnose(InProc):
     """🛑 WHY IT STOPPED, WHAT IT IS, AND WHETHER IT RUNS — the three answers every revive
     action is chosen from, so every one of them is pinned here rather than inferred.
@@ -4851,6 +4886,50 @@ class ReviveDiagnose(InProc):
         side["isSidechain"] = True
         st = self.stop_of(self.stamped_go(), side)
         self.assertEqual((st["stop"], st["uuid"]), ("mid-turn", "u1"))
+
+    def test_a_session_COMPACTED_WHILE_IDLE_answered_everything_and_is_not_mid_turn(self):
+        """🛑 THE SHAPE THAT MADE THE UNANSWERED-PROMPT VERDICT CALL IDLE SESSIONS DEAD
+        MID-WORK (fixed Thu 29 Oct 2026, week 44, the day the verdict was added).
+
+        The CLI compacts a session that is SITTING IDLE to keep its prompt cache warm, and
+        the file then ends on the `compact_boundary` system line, the `isCompactSummary`
+        user line and a run of attachments, with NO assistant line after it — because the
+        session was idle, having answered everything. Measured over all 1,958 transcripts in
+        the config homes on this machine that day: 132 end in that shape, and every one of
+        them read `mid-turn`, "killed before it said anything", about a session that had
+        finished. For a dead Remote Control child that verdict is DUE, and the action is a
+        FORK plus archiving the claude.ai link it already had.
+
+        The summary is not a prompt, so the window skips it exactly as it skips `isMeta`,
+        and the real prompt's answer is right there: `finished`.
+        """
+        st = self.stop_of(self.stamped_go(), self.clean(), *idle_compaction(self.cwd, SID_A))
+        self.assertEqual(st["stop"], "finished")
+        self.assertEqual(st["uuid"], "a1", "the answer it gave is the event, not the summary")
+
+    def test_a_compaction_summary_never_opens_the_window_over_the_limit_it_followed(self):
+        """🛑 AND THAT IS WHY THE FIX IS AT THE WINDOW, NOT IN THE VERDICT. A session parked
+        on a usage limit is idle, so it is a candidate for idle compaction too — and a window
+        that opened at the summary would hold neither the limit line nor the prompt it
+        belongs to. The stop would read `mid-turn` instead of `usage-limit`, which
+        `stalled_due` calls due NOW rather than at the reset: the one thing the brief's first
+        safety rule forbids (`Never wake before the reset`)."""
+        resets = time.time() + 3600
+        st = self.stop_of(self.stamped_go(), self.limit(resets=resets),
+                          *idle_compaction(self.cwd, SID_A, parent="a2"))
+        self.assertEqual(st["stop"], "usage-limit")
+        self.assertIs(st["in_force"], True)
+        self.assertAlmostEqual(st["resets_at"], resets, places=0)
+
+    def test_a_compaction_the_session_then_ANSWERED_is_still_a_finish(self):
+        """The ordinary compaction: it happens mid-turn, the session keeps going and answers.
+        Skipping the summary must not lose that answer — the window opens at the prompt
+        before the compaction and the answer after it is in the same window."""
+        st = self.stop_of(self.stamped_go(), *idle_compaction(self.cwd, SID_A))
+        self.assertEqual(st["stop"], "mid-turn", "nothing answered that prompt, before or after")
+        st2 = self.stop_of(self.stamped_go(), *idle_compaction(self.cwd, SID_A),
+                           self.clean(uuid="a7", parent="c9"))
+        self.assertEqual((st2["stop"], st2["uuid"]), ("finished", "a7"))
 
     def test_the_window_opens_at_the_last_REAL_prompt(self):
         """A `tool_result` and an `isMeta` line are both `type: "user"` and neither is a

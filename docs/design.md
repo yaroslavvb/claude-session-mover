@@ -1,6 +1,6 @@
 # Claude Session Mover: design and implementation
 
-Version 0.6.2 · code **[github.com/yaroslavvb/claude-session-mover](https://github.com/yaroslavvb/claude-session-mover)**
+Version 0.6.3 · code **[github.com/yaroslavvb/claude-session-mover](https://github.com/yaroslavvb/claude-session-mover)**
 (MIT, one Python file, standard library only).
 
 Everything here is Claude Code's own **undocumented on-disk state**. It has already changed inside one minor
@@ -939,6 +939,16 @@ after it — the file a kill in the first seconds of a turn leaves, measured on 
 `total_tokens_reminder` attachment and nothing else. Before 0.6.2 that read `unknown`: not due, and carrying no
 `uuid`, so the at-most-once key had no name for the stop. The prompt line itself is the stop event. ⚠️ A live
 session that is thinking leaves the same bytes, which is why the refusal below matters more, not less.
+
+🛑 **Which is why a COMPACTION SUMMARY may not open the window (0.6.3).** The CLI compacts a session *because* it
+is idle ("Compacted while idle, before the prompt cache expired"), and the file then ends on a `compact_boundary`
+system line, a `user` line carrying `isCompactSummary: true`, and a run of attachments — the second shape above,
+exactly. Measured over all 1,958 transcripts in the config homes on one machine: 132 of them, each a session
+that was idle because it had answered everything, every one read as a kill. `isCompactSummary` therefore joins
+`isMeta` and `tool_result` among the lines the window skips, so the window opens at the real prompt before the
+compaction and finds its answer. Fixing it at the window rather than in the verdict is deliberate: a session
+parked on a usage limit is idle too, and a window opening at the summary holds neither the limit line nor the
+prompt it belongs to, so that session read `mid-turn` — due now — instead of `usage-limit`, due at the reset.
 
 🛑 **Unmeasured is the sixth, and it was added in 0.6.1.** A session is only called live by proving its registry
 row, and that proof needs `ps`; `ps_table` answers `None` when `ps` could not be *asked*, and `None` is never

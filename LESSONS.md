@@ -907,6 +907,36 @@ hours. Every one of these is **Beta**: it is behaviour and layout nobody documen
   undocumented on-disk layout; the *absence of an assistant line* is the part that does not depend
   on it.
 
+### L57 · The CLI compacts a session BECAUSE it is idle, and that leaves the shape of a kill
+
+- **Rule.** A `user` line carrying `isCompactSummary: true` is the CLI's own summary of the
+  conversation so far. Nobody sent it, so a reader looking for "the last real prompt" must skip it
+  exactly as it skips `isMeta` — or the absence of an answer after it reads as a session killed
+  before it could answer, when what it really means is that nobody had asked anything.
+- **Why.** Idle compaction (the CLI's own words, in the `informational` line right after the
+  boundary: *"Compacted while idle, before the prompt cache expired · turn off with
+  `"idleCompaction": false`"*) compacts a session that is sitting idle to keep its prompt cache
+  warm. The file then ends on a `system` line of subtype `compact_boundary`, the summary line, and a
+  run of `attachment` lines, with no assistant line after any of it — the same shape as L56's kill
+  in the first seconds of a turn. Measured Thu 29 Oct 2026 by running the reader over every
+  transcript in the config homes on one machine: of 1,958 files, 132 end that way, and 0.6.2 read
+  every one of them as `mid-turn` — "killed before it said anything" — about a session that was
+  idle precisely because it had answered everything. For a dead Remote Control child the action an
+  unattended caller takes on that verdict is a fork plus archiving the link the session already had.
+  🛑 And the fix belongs at the WINDOW, not in the verdict: a session parked on a usage limit is
+  idle, so it is a candidate for idle compaction too, and a window opening at the summary holds
+  neither the limit line nor the prompt it belongs to — so that session read `mid-turn`, which is
+  due NOW, instead of `usage-limit`, which is due at the reset.
+- **Check.** Over one machine's own transcripts, which is the only place this shape is common:
+  ```sh
+  for f in ~/.claude*/projects/*/*.jsonl; do
+    tail -40 "$f" | jq -sr 'map(select(.isCompactSummary)) | length' | grep -q '^[1-9]' && echo "$f"
+  done | head             # each of these must read `finished`, never `mid-turn`
+  csm revive <one of them> --dry-run | sed -n '2p;4p'
+  ```
+- **Verified.** 2.1.312 (measured over 1,958 transcripts on one machine). **Beta** — `isCompactSummary`
+  is undocumented on-disk layout, and a build that renamed it would put the old reading back.
+
 <a id="related"></a>
 
 ## Related tools

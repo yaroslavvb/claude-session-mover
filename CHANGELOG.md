@@ -205,6 +205,12 @@ deliberate change to an existing contract.
 The first eleven entries are the review of this release's own commits, applied before it shipped.
 Each one has a test that fails without the fix.
 
+- **The note now reaches a session resumed over a stale registry row.** Right after a resume there
+  can be two registry files for one id: a stale one whose pid was reused, and the new process's.
+  `live_rows` keeps whichever sorts last by file name, which compares pids as text, so the stale row
+  could mask the real one. The relay then found no name and sent nothing (exit 1, "not proved").
+  Seen once on a CI runner, depending on which pid it handed out. `live_name` now reads every row
+  for the id and takes the proved one; a test swaps the two rows' roles so either order is covered.
 - **The suite no longer depends on the machine it runs on** (tests and CI only; the tool is
   unchanged). The fake tmux keyed a pane file by window name, so a window reopened under the same
   name shared a file with the old window's still-running process, whose exit trailer could land

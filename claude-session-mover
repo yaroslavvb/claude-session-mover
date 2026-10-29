@@ -7789,6 +7789,34 @@ def relay_note(acct: Account, name: str, note: str, model: str = "",
     return out
 
 
+def live_rows_for(acct: Account, local_id: str) -> list:
+    """EVERY running registry row in this home that names `local_id`, in file-name order.
+
+    `live_rows` keeps one row per id. That is right for a listing and wrong for the one
+    question where two rows for one id is the case that matters: see `live_name`.
+    """
+    out = []
+    d = acct.home / "sessions"
+    try:
+        names = sorted(os.listdir(str(d)))
+    except OSError:
+        return out
+    for n in names:
+        if not n.endswith(".json") or n.startswith("."):
+            continue
+        try:
+            pid = int(n[:-len(".json")])
+        except ValueError:
+            continue
+        if not pid_alive(pid):
+            continue
+        r = read_json(d / n)
+        if isinstance(r, dict) and r.get("sessionId") == local_id:
+            r["pid"] = pid
+            out.append(r)
+    return out
+
+
 def live_name(acct: Account, local_id: str, transcript: Path) -> dict:
     """That session's live registry row in this home, with its pid PROVED, or `{}`.
 
@@ -7796,20 +7824,25 @@ def live_name(acct: Account, local_id: str, transcript: Path) -> dict:
     session — but a registry file outlives its process, so an unproved row is no row at all
     here: messaging the name of a dead row would send the note to whatever answers to it
     next.
+
+    🛑 EVERY ROW FOR THAT ID, NOT THE ONE `live_rows` KEPT. Right after a resume there can be
+    two: a stale file whose pid was reused, and the process just started. `live_rows` keeps
+    whichever sorts last by file name, which is the pid compared as TEXT ("9956.json" after
+    "10234.json"), so the stale row could mask the real one for the whole wait and the note
+    went to nobody. That failed a resume-in-place test on one CI runner and not the next,
+    because it depended on which pid the runner handed out (Wed 28 Oct 2026).
     """
-    r = live_rows(acct).get(local_id)
-    if not isinstance(r, dict):
-        return {}
-    probe = Session(account=acct, local_id=local_id, transcript=transcript, mtime=0.0,
-                    pid=int(r.get("pid") or 0),
-                    proc_start=str(r.get("procStart") or ""),
-                    status=str(r.get("status") or ""))
-    ok, why = still_the_same_process(probe)
-    if not ok:
-        return {}
-    out = dict(r)
-    out["csm_proof"] = why
-    return out
+    for r in live_rows_for(acct, local_id):
+        probe = Session(account=acct, local_id=local_id, transcript=transcript, mtime=0.0,
+                        pid=int(r.get("pid") or 0),
+                        proc_start=str(r.get("procStart") or ""),
+                        status=str(r.get("status") or ""))
+        ok, why = still_the_same_process(probe)
+        if ok:
+            out = dict(r)
+            out["csm_proof"] = why
+            return out
+    return {}
 
 
 def name_twins(acct: Account, local_id: str, name: str) -> list:

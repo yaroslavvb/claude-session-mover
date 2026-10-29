@@ -4544,6 +4544,29 @@ class ReviveDiagnose(InProc):
         self.cwd = str(self.root / "work")
         os.makedirs(self.cwd, exist_ok=True)
 
+    def test_the_proved_row_is_found_whichever_of_two_rows_for_the_id_sorts_last(self):
+        """🛑 `live_name` reads EVERY registry row for the id. Two rows for one id is the
+        state right after a resume: a stale file whose pid was reused, and the new process.
+        Which one `live_rows` kept depended on the pids compared as text, so on one CI
+        runner the stale row masked the real one and the note went to nobody (Wed 28 Oct
+        2026). The roles are swapped halfway, so either file sorting last is covered."""
+        reg = self.a.home / "sessions"
+        reg.mkdir(exist_ok=True)
+        one, two = self.claude_proc(), self.claude_proc()
+        t = self.sess(self.go(), self.clean())
+
+        def rows(real, stale):
+            (reg / ("%d.json" % real.pid)).write_text(json.dumps(
+                {"pid": real.pid, "sessionId": SID_A, "name": "the-real-one",
+                 "procStart": ps_start(real.pid)}))
+            (reg / ("%d.json" % stale.pid)).write_text(json.dumps(
+                {"pid": stale.pid, "sessionId": SID_A, "name": "a-stale-row",
+                 "procStart": "Mon Jan  1 00:00:00 2024"}))
+            return self.mod.live_name(self.a, SID_A, t.transcript).get("name")
+
+        self.assertEqual(rows(one, two), "the-real-one")
+        self.assertEqual(rows(two, one), "the-real-one")
+
     # --- fixtures ---------------------------------------------------------
     def sess(self, *lines, **kw):
         return self.session(self.a, lines=list(lines) or None, **kw)

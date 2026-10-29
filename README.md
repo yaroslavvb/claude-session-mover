@@ -10,27 +10,32 @@ it there under the other login. The agent remembers everything that was said, ev
 the other account, and nothing is deleted from the old one. With `--from-machine` it does the same across two
 machines: the session is found on the other one, copied over ssh, and resumed here. And when a session has
 stopped answering altogether — a usage limit, a restart, a Remote Control disconnect — `csm revive` reads why out
-of its own transcript and brings it back, from nothing but its claude.ai link
-([below](#revive-a-dead-session)).
+of its own transcript and says what brings it back: a resume in place, a fork onto a new link, a move to an
+account with room, or the one thing to tap when only that session's own server can reopen it. Usually from
+nothing but its claude.ai link ([the walkthrough](#restart-a-session-that-died)).
 
 ## Start here
 
-New here? This part is the whole tool in five minutes. `csm` is one command you type in a terminal. It
-copies, resumes and reports; it never edits or deletes a conversation. Four jobs:
+New here? This part is the whole tool in five minutes. `csm` is one command you type in a terminal, on the
+machine the session lives on. It copies, resumes and reports; it never edits or deletes a conversation. (No
+terminal to hand? Install it with `./install.sh --skill` and ask any session on that machine that still has
+quota — [From a phone](#from-a-phone).) Four jobs:
 
 | you want to | the command |
 |---|---|
 | **continue a session on another of your accounts**, because the one it is on is out of quota | `csm move <session> --to <account>` |
-| **bring back a session that stopped** — a machine restart killed it, Remote Control disconnected, it hit a usage limit | `csm revive <session>` |
+| **bring back a session that stopped** — a machine restart killed it, Remote Control disconnected, something killed it mid-turn, it hit a usage limit (add `--to <account>` while that limit is still in force) | `csm revive <session>` |
 | **find a session** in any of your accounts, on this machine or another | `csm find "<id, link or words>"` |
 | **see what you have** — the accounts here, and their recent sessions | `csm accounts`, `csm list` |
 
 Three more for afterwards: `csm stop` ends a session csm started and frees its window, `csm modes` says
-which live sessions run in a weaker permission mode than this machine asks for, and `csm matrix` prints
-what your accounts share and what they cannot. [Commands](#commands) has all of them in full.
+which live sessions run in a weaker permission mode than this machine asks for — a worker a Remote Control
+server spawned can come up weaker than your `settings.json` says — and `csm matrix` prints what your accounts
+share and what they cannot. [Commands](#commands) has all of them in full.
 
-**`--dry-run` on `move`, `revive` and `stop` prints the whole plan and changes nothing.** It is the right
-first command for anything you have not done before.
+**`--dry-run` on `move`, `revive` and `stop` prints the whole plan and changes nothing**: it copies, starts,
+wakes, moves and signals nothing, and writes nothing but one line in csm's own log. It is the right first
+command for anything you have not done before.
 
 ### Install
 
@@ -41,9 +46,10 @@ cd claude-session-mover
 ```
 
 Python 3.7 or newer, standard library only — nothing to install with pip. Plus Claude Code itself, and
-tmux for the default Remote Control mode (`--foreground` needs none). macOS and Linux. The two install
-variants, `--skill` (which is what lets you drive csm by talking to a session from a phone) and
-`--no-short-name`, are in [Quick start](#quick-start) below.
+tmux for the default Remote Control mode (`--foreground` needs none). macOS and Linux. The links go in
+`~/.local/bin` (`CSM_BIN_DIR` changes that), and `install.sh` prints `note: … is not on your PATH` when it is
+not on yours — read the lines it prints. The two install variants, `--skill` (which is what lets you drive
+csm by talking to a session from a phone) and `--no-short-name`, are in [Quick start](#quick-start) below.
 
 **What csm needs to know about your accounts.** One *config home* per account — a directory
 `CLAUDE_CONFIG_DIR` points at, holding one login — each signed in once:
@@ -56,7 +62,8 @@ CLAUDE_CONFIG_DIR=~/.claude-work claude      # then /login as that account
 is the account `<name>`, so that one line is enough to have two accounts csm can move a session between.
 To name the accounts yourself, to pin which login each home must hold, or to share one list across
 machines, write an accounts file — [`csm accounts`](#csm-accounts) has both dialects and every column.
-Then look; neither of these writes anything:
+Then look; neither of these touches a session or a config home (`csm list` only leaves its row numbering
+behind, in csm's own state directory):
 
 ```sh
 csm accounts        # the homes found here, and the email each one is signed in as
@@ -66,30 +73,40 @@ csm list            # recent sessions in every account, newest first
 ### What do I give csm?
 
 `csm move`, `csm revive` and `csm stop` each take one `SESSION` argument, and six different things are
-accepted there. They are not six names for one id: **there are two ids**, and knowing which one you are
-holding is the difference between "it just works" and "no session matches". (`csm find` takes the same
-things except a row number — it is the command for when you have only words.)
+accepted there. Behind those six ways of naming a session there are **two ids** — the claude.ai one (rows 1–2
+below) and the local one (rows 3–4); a row number and title words are not ids at all — and which one you are
+holding is the difference between "it just works" and "no session matches". (`csm find` takes the same things
+except a row number — it is the command for when you have only words.)
 
 **"Remote Control" decides a lot of what follows, so once:** it is how a session on this machine is driven
-from the Claude app or a phone — either a `claude remote-control` server serving a folder and starting
-sessions in it, or a session that asked for it itself (`claude --remote-control=<title>`). Those are the
-sessions that have a claude.ai link; a plain `claude` in a terminal has none until csm gives it one.
+from the Claude app or a phone, and it makes three kinds of session that the rest of this page keeps apart:
+
+- a **server child**: a `claude remote-control` server serves a folder and starts sessions in it. This is the
+  kind you are most likely to be rescuing, and the only one csm cannot put back on its own link.
+- a **self-hosted** session: one that asked for Remote Control itself (`claude --remote-control=<title>`), so
+  it hosts its own link.
+- a **terminal** session: a plain `claude` in a terminal. It has no claude.ai link at all until csm gives it one.
+
+You do not have to work out which one you have, and you cannot tell from the app: `csm revive … --dry-run`
+proves it, says so on its `what it is` line, and picks the answer from it.
 
 | what you give it | what it looks like | where you find it | when to use it |
 |---|---|---|---|
-| **a claude.ai link** — the recommended one | `https://claude.ai/code/session_01PHXskvoLtckdvqFv3F8rei` | **in the app**, on a phone or a desktop: it is the address of that session's page, and in a browser it is what the address bar shows. **In a terminal**: a session that asked for Remote Control itself reports it in the session (`/remote-control is active · Continue here, on your phone, or at https…`), `csm list --json` carries each session's `url`, and `csm move` prints the new one when a move finishes | **whenever the session has stopped.** For a Remote Control session csm *computes* the transcript's file name from the link, so it resolves with nothing running: no process, no registry row, no network, no guessing |
-| **the bare claude.ai id** | `session_01PHXskvoLtckdvqFv3F8rei`, or the same id as `cse_01PHXskvoLtckdvqFv3F8rei` | it is the last segment of that link. Remote Control writes the very same id with a `cse_` prefix instead | exactly the same thing as the link — **one id, two prefixes**, and csm accepts either. Useful when you have the id but not the url |
+| **a claude.ai link** — the recommended one | `https://claude.ai/code/session_01PHXskvoLtckdvqFv3F8rei` | **in the app**, on a phone or a desktop: it is the address of that session's page, and in a browser it is what the address bar shows. **In a terminal**: a session that asked for Remote Control itself prints it in the session — the banner the `/remote-control` command leaves (`… is active · Continue here, on your phone, or at https…`) — while `csm list --json` carries each session's `url`, and `csm move` prints the new one when a move finishes | **whenever the session has stopped.** For a Remote Control session csm *computes* the transcript's file name from the link, so it resolves with nothing running: no process, no registry row, no network, no guessing |
+| **the bare claude.ai id** | `session_01PHXskvoLtckdvqFv3F8rei`, or the same id as `cse_01PHXskvoLtckdvqFv3F8rei` | it is the last segment of that link. Remote Control writes the very same id with a `cse_` prefix instead — that spelling is what you see in a running session's registry row and in a server's own command line, so if you have the link you already have this id | exactly the same thing as the link — **one id, two prefixes**, and csm accepts either. Useful when you have the id but not the url |
 | **the local session id** — Claude Code's own | `bf974a77-c0b0-5763-81be-f057a3dc7e57`, or just `bf974a77` | it *is* the transcript's file name: `<config home>/projects/<folder>/<id>.jsonl`. `csm list` and `csm find` print its first 8 characters; `--json` on either carries the whole id | when you got it from `csm list` or `csm find`. **A prefix of 4 characters or more is enough**, as long as it matches exactly one session; anything ambiguous is listed, never guessed |
-| **a spacesheep session page link** | `https://spacesheep.dev/sessions/claude-code/bf974a77-c0b0-5763-81be-f057a3dc7e57` | the address of that page | the uuid in such a link *is* the local session id, so it names the transcript directly, with no arithmetic and nothing running |
+| **a spacesheep session page link** | `https://spacesheep.dev/sessions/claude-code/bf974a77-c0b0-5763-81be-f057a3dc7e57` | the address of that page, if you publish sessions to spacesheep.dev | the uuid in such a link *is* the local session id, so it names the transcript directly, with no arithmetic and nothing running |
 | **a row number** | `3` | the `#` column of **the last `csm list` you ran on this machine** | the shortest thing to type, right after a `csm list`. It is remembered per machine, so it means nothing after a `csm list` somewhere else |
 | **words from the title** | `"refactor"` | the `title` column of `csm list` or `csm find`, matched case-insensitively anywhere in it | a session you can see in a listing. It is the one form that can quietly miss — see below |
 
-**"Is it the session ID?"** — there are two ids, and both are accepted everywhere a `SESSION` is, so it does
-not matter which one you hand over. The **claude.ai id** (`session_…` / `cse_…`) is the one in the link and in
-the app. The **local session id** is a uuid, and it is the name of the transcript file on this machine — what
-`csm list` and `csm find` print. For a session a Remote Control server started, the second is computed from the
-first, which is the whole reason a link alone can find a session that nothing is running. So: give whichever
-you have, and **when the session has stopped, give it the link.**
+**"Is it the session ID?"** — there are two, and csm accepts both wherever a `SESSION` is asked for. The
+**claude.ai id** (`session_…` / `cse_…`) is the one in the link and in the app. The **local session id** is a
+uuid, and it is the name of the transcript file on this machine — what `csm list` and `csm find` print. For a
+session a Remote Control server started, the second is *computed* from the first, which is the whole reason a
+link alone can find a session that nothing is running. So they are interchangeable for a session you can see
+in a listing — but **for one that has stopped, reach for the link first**, and if it answers `no transcript
+for that link here`, hand it the local id (or a 4-character prefix) instead. A terminal session has no link
+at all: for that one the local id from `csm list` *is* the answer.
 
 Three cautions, each measured rather than assumed:
 
@@ -98,63 +115,80 @@ Three cautions, each measured rather than assumed:
   not in a config home on this machine, it says so and names what it looked in.
 - **The arithmetic holds for a session a Remote Control *server* started**, which is the kind you are most
   likely to be rescuing: its local id *is* a hash of its claude.ai session's own API address, so the link finds
-  the transcript with nothing running — no process, no registry row, no network. For a session that asked for
-  Remote Control itself, or a terminal session that got a link later, csm matches the claude.ai id recorded
-  inside the transcript instead; that works too, but only while the session is recent enough to be in the
-  listing csm scans. If a link comes back as `no transcript for that link here`, give the local session id or
-  a 4-character prefix of it, and use `csm find` to get it.
-- **A title can miss.** csm matches the title in the transcript (one you set, one the CLI generated, or the
-  last prompt). Measured across the transcripts on one machine, CLI 2.1.312: 11% of the sessions a Remote
-  Control server started carry a generated title, against 64% of the others — so the words the app shows you
-  may be in no file csm reads, and a stopped Remote Control session is exactly the case where that bites.
-  `csm find` also reads the desktop app's own titles, which are in no transcript and which `csm list` does
-  not see. When a title finds nothing, use the link.
+  the transcript with nothing running — no process, no network, no registry row (the live `sessions/<pid>.json`
+  file a running session keeps, and a stopped one has none). For a session that asked for Remote Control
+  itself, or a terminal session that got a link later, csm matches the claude.ai id recorded inside the
+  transcript instead; that works too, but only while the session is recent enough to be in the listing csm
+  scans — while a link's arithmetic, and a local id typed in full, name the file however old it is. If a link
+  comes back as `no transcript for that link here`, give the local session id or a 4-character prefix of it,
+  and use `csm find` to get it.
+- **A title can miss.** csm matches the title in the transcript — one you set, one the CLI generated, or the
+  last prompt — which is often not the words the app shows you. Measured across the transcripts on one
+  machine, CLI 2.1.312: 11% of the transcripts a Remote Control server started carry a generated title line,
+  against 64% of the others, so for those csm is matching a prompt rather than a title, and a stopped Remote
+  Control session is exactly the case where that bites. `csm find` also reads the desktop app's own titles,
+  which are in no transcript and which `csm list` does not see. When a title finds nothing, use the link or
+  the id.
 
 ### Restart a session that died
 
 The case this part is written for: a session stopped answering — the machine restarted under it, Remote
 Control disconnected, something killed it mid-turn, or its account hit a usage limit.
 
-**In a hurry.** Copy the session's claude.ai link out of the app, then:
+**In a hurry.** With the session's claude.ai link, copied out of the app:
 
 ```sh
 csm revive <link> --dry-run     # why it stopped, and what reviving it would do — nothing changes
 csm revive <link>               # ...do that
 ```
 
-Read **line 2** of the answer: it names what csm will do, including the one case it cannot do for you — a
-session a Remote Control *server* started, where the cure is to open the link and say *continue*, or
-`csm revive <link> --new-link` to fork it onto a new link instead. The steps below are the same thing
-unhurried.
+With no link — a plain `claude` in a terminal has none — name it from a listing instead:
 
-**0. Try the app first; it is free and keeps everything.** If it was a Remote Control session and a
-`claude remote-control` server is still running in its folder, open its link in the app and type *continue*.
-The server respawns the worker itself, and you keep the link, the title, the account and its quota window.
-Nothing local can make that happen. It does **not** work when that server is gone (it died with the machine),
-when the session was never a Remote Control one (a plain `claude` in a terminal has no link to open), or when
-the account is out of quota — the next turn then dies on the same wall. Reach for `csm revive` when nobody is
-at the keyboard, when you do not know why it stopped, when the account has no quota left, or when what you
-actually need to know is whether its last tool call ever ran.
+```sh
+csm list                        # or: csm find "<words from the title>"
+csm revive bf974a77 --dry-run   # the 8-character id in the `session` column, or that row's number
+```
 
-**1. Get the link.** Open the session in the Claude app and copy its address —
-`https://claude.ai/code/session_…`. If you have no link, any of the other forms in the table above will do;
-`csm find "<words>"` and `csm list` are how you go looking.
+Read **line 2** of the answer: it names what csm will do, and for one kind of session what it deliberately
+will **not** do — a worker a Remote Control *server* started, which only that server can put back on its own
+link. If the server is still up, the cure is to open the link and say *continue*; if it died with the machine,
+`csm revive <link> --new-link` is the one command that brings the conversation back with nobody tapping
+anything, onto a new link. The steps below are the same thing unhurried.
 
-**2. Ask what happened, and change nothing.**
+**0. Try the cheap thing first.** If it was a Remote Control session and a `claude remote-control` server is
+still running in its folder, open its link in the app and type *continue*: the server respawns the worker
+itself, and you keep the link, the title, the account and its quota window. Nothing local can make that
+happen. If it was a plain terminal session, the by-hand equivalent is `claude --resume <id>` in its own
+folder — which leaves it with no claude.ai link, where a revive gives it one.
+
+Neither helps when that server is gone (it died with the machine), when the account is out of quota — the
+next turn dies on the same wall — or when you do not know why it stopped. Reach for `csm revive` when nobody
+is at the keyboard, when the account has to change, or when what you actually need to know is whether its
+last tool call ever ran. 🛑 And never hand-resume a **server child**: `claude --resume` registers a *new*
+claude.ai session for it instead of re-attaching the old one, and `--resume=<url>` can replace the local
+transcript with the server's copy ([What it cannot do](#what-it-cannot-do)).
+
+**1. Name the session.** The link is the one spec that always resolves for a session that is no longer
+running: open it in the Claude app, or in a browser, and copy the address —
+`https://claude.ai/code/session_…`. With no link, run `csm list` (or `csm find "<words>"`) and take the
+8-character id in the `session` column, or that row's number; any of the six forms in the table above will do.
+
+**2. Ask what happened, and change nothing.** Run it from anywhere on that machine — the folder it would
+come back in is read out of the transcript, not out of your shell.
 
 ```sh
 csm revive https://claude.ai/code/session_01PHXskvoLtckdvqFv3F8rei --dry-run
 ```
 
 The answer opens with three lines, and they are the whole answer — everything after them is for checking the
-reasoning:
+reasoning. This session is a worker a Remote Control server started, and that server is still up:
 
 ```
 REVIVE  the refactor sweep   (work, bf974a77)
   1 stopped Tue 27 Oct 17:46 (19h ago): it answered and stopped: the last line is a clean
     assistant turn
   2 nothing is started: open https://claude.ai/code/session_01PHXskvoLtckdvqFv3F8rei and say
-    continue — its server respawns it on open (and its server is down)
+    continue — its server respawns it on open
   3 risk: a server child cannot be resumed onto its own link; the cure that does not need you
     is `--new-link`, which forks
 ```
@@ -166,20 +200,23 @@ mode, the row it took — and the note it would send.)
 Line **1** is why it stopped, read out of the transcript: `it answered and stopped` (a clean last turn — the
 ordinary shape of a session killed while idle), `it was cut off mid-turn: its last tool call (<tool>) has no
 recorded result, so what that call did is UNKNOWN` (a kill in the middle of work — read this one carefully),
-`it hit a <kind> limit, which resets <time>`, `it was archived or ended from the app`, or
+`it hit a <kind> limit, which resets <time>` (with ` — that reset has passed` on the end when it has, which
+is why a limit in line 1 does not always decide line 2), `it was archived or ended from the app`, or
 `its last turn ended on <error>, which is not a limit`.
 
-Line **2** is what a real run would do. It is the row of the decide table that matched, and it tells you which
-command you actually want:
+Line **2** is what a real run would do — one sentence per case, from the decide table
+([in full](#what-it-decides-in-order)) — and it tells you which command you actually want:
 
 | line 2 says | what it means | what to do |
 |---|---|---|
-| `nothing is started: open <link> and say continue` | it was a worker a `claude remote-control` **server** started, and such a session cannot be resumed onto its own link by anything local — only its server can bring it back, and only when the link is opened | open the link and say *continue*. If its server is down, or nobody is at the keyboard: `csm revive <link> --new-link`, which forks it onto a new link with the same past |
+| `nothing is started: open <link> and say continue — its server respawns it on open` | it was a worker a `claude remote-control` **server** started, and such a session cannot be resumed onto its own link by anything local — only its server can bring it back, and only when the link is opened | open the link and say *continue*. ⚠️ When that server is not up the same line ends `(and its server is down)` or `(and its server is unread)` — a machine restart kills the server too — and then the tap cannot work: `csm revive <link> --new-link` forks it onto a new link with the same past, and needs nobody |
 | `resume it in place, on the same claude.ai link` | it asked for Remote Control itself, so resuming it re-attaches that same link | `csm revive <link>` |
-| `resume it in place — it gets a NEW claude.ai link` | it was a plain `claude` in a terminal. It never had a link, so the one it comes back on is new exposure, not a restoration | `csm revive <id>` |
-| `nothing to do yet: the limit it stopped on is still in force` | starting it now would spend its first turn hitting the same wall | wait until the reset it prints and run it again, or move it: step 5 |
+| `resume it in place — it gets a NEW claude.ai link` | it was a plain `claude` in a terminal. It never had a link, so the one it comes back on is new exposure, not a restoration | `csm revive <id>`. To bring it back with no link at all, resume it by hand: `claude --resume <id>` in its folder |
+| `FORK it: a new session id, a new link, the same past` (or `FORK it onto a NEW claude.ai link: …`) | you passed `--new-link`, or it is a server child, which has no other way back | that is the plan; afterwards leave the old copy alone (step 4) |
+| `nothing to do yet: the limit it stopped on is still in force` | starting it now would spend its first turn hitting the same wall | wait until the reset it prints and run it again, or move it: step 5. A reset that has already passed is reported in line 1 and decides nothing |
 | `wake it — relay this note to the session that is already running` | it is not dead after all: something respawned it, or you opened the link | `csm revive <link>` delivers the note to it; or simply type in the app |
 | `nothing to do: it is working right now` | it is in the middle of a turn | nothing. A message now would join that turn |
+| `nothing to do: it was archived or ended from the app` | somebody, or a sweep, closed it on purpose | `csm revive <link> --unarchive` if you do mean to reopen it, which unarchives it |
 | `nothing to do: <owner> owns this session` | a supervisor, a bot or a scheduled pass keeps this session | that program's own command, which the refusal names |
 
 Line **3** is the one risk, worst first, and it outranks the mechanism: an unanswered tool call, an archive
@@ -193,24 +230,35 @@ csm revive https://claude.ai/code/session_01PHXskvoLtckdvqFv3F8rei
 
 The plan and the run take the same row, so what the dry run printed is what happens.
 
-**4. Read what you get back, and mind the old link.** A revive never types as you and never writes into a
-transcript: the session comes up idle and a short note is then delivered to it as a *peer* message, from a
-sender named `csm revive (<machine>)`, saying what moved under it. Then:
+**4. Read what you get back, and mind the old link.** The revive note is never typed as you and never
+written into a transcript: the session comes up idle, and the note is then delivered to it as a *peer*
+message, from a sender named `csm revive (<machine>)`, saying what moved under it, asking it to carry on where
+it stopped and to re-check anything time-sensitive first. `--say "<one line>"` adds a sentence of your own,
+quoted verbatim and attributed to you — `--say "skip the card run, just write the findings up"` is how you
+redirect it. (A `--to` revive is a move as well, and a move does append its own hidden note to the **copy**:
+step 5.) Then:
 
 - **Resumed in place** (`✅ revived, and it has taken a turn`): the `link` line is the same link you gave it,
-  and a `window` line names the tmux window it runs in.
+  and a `window` line names the tmux window it runs in and prints the `csm stop …` that ends it. To look in:
+  `tmux attach -t '=csm-<account>'` — that `window` line names the exact tmux session and window.
 - **Resumed with a new link**: the output says so loudly —
   `⚠ new link    it was never a Remote Control session, so this link is new exposure, not a restoration`.
   Use the new one; nothing opens the way in it had before.
 - **Forked** (`--new-link`, or a dead Remote Control server child): you get a **new** session id and a **new**
-  link, with the whole past, and `🛑 OLD LINK  <url> still opens the OLD copy, which is now a second
-  conversation with the same past. Do not type there; archive it in the app.` Do exactly that: the old link
-  still works, and two conversations with one history is the one mess csm cannot untangle for you.
-- **Nothing started** (the first case in the table above): it prints the link to open, whether that folder's
-  server is up, and the two commands that follow — `csm revive <id>` once it is open, or
-  `csm revive <id> --new-link` to fork.
-- **`⚠ it is up, and NOT proved (exit 1)`**: something is running, but nothing proved it read the note. Open
-  the link and say *continue*. Exit `0` means it took a turn, `2` that nothing was started at all.
+  link, with the whole past. A `new session` line carries that id, the `window` line prints
+  `csm stop <the NEW id8>`, and the old way in is called out: `🛑 OLD LINK  <url> still opens the OLD copy,
+  which is now a second conversation with the same past. Do not type there; archive it in the app.` Do exactly
+  that (claude.ai in a browser archives it too): two conversations with one history is the one mess csm cannot
+  untangle for you. A forked **terminal** session has no old link to archive — the output says so, and its old
+  transcript simply sits on disk with nothing running it.
+- **Nothing started** (the server-child case): it prints the link to open, whether that folder's server is up,
+  and the two commands that follow — `csm revive <id>` once it is open, which relays the note into the session
+  the server respawned (typing in the app does the rest), or `csm revive <id> --new-link` to fork.
+- **`⚠ it is up, and NOT proved (exit 1)`**: something is running, but nothing proved it read the note. That
+  line names the link to open and say *continue* on.
+
+**Exit codes, for a script:** `0` it took a turn — or there was nothing to do, or the one thing to tap was
+printed; `1` something is up and nothing proved it read the note; `2` a refusal, and nothing was started.
 
 **5. If the account is out of quota, bring it back on another one.** Same command, plus where to put it:
 
@@ -222,8 +270,9 @@ csm revive <link> --to auto         # the account here with the most weekly room
 This is an ordinary `csm move` with the revive note delivered afterwards, so it costs what a move costs
 ([What a move costs](#what-a-move-costs-and-what-it-cannot-carry)): a new link owned by the target account,
 and across two organizations the first turn re-reads the whole conversation on the new account's quota.
-`--to auto` needs a quota meter (`CSM_METERS`); with none it refuses rather than guess, and names the knob —
-so on a plain install, name the account yourself. `--to` is also the cure for a limit that is still in force.
+`--to auto` needs a quota meter — `CSM_METERS`, which nothing in csm writes; a job of your own fills it — and
+with none it refuses rather than guess and names the knob, so on a plain install name the account yourself.
+`--to` is also the cure for a limit that is still in force.
 
 **6. Clean up when you are done.** A revive that started a window leaves it running:
 
@@ -231,8 +280,10 @@ so on a plain install, name the account yourself. `--to` is also the cure for a 
 csm stop bf974a77            # ends it and frees the window (for a fork: the NEW id)
 ```
 
-`csm stop` ends only a session csm itself started, captures the pane's scrollback first, and never deletes a
-transcript.
+A revive opens its window under the same name a move does — `moved-<id8>` in the tmux session `csm-<account>`
+— which is exactly what `csm stop` is authorised on, and the success output prints the command to use. It ends
+only a session csm itself started, captures the pane's scrollback first, and never deletes a transcript: the
+conversation stays where it is, and can be revived again.
 
 ### Move a session to another account
 
@@ -242,7 +293,9 @@ For a session that is **still running** and whose account is out of quota:
 csm list                           # find it; note its row number
 csm move 3 --to work --dry-run     # the plan, the cost, and any refusal
 csm move 3 --to work               # do it
-csm stop 3                         # later: end the moved session and free its window
+csm stop 3                         # later: end it and free its window — a row number means the
+                                   #   last `csm list` on this machine, so its 8-character id is
+                                   #   the safer argument once you have run another listing
 ```
 
 It prints the account to open the app as, the **new** claude.ai link, the window it runs in and what the move
@@ -260,7 +313,9 @@ csm find 7f3a --on laptop       # ...on another machine, over ssh, read-only
 It searches ids, links and titles in every account home. Two things it will tell you itself: the age column
 is the transcript file's last write and not its last turn, and **0 rows is not proof the session is gone** —
 a stopped session has no registry row and a Remote Control one usually has no title, so paste its link, which
-names the transcript by arithmetic.
+names the transcript by arithmetic. A session that never had a link (a terminal one) has none to paste: widen
+the window with `--all`, or read the file names in `<config home>/projects/<folder>/`, which *are* the local
+session ids.
 
 ### What csm will not do
 
@@ -275,7 +330,9 @@ Each of these is a refusal with the cure in it, not a surprise:
   gate a revive turns on is a question about the machine the session is on: run `csm --machine laptop revive
   <spec>` and the whole thing happens over there. (A *move* does cross machines: `--from-machine`.)
 - **It cannot choose between two copies of one id.** A move is a copy, so after any move the same id sits in
-  two homes; with neither running, it refuses and names both. `--account <name>` is the answer.
+  two homes; with neither running, it refuses and names both. `csm revive --account <name>` says which one;
+  `csm move`'s spelling for it is `--from-account`, and `csm stop` needs neither — it looks only at the copy
+  whose window csm itself opened.
 - **It cannot tell you whether an interrupted tool call took effect** — only that there is no recorded result,
   which is also what it tells the revived session.
 - **It cannot attach a claude.ai connector to another account.** No terminal command on any machine can; you
@@ -425,6 +482,12 @@ One realpath for every home is `shared` wherever that path lives — including i
 the layout you get by sharing through the default `~/.claude`. That earns a note (rename that home and every
 link into it dangles), not a divergence.
 
+The footer counts only the ten layers `--check` decides on — the seven shared entries (`settings.json`,
+`CLAUDE.md`, `skills`, `agents`, `commands`, `output-styles`, `plugins`) plus `plugins enabled`,
+`MCP servers` and `auto-memory` — and not every 🔧 row in the table: `login` is reported on its own, and
+`settings.local.json` and `scheduled-tasks` never fail it, because having one and not the other is usually
+the design.
+
 Every cell is a measurement, never a guess. `?` is not the same as `no` and is never counted as a match, so
 `--check` goes red on a layer that diverges or a login that is gone, and never on an unknown.
 
@@ -537,10 +600,10 @@ is the account's handle where the accounts file gives one, and its name otherwis
 csm move SESSION --to ACCOUNT [flags]
 ```
 
-`SESSION` can be a row number from the last `csm list`, a session id or a prefix of one (4 characters or more), a
-`https://claude.ai/code/session_…` link, or a piece of the title. `--to` takes an account's name, its handle, its
-email, or a unique prefix of any of those. Anything ambiguous is refused with the candidates listed, never guessed,
-and so is a bare number unless an account is literally named that.
+`SESSION` is any of the six forms in [What do I give csm?](#what-do-i-give-csm) — one list for `move`, `revive` and
+`stop`, which share the resolver (`find` takes the same ones bar a row number). `--to` takes an account's name, its
+handle, its email, or a unique prefix of any of those. Anything ambiguous is refused with the candidates listed,
+never guessed, and so is a bare number unless an account is literally named that.
 
 | flag | effect |
 |---|---|
@@ -600,20 +663,26 @@ narrative, the table in plain words and what it cannot do are in
 
 | flag | effect |
 |---|---|
-| `--dry-run` | print the plan — the row it would take, the note it would send, any refusal — and start, wake, move and write nothing |
+| `--dry-run` | print the plan — the row it would take, the note it would send, any refusal — and start, wake, move and write nothing, bar the one line in csm's own log every command writes (`revive.jsonl` records real runs only) |
 | `--json` | the diagnosis record, the decision and the note, as JSON. The prose goes to stderr, so stdout stays parseable |
 | `--to ACCOUNT` | move it to that account instead of reviving it where it is (`auto` for the one with the most weekly room). It is also the cure for a limit that is still in force |
 | `--new-link` | a fresh copy on a new link: **fork** the dead session to a new session id and a new link, leaving its transcript byte-identical. It is the only way back for a Remote Control **server child**, which cannot be resumed onto its own link at all, and on a dead self-hosted or terminal session it forks instead of resuming in place (row 11). The old link, where there was one, still opens the old copy. On a row that forks nothing — live, a move, a refusal — the output says it was **not** carried out, and why |
-| `--account NAME` | which home's copy to revive. Only needed when a move has left copies of one id in more than one home and none of them is running — revive refuses rather than choose, the same as `move` and `stop` |
+| `--account NAME` | which home's copy to revive. Only needed when a move has left copies of one id in more than one home and none of them is running — revive refuses rather than choose, as `move` and `stop` do. Their spellings differ: `move --from-account NAME`, and `stop` needs none, because it looks only at the copy whose window csm opened |
 | `--say TEXT` | one thing to pass on to the revived session, quoted verbatim and attributed to you. At most 400 characters, and it may not start with `!` or `/`, which the CLI would run as a command |
 | `--permission-mode MODE` | the mode to come back in. Without it, the mode the session recorded, by the same rule as `move`. ⚠️ It is applied only on the rows that START a process (6, 7, 8, 10, 11); on a wake, on row 3, on row 9 and on a refusal nothing is started, so the mode line REPORTS what the session is already in (`unchanged: …`, `applied: false` in `--json`) and the flag is named as not carried out |
 | `--unarchive` | resume a session that was archived or ended from the app, which unarchives it. Refused without this flag |
 | `--name NAME` | the Remote Control name the revived session gets |
 | `--from-machine M` | refused, and says so: every gate a revive turns on is a question about the machine the transcript is on. Run `csm --machine M revive <spec>` instead, which does the whole thing over there |
 
+There is no `--foreground` and no `--no-remote-control` here: whatever row it takes, a revive comes up as a
+Remote Control session, which is what gives a terminal session a link it never had. To bring one back without
+a link, resume it by hand — `claude --resume <id>` in its folder, which is the by-hand path for a terminal or
+self-hosted session and comes back with no link at all. Never for a server child: see
+[What it cannot do](#what-it-cannot-do).
+
 **Exit codes are the answer an unattended caller reads**: `0` the session took a turn (or there was nothing to
 do, or the one thing to tap was printed), `1` something is **up** and nothing proved it read the note, `2`
-nothing was started at all.
+nothing was started at all — every refusal, and nothing started.
 
 ### `csm stop`
 
@@ -621,7 +690,8 @@ nothing was started at all.
 csm stop SESSION [--dry-run]
 ```
 
-Ends a session **this tool moved** and removes the tmux window it opened: the cleanup, and the unblocker for moving
+Ends a session **this tool started** — one it moved, and one `csm revive` resumed or forked, which opens its
+window under the same name — and removes that tmux window: the cleanup, and the unblocker for moving
 the same session to the same account again. It stops nothing else. The authorisation is `csm`'s own window
 (`moved-<id8>` in `csm-<account>`) plus, for a running session, a live registry row naming that same window; the pid
 is signalled only after its identity is proved. Killing the window SIGHUPs the pane's process tree, which the
@@ -688,10 +758,10 @@ reads the file. Read-only, apart from `--restart-idle --apply`.
   (`ok:`, `FAULT:`, `INCOMPLETE:`) and agree with the exit code. Every diagnostic on that path goes to the log.
 - `--restart-idle` prints which idle workers a restart would SIGTERM to bring them back in their server's mode, and
   why each other row is refused: never a server, never a session hosting itself, never this session, never a busy
-  one, never a pid whose recorded start time does not prove it. 🛑 `--apply` is **gated**: while the mode a
-  respawned worker comes back in is unverified it refuses and signals nothing (exit 2). **No environment variable
-  can open that gate** — a constant in the file is the only switch, because a stray variable in a scheduled pass's
-  environment must never be able to stop your sessions.
+  one, never a pid whose recorded start time does not prove it. 🛑 It stays a plan today: `--apply`, the flag that
+  would carry it out, is **gated shut** while the mode a respawned worker comes back in is unverified — it refuses
+  and signals nothing (exit 2). **No environment variable can open that gate** — a constant in the file is the only
+  switch, because a stray variable in a scheduled pass's environment must never be able to stop your sessions.
 
 ### `csm matrix`
 
@@ -898,14 +968,13 @@ csm revive 7f3a --to auto --say "skip the card run, just write the findings up"
 csm revive 7f3a --new-link                                    # fork a dead session onto a new link, fresh copy
 ```
 
-**When to use it, and when to just open the session and say *continue*.** If the session is a Remote Control one
-whose folder still has a `claude remote-control` server running, opening its link in the app and typing
-*continue* is the better answer: the server respawns the worker itself, and you keep the link, the title, the
-account and the quota window. Nothing local can make that happen — the respawn is the server's decision, taken
-when the session next gets activity — so `revive` detects exactly that case, prints the one thing to tap, and
-starts nothing (row 9). Reach for `revive` instead when **nobody is at the keyboard**, when you **do not know why
-it stopped**, when the account it was on **has no quota left** (`--to auto` moves it to the one that does), or
-when the thing you actually need to know is whether its **last tool call ever ran**.
+**When to use it, and when to just open the session and say *continue*.** The short version is
+[step 0](#restart-a-session-that-died) of the walkthrough; the mechanism is this. A respawn is the server's own
+decision, taken when the session next gets activity, so nothing local can make it happen: `revive` detects
+exactly that case, prints the one thing to tap, and starts nothing (row 9). Reach for `revive` instead when
+**nobody is at the keyboard**, when you **do not know why it stopped**, when the account it was on **has no
+quota left** (`--to auto` moves it to the one that does), or when the thing you actually need to know is
+whether its **last tool call ever ran**.
 
 ### What it decides, in order
 
@@ -960,7 +1029,8 @@ while its server's argv says `bypassPermissions`, and a mode neither source name
 ### The three-line answer
 
 Everything above the detail block is what gets read out on a phone: **what stopped it and when · what revive
-would do · the one risk**.
+would do · the one risk**. Here for `csm revive <link> --new-link --dry-run` on a dead server child whose
+limit has since reset — so row 4 does not fire, and line 1 says as much:
 
 ```
 REVIVE  the refactor sweep   (work, bf974a77)
@@ -1000,7 +1070,8 @@ promptSource: "typed"`) whatever its text says, so a sentence csm wrote would be
 conversation's record, from one you typed. The alternative — a hidden `isMeta` line plus `--reply-on-resume` — is
 honest and self-starting, but it writes into a transcript, and for a fork it would have to write into the *old*
 one, where a later lazy respawn of the old link could pick it up as an interrupted turn: two actors on one
-conversation. So **a revive writes into no transcript at all**, and the note opens with its own stamp,
+conversation. So **the revive note goes into no transcript at all** (a `--to` revive is also a `csm move`, and a
+move appends its own `isMeta` move note to the copy it made), and the note opens with its own stamp,
 `[claude-session-mover — written by the tool; the user did not type this]`.
 
 **The proof is a turn, not a link.** The transcript's byte offset is taken *before* the relay; exit `0` needs
@@ -1037,7 +1108,8 @@ because the proof is the session's own behaviour and not the relay's word for it
   result, which is the honest answer, and the revived session is told the same thing.
 - **It cannot choose between two copies of one id.** A move is a copy, so after any `csm move` the same id sits
   in two homes; with neither of them running, nothing says which one was being used, and `revive` refuses and
-  names both — `move` and `stop` do the same. `--account NAME` is the answer.
+  names both — `move` and `stop` refuse there too. `revive --account NAME` is the answer; `move`'s spelling is
+  `--from-account NAME`, and `stop` considers only the copy whose window csm opened.
 - **It cannot address a session whose registry name is not unique.** SendMessage addresses a session *by* its
   name, so two proved live sessions of one name is a refusal before anything is sent, naming both. csm's own
   label carries the session's id8 so that the windows it starts cannot collide.
@@ -1051,7 +1123,10 @@ because the proof is the session's own behaviour and not the relay's word for it
 
 Every one of these is a rule in the code, and the tests pin them:
 
-- **The source transcript is never edited or deleted.** A move is a copy and a resume.
+- **The source transcript is never edited or deleted.** A move is a copy and a resume. (One layout is the
+  exception, and says so where it is described: two homes whose `projects/` resolve to **one** tree, where the
+  copy *is* the source, and the move note is appended to that one file because it is the only place the resumed
+  session could read it.)
 - **Nothing is written before every refusal has been checked.** A move refused for a stale window, a vanished
   directory or a live twin leaves the target home exactly as it was.
 - **A credential is never read, printed, copied or logged.** The login check asks only whether one *exists* — on
@@ -1151,6 +1226,10 @@ disconnected — restart it"*, *"it stopped on a limit, continue it on an accoun
 link and the agent runs `csm revive` with it; the answer comes back as the three lines above, the link, and the
 title you knew it by.
 
+🛑 This needs one session on that machine that is still alive and still has quota, because that is what you are
+typing into. When a restart killed everything there, nothing on a phone can start the first one: run csm on that
+machine itself, or from another machine's terminal with `csm --machine <name> revive <link>`.
+
 Re-run `./install.sh --skill` after an update. It repoints a link of its own, and **refuses a link that points
 somewhere else**, printing `skipped <home>/skills/move-session: it links to …` — which is the case to watch for if
 you already kept that skill somewhere of your own: those homes go on reading the old text until you repoint them
@@ -1168,7 +1247,8 @@ update.
 - **Claude Code's on-disk state is undocumented** and can change in any release. Everything here was measured
   against CLI 2.1.296–2.1.300 (the shared-tree handling and LESSONS.md against 2.1.308; everything `csm revive`
   reads and does against 2.1.312); the tests pin every shape the tool depends on, so a format change fails loudly
-  rather than quietly. Re-check anything load-bearing against the version you actually run.
+  rather than quietly. Re-check anything load-bearing against the version you actually run — `claude --version`
+  says which that is, and `csm matrix` prints it per machine.
 - CI runs the suite on Ubuntu and macOS against Python 3.9 and 3.12, and on Ubuntu 22.04 against **3.7** — the
   floor this page promises, so it is measured and not merely claimed — with no tmux and no account.
 
@@ -1196,6 +1276,11 @@ copies the code and leaves the data where it was made.
 
 Do not confuse that with `--machine M` / `--ssh HOST`, which run the whole command *on* that machine, where it
 again moves between two homes over there.
+
+**Can I revive a session that died before I installed csm?**
+Yes. Everything `revive` reads is already on disk — the transcript in its config home, and the live registry if
+anything is still running — so when the session stopped relative to the install makes no difference. What it
+cannot read is a session whose transcript was pruned (`cleanupPeriodDays`) or that lives on another machine.
 
 **Does it delete anything?**
 No. The source transcript stays where it is, readable from the old account. `--stop-source` stops one proved
